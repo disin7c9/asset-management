@@ -1,0 +1,29 @@
+# Secrets — never commit
+.env
+.env.*
+*.key
+*.pem
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtualenvs / uv
+.venv/
+venv/
+
+# Local data (user-specific portfolios, fetched prices, generated reports)
+data/
+reports/
+*.sqlite
+*.db
+
+# OS / editor noise
+.DS_Store
+*.swp
+.vscode/
+.idea/
