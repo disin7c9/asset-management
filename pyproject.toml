@@ -1,15 +1,19 @@
 [project]
 name = "asset-management"
-version = "0.0.1"
+version = "0.0.2"
 description = "Personal asset-management tool: transaction-log holdings, drawdown-first reporting with confidence bands, multi-source price provenance."
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "pandas>=2.2",
     "numpy>=1.26",
+    "pyarrow>=15.0",
     "yfinance>=0.2.40",
     "resend>=2.0",
     "python-dotenv>=1.0",
 ]
+
+[project.scripts]
+asset-management = "app.cli:main"
 
 [dependency-groups]
 dev = [
