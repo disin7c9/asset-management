@@ -13,7 +13,7 @@ import pandas as pd
 import pytest
 
 from app import prices as P
-from app.prices import PriceRow, PricesResult, fetch_latest
+from app.prices import PriceRow, PricesResult, fetch_latest, fetch_series
 
 
 def _fake_yf_df(price: float, on: date) -> pd.DataFrame:
@@ -240,3 +240,69 @@ def test_prices_result_helpers() -> None:
     assert result.n_stooq == 1
     assert result.n_cache == 1
     assert result.fallbacks_used == 1
+
+
+# ── fetch_series (slice 3) ─────────────────────────────────────────────────
+
+
+def _fake_yf_history(prices: list[float], start: date) -> pd.DataFrame:
+    idx = pd.date_range(pd.Timestamp(start), periods=len(prices), freq="D")
+    return pd.DataFrame({"Close": prices}, index=idx)
+
+
+def test_fetch_series_returns_history_with_index(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    start = date(2024, 1, 1)
+    monkeypatch.setattr(
+        P, "_fetch_yf", lambda t, s, e: _fake_yf_history([100.0, 101.0, 102.0], start)
+    )
+    monkeypatch.setattr(P, "_fetch_stooq_csv", lambda t: None)
+    result = fetch_series(["VOO"], start, date(2024, 1, 3), cache_dir=tmp_path)
+    assert "VOO" in result.rows
+    s = result.rows["VOO"]
+    assert len(s) == 3
+    assert float(s.iloc[0]) == 100.0
+    assert isinstance(s.index, pd.DatetimeIndex)
+
+
+def test_fetch_series_falls_back_to_stooq(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(P, "_fetch_yf", lambda t, s, e: None)
+    csv_text = (
+        "Date,Open,High,Low,Close,Volume\n"
+        "2024-01-01,0,0,0,10.0,0\n"
+        "2024-01-02,0,0,0,11.0,0\n"
+        "2024-01-03,0,0,0,12.0,0\n"
+    )
+    monkeypatch.setattr(P, "_fetch_stooq_csv", lambda t: csv_text)
+    result = fetch_series(["VOO"], date(2024, 1, 1), date(2024, 1, 3), cache_dir=tmp_path)
+    assert list(result.rows["VOO"].round(1)) == [10.0, 11.0, 12.0]
+
+
+def test_fetch_series_missing_when_all_fail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(P, "_fetch_yf", lambda t, s, e: None)
+    monkeypatch.setattr(P, "_fetch_stooq_csv", lambda t: None)
+    result = fetch_series(["NOPE"], date(2024, 1, 1), date(2024, 1, 3), cache_dir=tmp_path)
+    assert result.rows == {}
+    assert result.missing == ["NOPE"]
+
+
+def test_fetch_series_writes_and_reuses_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    start = date(2024, 1, 1)
+    end = date(2024, 1, 3)
+    monkeypatch.setattr(
+        P, "_fetch_yf", lambda t, s, e: _fake_yf_history([100.0, 101.0, 102.0], start)
+    )
+    fetch_series(["VOO"], start, end, cache_dir=tmp_path)
+    assert (tmp_path / "VOO_series.parquet").exists()
+    # Second call must hit cache: network wrappers now fail the test if called.
+    monkeypatch.setattr(P, "_fetch_yf", lambda *a, **k: pytest.fail("yf should not be called"))
+    monkeypatch.setattr(P, "_fetch_stooq_csv", lambda *a, **k: pytest.fail("stooq should not be called"))
+    result = fetch_series(["VOO"], start, end, cache_dir=tmp_path)
+    assert len(result.rows["VOO"]) == 3

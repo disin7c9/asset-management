@@ -5,6 +5,8 @@ from __future__ import annotations
 from datetime import date
 from math import isclose
 
+import pandas as pd
+import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
@@ -12,12 +14,20 @@ from app.events import Event
 from app.returns import (
     IRRError,
     annualize_return,
+    build_daily_returns,
     cash_flows_from_events,
     modified_dietz_return,
     money_weighted_return,
     summarize,
+    true_twr_annualized,
+    twr_index,
 )
 from app.returns import _xirr_newton  # noqa: PLC2701 — exercised directly in regression tests
+
+
+def _price_series(values: list[float], start: str = "2024-01-01") -> "pd.Series[float]":
+    idx = pd.date_range(start, periods=len(values), freq="D")
+    return pd.Series(values, index=idx, dtype=float)
 
 
 def _close(a: float, b: float, tol: float = 1e-6) -> bool:
@@ -134,8 +144,12 @@ def test_annualize_doubles_for_half_year_return() -> None:
     assert 0.099 < ann < 0.106
 
 
-def test_annualize_handles_zero_days() -> None:
-    assert annualize_return(0.10, 0) == 0.0
+def test_annualize_refuses_short_window() -> None:
+    # Below the ~30-day floor, annualizing is meaningless → None (not a number).
+    assert annualize_return(0.10, 0) is None
+    assert annualize_return(0.10, 2) is None
+    assert annualize_return(0.10, 29) is None
+    assert annualize_return(0.10, 30) is not None
 
 
 def test_annualize_passes_through_none() -> None:
@@ -206,6 +220,123 @@ def test_summarize_propagates_md_none_on_degenerate() -> None:
 
 
 # ── property-based ───────────────────────────────────────────────────────
+
+
+# ── equity curve / true TWR ────────────────────────────────────────────────
+
+
+def test_twr_equals_buy_and_hold_when_no_external_flows() -> None:
+    """Single buy at t0, no further flows → daily TWR == simple price return.
+
+    Buy 1 share @ $100 on day 0; prices [100, 110, 121]. The growth-of-1 index
+    must end at 1.21 (== 121/100), independent of the dollar amount invested.
+    """
+    events = [Event(date(2024, 1, 1), "TST", "buy", quantity=1.0, price=100.0, fee=0.0)]
+    series = {"TST": _price_series([100.0, 110.0, 121.0])}
+    daily = build_daily_returns(events, series, asof_date=date(2024, 1, 3))
+    assert list(daily.round(6)) == [0.10, 0.10]
+    idx = twr_index(daily)
+    assert float(idx.iloc[-1]) == pytest.approx(1.21)
+
+
+def test_twr_is_invariant_to_position_size() -> None:
+    """Doubling the share count must not change the time-weighted return."""
+    series = {"TST": _price_series([100.0, 110.0, 121.0])}
+    e1 = [Event(date(2024, 1, 1), "TST", "buy", quantity=1.0, price=100.0, fee=0.0)]
+    e2 = [Event(date(2024, 1, 1), "TST", "buy", quantity=10.0, price=100.0, fee=0.0)]
+    d1 = build_daily_returns(e1, series, asof_date=date(2024, 1, 3))
+    d2 = build_daily_returns(e2, series, asof_date=date(2024, 1, 3))
+    assert list(d1.round(9)) == list(d2.round(9))
+
+
+def test_dividend_offsets_ex_div_price_drop() -> None:
+    """A $2 cash dividend on a day the price drops $2 → ~zero return that day."""
+    events = [
+        Event(date(2024, 1, 1), "TST", "buy", quantity=1.0, price=100.0, fee=0.0),
+        Event(date(2024, 1, 2), "TST", "dividend", quantity=0.0, price=0.0, fee=0.0, cash=2.0),
+    ]
+    series = {"TST": _price_series([100.0, 98.0])}  # price drops 2 on ex-div day
+    daily = build_daily_returns(events, series, asof_date=date(2024, 1, 2))
+    assert float(daily.iloc[-1]) == pytest.approx(0.0, abs=1e-9)
+
+
+def test_build_daily_returns_empty_without_prices() -> None:
+    events = [Event(date(2024, 1, 1), "TST", "buy", quantity=1.0, price=100.0, fee=0.0)]
+    assert build_daily_returns(events, {}, asof_date=date(2024, 1, 3)).empty
+
+
+def test_true_twr_annualized_is_sane_over_two_years() -> None:
+    """21% total growth over ~2 trading-years (504 business days) ≈ 10%/yr.
+
+    Annualization is on the 252-trading-day basis using the COUNT of return
+    observations (the same clock as Sharpe). 505 business days → 504 returns →
+    1.21**(252/504) - 1 = sqrt(1.21) - 1 ≈ 10%.
+    """
+    idx = pd.bdate_range("2023-01-02", periods=505)  # ~2 trading years
+    prices = [100.0 + 21.0 * i / 504 for i in range(505)]  # 100 → 121
+    series = {"TST": pd.Series(prices, index=idx, dtype=float)}
+    events = [Event(idx[0].date(), "TST", "buy", quantity=1.0, price=100.0, fee=0.0)]
+    daily = build_daily_returns(events, series, asof_date=idx[-1].date())
+    ann = true_twr_annualized(daily)
+    assert ann is not None
+    n = len(daily)
+    assert ann == pytest.approx((121.0 / 100.0) ** (252.0 / n) - 1.0, rel=1e-6)
+    assert 0.08 < ann < 0.12  # ~10%/yr — the meaningful sanity check
+
+
+def test_true_twr_refuses_short_window() -> None:
+    """Fewer than ~20 return-days → None, so the report shows n/a, not millions of %."""
+    series = {"TST": _price_series([100.0, 110.0, 121.0])}
+    events = [Event(date(2024, 1, 1), "TST", "buy", quantity=1.0, price=100.0, fee=0.0)]
+    daily = build_daily_returns(events, series, asof_date=date(2024, 1, 3))
+    assert true_twr_annualized(daily) is None  # only 2 return-days
+
+
+def test_mwr_refuses_short_window() -> None:
+    """A sub-month IRR window → None (annualizing it would explode)."""
+    events = [
+        Event(date(2024, 1, 1), "TST", "buy", quantity=1.0, price=100.0, fee=0.0),
+        Event(date(2024, 1, 3), "TST", "sell", quantity=1.0, price=121.0, fee=0.0),
+    ]
+    # 2-day span, well under the 30-day floor.
+    assert money_weighted_return(events, current_value=0.0, asof_date=date(2024, 1, 3)) is None
+
+
+def test_build_daily_returns_drops_unpriced_ticker_events() -> None:
+    """Regression for review finding 1: a ticker absent from the price series must
+    NOT have its buy cost applied (which would emit a spurious huge negative return).
+    Its events are excluded entirely so the TWR is over the priced sub-portfolio."""
+    events = [
+        Event(date(2024, 1, 1), "AAPL", "buy", quantity=1.0, price=100.0, fee=0.0),
+        Event(date(2024, 1, 2), "ZZZ", "buy", quantity=1.0, price=500.0, fee=0.0),  # no series
+    ]
+    series = {"AAPL": _price_series([100.0, 101.0, 102.0, 103.0])}
+    daily = build_daily_returns(events, series, asof_date=date(2024, 1, 4))
+    # Every daily return should be AAPL's ~+1%/day; no -499% spike from ZZZ.
+    assert all(-0.5 < float(r) < 0.5 for r in daily), list(daily)
+    assert float(daily.iloc[0]) == pytest.approx(0.01, abs=1e-6)
+
+
+def test_late_dated_event_is_clamped_not_dropped() -> None:
+    """Regression for review finding 6: an event after the last trading day in the
+    series must be clamped to the last day, not silently discarded."""
+    # Series ends 2024-01-03 (a Wednesday); dividend dated 2024-01-06 (Saturday).
+    series = {"TST": _price_series([100.0, 100.0, 100.0])}  # flat → returns are 0 from price
+    events = [
+        Event(date(2024, 1, 1), "TST", "buy", quantity=1.0, price=100.0, fee=0.0),
+        Event(date(2024, 1, 6), "TST", "dividend", quantity=0.0, price=0.0, fee=0.0, cash=10.0),
+    ]
+    daily = build_daily_returns(events, series, asof_date=date(2024, 1, 6))
+    # The $10 dividend on a $100 position must show up as a +10% return on the
+    # last day (clamped to 2024-01-03), not vanish.
+    assert float(daily.iloc[-1]) == pytest.approx(0.10, abs=1e-9)
+
+
+def test_true_twr_none_on_too_little_data() -> None:
+    events = [Event(date(2024, 1, 1), "TST", "buy", quantity=1.0, price=100.0, fee=0.0)]
+    series = {"TST": _price_series([100.0, 110.0])}
+    daily = build_daily_returns(events, series, asof_date=date(2024, 1, 2))
+    assert true_twr_annualized(daily) is None  # only 1 return day
 
 
 @given(

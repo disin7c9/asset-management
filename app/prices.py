@@ -55,6 +55,18 @@ class PriceRow:
 
 
 @dataclass(frozen=True)
+class SeriesResult:
+    """Outcome of a `fetch_series` call. Never raises on per-ticker failure.
+
+    `rows` maps ticker → a pandas Series of daily close prices indexed by a
+    normalized (midnight) DatetimeIndex.
+    """
+
+    rows: dict[str, "pd.Series[float]"] = field(default_factory=dict)
+    missing: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
 class PricesResult:
     """Outcome of a `fetch_latest` call. Never raises on per-ticker failure."""
 
@@ -260,6 +272,144 @@ def _from_stooq(ticker: str, asof: date) -> PriceRow | None:
         source="stooq",
         fetched_at=_now_utc(),
     )
+
+
+def fetch_series(
+    tickers: Iterable[str],
+    start: date,
+    end: date,
+    *,
+    cache_dir: Path | None = None,
+    online: bool = True,
+) -> SeriesResult:
+    """Fetch the daily close *history* in [start, end] for each ticker.
+
+    Provider order per ticker: cache → yfinance → stooq. The whole series is
+    cached as `data/prices/<TICKER>_series.parquet` (columns: date, close,
+    fetched_at) and reused if fresh within TTL and covering `end`. Never
+    raises on a per-ticker miss — those appear in `missing`.
+    """
+    cache = cache_dir if cache_dir is not None else _CACHE_DIR_DEFAULT
+    try:
+        cache.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        log.warning("cache dir unwritable (%s) — proceeding without cache", exc)
+        cache = None  # type: ignore[assignment]
+
+    rows: dict[str, pd.Series[float]] = {}
+    missing: list[str] = []
+
+    for ticker in dict.fromkeys(tickers):
+        cached = _series_from_cache(ticker, start, end, cache) if cache else None
+        if cached is not None:
+            rows[ticker] = cached
+            continue
+        if not online:
+            missing.append(ticker)
+            continue
+        live = _series_from_yfinance(ticker, start, end)
+        if live is None or live.empty:
+            live = _series_from_stooq(ticker, start, end)
+        if live is None or live.empty:
+            missing.append(ticker)
+            continue
+        if cache:
+            _write_series_cache(ticker, live, cache)
+        rows[ticker] = live
+
+    log.info(
+        "series fetched: returned=%d missing=%d range=%s..%s",
+        len(rows), len(missing), start, end,
+    )
+    return SeriesResult(rows=rows, missing=missing)
+
+
+def _normalize_close(df: pd.DataFrame) -> "pd.Series[float] | None":
+    """Extract a clean daily-close Series (normalized DatetimeIndex) from a yf frame."""
+    if isinstance(df.columns, pd.MultiIndex):
+        df = df.droplevel(1, axis=1)
+    if "Close" not in df.columns:
+        return None
+    close = df["Close"].dropna()
+    if close.empty:
+        return None
+    close.index = pd.to_datetime(close.index).normalize()
+    return close.astype(float)
+
+
+def _series_from_yfinance(ticker: str, start: date, end: date) -> "pd.Series[float] | None":
+    df = _fetch_yf(ticker, start, end + timedelta(days=1))
+    if df is None or df.empty:
+        return None
+    return _normalize_close(df)
+
+
+def _series_from_stooq(ticker: str, start: date, end: date) -> "pd.Series[float] | None":
+    raw = _fetch_stooq_csv(ticker)
+    if not raw:
+        return None
+    dates: list[pd.Timestamp] = []
+    closes: list[float] = []
+    for row in csv.DictReader(io.StringIO(raw)):
+        d_str = row.get("Date") or row.get("date")
+        close_str = row.get("Close") or row.get("close")
+        if d_str is None or close_str is None:
+            continue
+        try:
+            d = date.fromisoformat(d_str)
+            if start <= d <= end:
+                dates.append(pd.Timestamp(d))
+                closes.append(float(close_str))
+        except ValueError:
+            continue
+    if not dates:
+        return None
+    return pd.Series(closes, index=pd.DatetimeIndex(dates), dtype=float).sort_index()
+
+
+def _series_from_cache(
+    ticker: str, start: date, end: date, cache_dir: Path
+) -> "pd.Series[float] | None":
+    path = cache_dir / f"{ticker}_series.parquet"
+    if not path.exists():
+        return None
+    try:
+        df = pd.read_parquet(path)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("series cache read failed for %s: %s", ticker, exc)
+        return None
+    if df.empty or "fetched_at" not in df.columns:
+        return None
+    fetched = pd.to_datetime(df["fetched_at"]).max().to_pydatetime()
+    if fetched.tzinfo is None:
+        fetched = fetched.replace(tzinfo=timezone.utc)
+    now = _now_utc()
+    if fetched > now or now - fetched > _CACHE_TTL:
+        return None  # stale or future-stamped → refetch
+    idx = pd.to_datetime(df["date"]).dt.normalize()
+    series = pd.Series(df["close"].astype(float).to_numpy(), index=pd.DatetimeIndex(idx))
+    series = series.sort_index()
+    # The cached series must cover the requested end date to be usable as-is.
+    if series.index.max() < pd.Timestamp(end - timedelta(days=4)):
+        return None
+    mask = (series.index >= pd.Timestamp(start)) & (series.index <= pd.Timestamp(end))
+    return series[mask]
+
+
+def _write_series_cache(ticker: str, series: "pd.Series[float]", cache_dir: Path) -> None:
+    path = cache_dir / f"{ticker}_series.parquet"
+    fetched = pd.Timestamp(_now_utc())
+    out = pd.DataFrame(
+        {
+            "date": series.index,
+            "close": series.to_numpy(),
+            "fetched_at": fetched,
+        }
+    )
+    try:
+        out.to_parquet(path, index=False)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("series cache write failed for %s: %s", ticker, exc)
 
 
 def _write_cache(row: PriceRow, cache_dir: Path) -> None:

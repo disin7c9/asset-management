@@ -1,0 +1,56 @@
+# Ghostfolio — local instance for end-to-end reconciliation only.
+# Brings up ghostfolio + postgres + redis. Throwaway: `docker compose down -v`
+# wipes it. Reads secrets from the sibling .env file.
+services:
+  ghostfolio:
+    image: ghostfolio/ghostfolio:latest
+    init: true
+    environment:
+      ACCESS_TOKEN_SALT: ${ACCESS_TOKEN_SALT}
+      # sslmode=disable: the plain postgres:15-alpine image has no SSL, and the
+      # Prisma 7 pg adapter errors on `prefer` instead of falling back.
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?connect_timeout=300&sslmode=disable
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      - "3333:3333"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Versions mirror ghostfolio's own docker-compose (tested path): postgres 15,
+  # redis alpine. Not newest-for-newest's-sake — this container is only a TWR
+  # oracle, so we avoid untested DB-version quirks.
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:alpine
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD}"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+volumes:
+  pgdata:

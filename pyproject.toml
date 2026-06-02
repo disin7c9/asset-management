@@ -7,6 +7,7 @@ dependencies = [
     "pandas>=2.2",
     "numpy>=1.26",
     "pyarrow>=15.0",
+    "empyrical-reloaded>=0.5.11",
     "yfinance>=0.2.40",
     "resend>=2.0",
     "python-dotenv>=1.0",

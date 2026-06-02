@@ -6,16 +6,23 @@ import argparse
 import json
 import logging
 import sys
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from app.derive import derive
-from app.events import load_events
+from app.derive import DerivedState, derive
+from app.events import Event, load_events
 from app.log_config import setup_logging
-from app.prices import PricesResult, fetch_latest
+from app.prices import PriceRow, PricesResult, fetch_latest, fetch_series
 from app.report import format_summary
-from app.returns import ReturnsSummary, summarize
+from app.returns import (
+    ReturnsSummary,
+    build_daily_returns,
+    summarize,
+    true_twr_annualized,
+    twr_index,
+)
+from app.risk import RiskSummary, summarize_risk
 
 log = logging.getLogger(__name__)
 
@@ -51,6 +58,11 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="serve from cache only; do not reach the network on a cache miss",
     )
+    parser.add_argument(
+        "--no-risk",
+        action="store_true",
+        help="skip the drawdown/risk panel (needs price history; slower than --no-prices)",
+    )
     args = parser.parse_args(argv)
 
     csv_path: Path = args.csv
@@ -60,6 +72,8 @@ def main(argv: list[str] | None = None) -> int:
         "n_events_replayed": 0,
         "n_prices_fetched": 0,
         "n_prices_missing": 0,
+        "n_series_fetched": 0,
+        "n_series_missing": 0,
         "fallbacks_used": 0,
         "status": "ok",
     }
@@ -82,35 +96,103 @@ def main(argv: list[str] | None = None) -> int:
         _log_run_summary(run)
         return 2
 
-    prices: dict[str, Any] | None = None
+    prices: dict[str, PriceRow] | None = None
     returns: ReturnsSummary | None = None
+    risk: RiskSummary | None = None
+    true_twr: float | None = None
     missing: list[str] = []
-    if not args.no_prices:
-        held = state.held()
-        if held:
-            result: PricesResult = fetch_latest(
-                list(held),
-                cache_dir=args.cache_dir,
-                online=not args.offline,
-            )
-            prices = result.rows
-            missing = result.missing
-            run["n_prices_fetched"] = len(result.rows)
-            run["n_prices_missing"] = len(result.missing)
-            run["fallbacks_used"] = result.fallbacks_used
-            if result.missing:
-                run["status"] = "partial"
-            mkt_value = sum(
-                held[tk].shares * result.rows[tk].close for tk in result.rows
-            )
-            returns = summarize(events, mkt_value, asof_date=date.today())
+
+    if not args.no_prices and state.held():
+        prices, returns, risk, true_twr, missing = _compute_prices_returns_risk(
+            events, state, args, run
+        )
 
     sys.stdout.write(
-        format_summary(state, prices=prices, returns=returns, missing_tickers=missing)
+        format_summary(
+            state,
+            prices=prices,
+            returns=returns,
+            risk=risk,
+            true_twr=true_twr,
+            missing_tickers=missing,
+        )
         + "\n"
     )
     _log_run_summary(run)
     return 0
+
+
+def _compute_prices_returns_risk(
+    events: list[Event],
+    state: DerivedState,
+    args: argparse.Namespace,
+    run: dict[str, Any],
+) -> tuple[
+    dict[str, PriceRow] | None,
+    ReturnsSummary | None,
+    RiskSummary | None,
+    float | None,
+    list[str],
+]:
+    """Fetch prices, derive returns + risk. Single price source per mode.
+
+    When the risk panel is on we fetch price *history* once and derive each
+    held ticker's latest price from its series tail — so MWR/Modified Dietz
+    and the true-TWR share one price universe (no spot-vs-history mismatch)
+    and we avoid a second network round-trip. With --no-risk we fetch only
+    the latest prices.
+    """
+    held = state.held()
+    today = date.today()
+    online = not args.offline
+    prices: dict[str, PriceRow] = {}
+    risk: RiskSummary | None = None
+    true_twr: float | None = None
+
+    series = None
+    if not args.no_risk and events:
+        traded = sorted({ev.ticker for ev in events})
+        start = min(ev.date for ev in events) - timedelta(days=5)
+        series = fetch_series(traded, start, today, cache_dir=args.cache_dir, online=online)
+        run["n_series_fetched"] = len(series.rows)
+        run["n_series_missing"] = len(series.missing)
+        if series.missing and run["status"] == "ok":
+            run["status"] = "partial"
+        if series.rows:
+            daily = build_daily_returns(events, series.rows, asof_date=today)
+            true_twr = true_twr_annualized(daily)
+            risk = summarize_risk(daily, twr_index(daily))
+
+    if series is not None and series.rows:
+        # Derive each held ticker's latest price from its series tail (one source).
+        fetched_at = datetime.now(timezone.utc)
+        for tk in held:
+            s = series.rows.get(tk)
+            if s is not None and not s.empty:
+                prices[tk] = PriceRow(
+                    ticker=tk,
+                    asof_date=s.index[-1].date(),
+                    close=float(s.iloc[-1]),
+                    source="series",
+                    fetched_at=fetched_at,
+                )
+        missing = [tk for tk in held if tk not in prices]
+    else:
+        # No risk panel (or series unavailable): fetch latest prices for held.
+        result: PricesResult = fetch_latest(
+            list(held), cache_dir=args.cache_dir, online=online
+        )
+        prices = result.rows
+        missing = result.missing
+        run["n_prices_fetched"] = len(result.rows)
+        run["n_prices_missing"] = len(result.missing)
+        run["fallbacks_used"] = result.fallbacks_used
+        if result.missing and run["status"] == "ok":
+            run["status"] = "partial"
+
+    mkt_value = sum(held[tk].shares * prices[tk].close for tk in prices)
+    returns = summarize(events, mkt_value, asof_date=today)
+    return prices, returns, risk, true_twr, missing
 
 
 def _log_run_summary(run: dict[str, Any]) -> None:

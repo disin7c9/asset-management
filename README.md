@@ -2,7 +2,7 @@
 
 A small Python tool for tracking a personal portfolio of stocks and ETFs.
 
-Reads an append-only CSV transaction log (date, ticker, action, quantity, price, fee per row), replays it, and prints current holdings + market value, cost basis, realized and unrealized P&L, and per-period returns. Holdings are *derived* from the log — never stored — so the same input always produces the same output. Prices are fetched from multiple sources with fallback and an on-disk cache; every displayed number is traceable to its source.
+Reads an append-only CSV transaction log (date, ticker, action, quantity, price, fee per row), replays it, and prints a **drawdown-first** brief: how far the portfolio fell from its peak (with a bootstrap confidence band), risk-adjusted ratios, time- and money-weighted returns, and current holdings. Holdings are *derived* from the log — never stored — so the same input always produces the same output. Prices are fetched from multiple sources with fallback and an on-disk cache; every displayed number is traceable to its source, and figures that can't be computed honestly (too-short a window, no real solution) print `n/a` rather than a fabricated number.
 
 ## Requirements
 
@@ -18,40 +18,49 @@ uv sync
 ## Run
 
 ```bash
-uv run python -m app                         # bundled example log; fetches live prices
+uv run python -m app                         # bundled example log; fetches prices + risk panel
 uv run python -m app --csv path/to/your.csv  # your own CSV
-uv run python -m app --no-prices             # skip pricing entirely (holdings + realized only)
+uv run python -m app --no-risk               # holdings + returns, skip the drawdown/risk panel
+uv run python -m app --no-prices             # holdings + realized P&L only (no network)
 uv run python -m app --offline               # serve from on-disk cache; no network
 uv run python -m app --cache-dir /some/dir   # override the default cache location
 ```
 
 The CSV is expected to have columns: `Date, Code, DataSource, Currency, Price, Quantity, Action, Fee, Note`. `Action` is one of `buy`, `sell`, `dividend`, `fee`, `interest`. Empty cells in numeric columns are treated as zero. Non-ISO dates are rejected with a clear error. UTF-8 BOM is tolerated.
 
-Example output:
+Example output (drawdown leads, then risk-adjusted ratios, then returns, then holdings):
 
 ```
+=== DRAWDOWN (investment, time-weighted) ===
+Max drawdown:      -9.84%  (95% CI -17.21% .. -5.58%)
+  peak 2025-02-19 → trough 2025-04-08 → 2025-06-10  (111 days)
+Ulcer index:       2.38%   CDaR (worst 5%):  6.73%
+You've spent 80% of this period below a previous high.
+
+=== RISK-ADJUSTED (annualized, 252-day basis, risk-free 0%, ± bootstrap CI) ===
+Sharpe:   +1.75  (95% CI +0.68 .. +2.83)
+Sortino:  +2.66  (95% CI +0.96 .. +4.63)
+Calmar:   +1.97  (95% CI +0.52 .. +4.83)
+
+=== RETURNS (annualized, 252-day basis) ===
+Period: 2023-01-05 → 2026-06-02 (1244 days, ~3.41y)
+Time-weighted (true TWR):                +19.37%
+Money-weighted (IRR):                    +18.28%
+Modified Dietz (approx TWR):             +17.94%
+
+=== HOLDINGS ===
 ticker     shares  avg cost    price    mkt value      unreal    realized
 -------------------------------------------------------------------------
-BND        50.000     72.26    73.46      3673.00      +60.00      +45.10
-IAU        25.000     37.23    85.49      2137.25    +1206.62     +220.62
-VEA        15.000     40.27    71.77      1076.55     +472.55       +0.00
-VOO        12.000    375.13   695.49      8345.88    +3844.28     +295.80
--------------------------------------------------------------------------
+BND        50.000     72.26    73.18      3659.00      +46.00      +45.10
+...
 Total cost basis (held): $9,649.23
-Market value (priced):   $15,232.68
-Unrealized P&L:          $+5,583.45
-Realized P&L (sells+div): $+561.52
-Fees paid (informational): $8.00
-Net P&L (unrealized + realized): $+6,144.98
+Market value (priced):   $15,211.40
+Net P&L (unrealized + realized): $+6,123.70
 
-Period: 2023-01-05 → 2026-06-01 (1243 days, ~3.40y)
-Money-weighted return (IRR, annualized):    +18.35%
-Modified Dietz (annualized, approx TWR):    +18.01%
-
-Prices: 4 yfinance  (age: 0s .. 1s old as of 2026-06-01 04:34 UTC)
+Prices: 4 series  (age: 0s .. 0s old as of 2026-06-02 02:42 UTC)
 ```
 
-Each run emits one structured JSON log line (`run_summary`) on stderr summarizing what happened: `{date, source, n_events_replayed, n_prices_fetched, n_prices_missing, fallbacks_used, status}`.
+Confidence bands come from a moving-block bootstrap. Drawdown is *investment* (time-weighted) drawdown, not account-balance drawdown. Each run also emits one structured JSON log line (`run_summary`) on stderr: `{date, source, n_events_replayed, n_prices_fetched, n_prices_missing, n_series_fetched, n_series_missing, fallbacks_used, status}`.
 
 ## Develop
 
@@ -68,16 +77,32 @@ asset-management/
 ├── app/
 │   ├── events.py     CSV → typed event list
 │   ├── derive.py     events → holdings + cost basis + realized P&L
-│   ├── prices.py     multi-source price fetch with provenance + on-disk cache
-│   ├── returns.py    events + value → MWR (XIRR) + Modified Dietz returns
-│   ├── report.py     state + prices + returns → text summary
+│   ├── prices.py     multi-source price fetch (latest + history) with provenance + cache
+│   ├── returns.py    events + prices → equity curve, true TWR, MWR (XIRR), Modified Dietz
+│   ├── risk.py       drawdown family + Sharpe/Sortino/Calmar with bootstrap CIs
+│   ├── report.py     state + prices + returns + risk → drawdown-first text summary
 │   ├── cli.py        argparse + entry composition + structured run log
 │   ├── log_config.py logging setup
 │   ├── __main__.py   python -m app
 │   └── __init__.py
-├── tests/            unit, property, and regression tests
+├── tests/            automated suite (unit, property, regression) — offline, run on every change
+├── reconcile/        manual cross-validation against external tools (ghostfolio, quantstats)
 ├── pyproject.toml    dependencies, mypy/ruff config
 └── README.md
+```
+
+## Validation
+
+The numbers are cross-checked against two independent tools on the bundled example data (harness in [`reconcile/`](reconcile/)):
+
+- **ghostfolio** reconstructs holdings, market value, and P&L from the same transaction log and matches **to the cent**.
+- **quantstats** independently computes Sharpe, Sortino, and max drawdown from the return series, matching **to 4 decimals**.
+
+Together they validate the whole pipeline: ghostfolio confirms the holdings/value reconstruction; quantstats confirms the risk/return formulas. Full comparison in [`reconcile/RESULTS.md`](reconcile/RESULTS.md).
+
+```bash
+uv run --with quantstats python reconcile/reconcile_quantstats.py   # metric cross-check
+# end-to-end (ghostfolio): see reconcile/RESULTS.md
 ```
 
 ## License
