@@ -61,6 +61,10 @@ class ReturnsSummary:
     asof_date: date
     money_weighted_annualized: float | None  # None if Newton didn't converge
     modified_dietz_annualized: float | None  # None if denominator was degenerate
+    # True time-weighted return (252-basis), computed from the daily-return
+    # series in the composition root and folded in here. A plain value (no CI):
+    # the bootstrapped-metric convention (MetricCI triples) is for risk.py only.
+    true_twr_annualized: float | None = None
 
     @property
     def period_days(self) -> int:
@@ -179,13 +183,18 @@ def summarize(
     events: list[Event],
     current_value: float,
     asof_date: date,
+    *,
+    true_twr: float | None = None,
 ) -> ReturnsSummary:
     """Compute the per-period numbers the report layer renders.
 
     Computes cash flows ONCE and shares them between MWR and Modified Dietz.
+    `true_twr` is computed upstream from the daily-return series (it needs the
+    price history this function doesn't see) and folded into the summary so the
+    report layer reads a single object instead of a side parameter.
     """
     if not events:
-        return ReturnsSummary(asof_date, asof_date, 0.0, 0.0)
+        return ReturnsSummary(asof_date, asof_date, 0.0, 0.0, true_twr_annualized=true_twr)
     cfs = cash_flows_from_events(events)
     period_start = min(ev.date for ev in events)
     period_days = (asof_date - period_start).days
@@ -197,6 +206,7 @@ def summarize(
         asof_date=asof_date,
         money_weighted_annualized=mwr,
         modified_dietz_annualized=md_ann,
+        true_twr_annualized=true_twr,
     )
 
 

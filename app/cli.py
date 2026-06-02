@@ -10,11 +10,20 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from dotenv import load_dotenv
+
 from app.derive import DerivedState, derive
+from app.email import send_report
 from app.events import Event, load_events
 from app.log_config import setup_logging
 from app.prices import PriceRow, PricesResult, fetch_latest, fetch_series
-from app.report import format_summary
+from app.report import (
+    ReportData,
+    build_report_data,
+    render_html,
+    render_markdown,
+    render_text,
+)
 from app.returns import (
     ReturnsSummary,
     build_daily_returns,
@@ -31,10 +40,12 @@ log = logging.getLogger(__name__)
 _REPO_ROOT: Path = Path(__file__).resolve().parents[1]
 _DEFAULT_CSV: Path = _REPO_ROOT / "examples" / "data" / "transactions.csv"
 _DEFAULT_CACHE: Path = _REPO_ROOT / "data" / "prices"
+_DEFAULT_REPORTS: Path = _REPO_ROOT / "reports"
 
 
 def main(argv: list[str] | None = None) -> int:
     setup_logging()
+    load_dotenv(_REPO_ROOT / ".env")  # RESEND_API_KEY / REPORT_TO for --send
     parser = argparse.ArgumentParser(prog="asset-management", description=__doc__)
     parser.add_argument(
         "--csv",
@@ -63,11 +74,28 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="skip the drawdown/risk panel (needs price history; slower than --no-prices)",
     )
+    parser.add_argument(
+        "--save",
+        action="store_true",
+        help="also write the brief as markdown to <reports-dir>/<asof>.md",
+    )
+    parser.add_argument(
+        "--reports-dir",
+        type=Path,
+        default=_DEFAULT_REPORTS,
+        help=f"directory for saved markdown briefs (default: {_DEFAULT_REPORTS})",
+    )
+    parser.add_argument(
+        "--send",
+        action="store_true",
+        help="email the brief as HTML via Resend (needs RESEND_API_KEY + REPORT_TO)",
+    )
     args = parser.parse_args(argv)
 
     csv_path: Path = args.csv
+    today = date.today()  # one as-of date for the title, the filename, and the log
     run: dict[str, Any] = {
-        "date": date.today().isoformat(),
+        "date": today.isoformat(),
         "source": str(csv_path),
         "n_events_replayed": 0,
         "n_prices_fetched": 0,
@@ -76,6 +104,9 @@ def main(argv: list[str] | None = None) -> int:
         "n_series_missing": 0,
         "fallbacks_used": 0,
         "status": "ok",
+        "report_saved": None,
+        "email_sent": False,
+        "email_detail": None,
     }
 
     if not csv_path.exists():
@@ -99,27 +130,61 @@ def main(argv: list[str] | None = None) -> int:
     prices: dict[str, PriceRow] | None = None
     returns: ReturnsSummary | None = None
     risk: RiskSummary | None = None
-    true_twr: float | None = None
     missing: list[str] = []
 
     if not args.no_prices and state.held():
-        prices, returns, risk, true_twr, missing = _compute_prices_returns_risk(
+        prices, returns, risk, missing = _compute_prices_returns_risk(
             events, state, args, run
         )
 
-    sys.stdout.write(
-        format_summary(
-            state,
-            prices=prices,
-            returns=returns,
-            risk=risk,
-            true_twr=true_twr,
-            missing_tickers=missing,
-        )
-        + "\n"
+    data = build_report_data(
+        state, prices=prices, returns=returns, risk=risk,
+        missing_tickers=missing, asof=today,
     )
+
+    sys.stdout.write(render_text(data) + "\n")
+    save_path = args.reports_dir / f"{data.asof_date}.md" if args.save else None
+    delivered = _deliver(data, run, save_path=save_path, send=args.send)
     _log_run_summary(run)
-    return 0
+    # A requested sink that failed → non-zero exit so a scheduler (cron) alerts,
+    # even though the brief was already printed to stdout.
+    return 0 if delivered else 1
+
+
+def _deliver(
+    data: ReportData,
+    run: dict[str, Any],
+    *,
+    save_path: Path | None,
+    send: bool,
+) -> bool:
+    """Route the built report to the optional sinks (markdown file, email).
+
+    stdout already happened in ``main``; this handles only the ``--save`` /
+    ``--send`` sinks and records each outcome in ``run`` for the structured log
+    line. Delivery failures are **recorded, not raised** — the brief was already
+    printed — but the return value is ``False`` if any *requested* sink failed,
+    so the caller can exit non-zero for a scheduler to notice.
+    """
+    ok = True
+    if save_path is not None:
+        try:
+            save_path.parent.mkdir(parents=True, exist_ok=True)
+            save_path.write_text(render_markdown(data), encoding="utf-8")
+            run["report_saved"] = str(save_path)
+            log.info("saved markdown brief to %s", save_path)
+        except OSError as exc:
+            ok = False
+            log.error("failed to save markdown brief to %s: %s", save_path, exc)
+    if send:
+        result = send_report(subject=data.title, html=render_html(data))
+        run["email_sent"] = result.sent
+        run["email_detail"] = result.detail
+        if not result.sent:
+            ok = False
+    if not ok and run["status"] == "ok":
+        run["status"] = "partial"
+    return ok
 
 
 def _compute_prices_returns_risk(
@@ -131,7 +196,6 @@ def _compute_prices_returns_risk(
     dict[str, PriceRow] | None,
     ReturnsSummary | None,
     RiskSummary | None,
-    float | None,
     list[str],
 ]:
     """Fetch prices, derive returns + risk. Single price source per mode.
@@ -191,15 +255,16 @@ def _compute_prices_returns_risk(
             run["status"] = "partial"
 
     mkt_value = sum(held[tk].shares * prices[tk].close for tk in prices)
-    returns = summarize(events, mkt_value, asof_date=today)
-    return prices, returns, risk, true_twr, missing
+    returns = summarize(events, mkt_value, asof_date=today, true_twr=true_twr)
+    return prices, returns, risk, missing
 
 
 def _log_run_summary(run: dict[str, Any]) -> None:
     """Emit one structured JSON line summarizing the run.
 
-    Schema follows CLAUDE.md: {date, source, n_events_replayed, n_prices_fetched,
-    n_prices_missing, fallbacks_used, status, error?}.
+    Schema: {date, source, n_events_replayed, n_prices_fetched, n_prices_missing,
+    n_series_fetched, n_series_missing, fallbacks_used, status, report_saved,
+    email_sent, email_detail?, error?}.
     """
     log.info("run_summary %s", json.dumps(run, separators=(",", ":")))
 
