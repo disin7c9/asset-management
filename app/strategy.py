@@ -1,0 +1,246 @@
+"""Strategy layer: turn current holdings + a target allocation into legible,
+named buy/sell suggestions. Pure functions — no I/O, no network.
+
+This is *discipline, not prediction*. A rebalance suggestion ("you're 7pp
+overweight VOO → trim") makes no claim that it will beat the market, so it needs
+no backtest to be honest. Strategies that claim an *edge* (timing, momentum) are
+a separate concern and must be walk-forward validated (see app/backtest.py, a
+later slice) before they may surface a suggestion.
+
+Every suggestion carries the **named rule** that produced it and a one-line
+reason, so the user learns the rule rather than trusting a black box.
+
+Modes (v0):
+    to_total        sell + buy to hit target weights exactly (deploys new cash too)
+    cash_flow_only  invest new cash into underweights; never sell (tax-friendly)
+    fixed_dca       buy the target mix with a fixed cash amount, ignoring drift
+    bands           like to_total, but only act on tickers whose drift exceeds a
+                    band (prevents churn); rebalances existing holdings only
+
+Weights in the target are **relative** — they are normalized to sum to 1, so
+``25,25,25,25`` and ``0.25,0.25,0.25,0.25`` mean the same thing.
+"""
+
+from __future__ import annotations
+
+import csv
+import logging
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Literal, get_args
+
+log = logging.getLogger(__name__)
+
+Mode = Literal["to_total", "cash_flow_only", "fixed_dca", "bands"]
+VALID_MODES: frozenset[str] = frozenset(get_args(Mode))  # tracks the type
+
+# Trades below this dollar magnitude are treated as "hold" (avoids micro-orders
+# and floating-point residue after an exact rebalance).
+_MIN_TRADE_USD = 1.0
+# A drift exactly at the band counts as within it (hold). The epsilon makes the
+# boundary deterministic instead of swinging on float rounding of weight diffs.
+_BAND_EPS = 1e-9
+
+
+@dataclass(frozen=True)
+class Suggestion:
+    """One per-ticker recommendation, paired to the rule that produced it."""
+
+    ticker: str
+    action: Literal["buy", "sell", "hold"]
+    shares: float            # magnitude of shares to trade (0 for hold)
+    dollars: float           # magnitude of $ to trade (0 for hold)
+    current_weight: float    # share of current portfolio value (0..1)
+    target_weight: float     # normalized target weight (0..1)
+    rule: str                # the mode name
+    reason: str              # human-readable trigger
+
+    @property
+    def drift(self) -> float:
+        return self.current_weight - self.target_weight
+
+
+def load_target(path: Path) -> dict[str, float]:
+    """Load a target-allocation CSV (columns: Ticker, Weight) → normalized weights.
+
+    Weights are relative and normalized to sum to 1.0. A weight of **0 is allowed**
+    and means "close this position" — a deliberate, explicit sell-to-$0. It is kept
+    in the returned dict so the caller can tell an intentional 0 apart from a ticker
+    that was simply omitted (omission is the ambiguous case the CLI warns about).
+    Rejects an empty file, a target that sums to zero, a negative weight, or a
+    non-numeric weight (a clear error beats a silently skewed target).
+    """
+    raw: dict[str, float] = {}
+    with path.open(newline="", encoding="utf-8-sig") as fh:
+        reader = csv.DictReader(fh)
+        fields = {f.strip() for f in (reader.fieldnames or [])}
+        if not {"Ticker", "Weight"} <= fields:
+            msg = f"{path}: target CSV needs columns Ticker, Weight (found {sorted(fields)})"
+            raise ValueError(msg)
+        for row in reader:
+            ticker = (row.get("Ticker") or "").strip().upper()
+            if not ticker:
+                continue
+            raw_w = (row.get("Weight") or "0").strip() or "0"
+            try:
+                weight = float(raw_w)
+            except ValueError:
+                msg = f"{path}: non-numeric weight {raw_w!r} for {ticker}"
+                raise ValueError(msg) from None
+            if weight < 0:
+                msg = (
+                    f"{path}: target weight for {ticker} must be >= 0 "
+                    f"(use 0 to close the position; got {weight})"
+                )
+                raise ValueError(msg)
+            raw[ticker] = raw.get(ticker, 0.0) + weight
+    total = sum(raw.values())
+    if not raw or total <= 0:
+        msg = f"{path}: target allocation is empty or sums to zero"
+        raise ValueError(msg)
+    return {tk: w / total for tk, w in raw.items()}
+
+
+def suggest(
+    mode: Mode,
+    held_value: dict[str, float],
+    prices: dict[str, float],
+    target: dict[str, float],
+    *,
+    new_cash: float = 0.0,
+    band: float = 0.05,
+) -> list[Suggestion]:
+    """Produce per-ticker suggestions for one rebalancing rule.
+
+    ``held_value`` maps ticker → current market value ($); ``prices`` maps ticker
+    → per-share price (to convert dollars to shares). The universe is the union
+    of held and target tickers that have a **positive** price; a ticker with no
+    price — or a non-positive one (bad/stale quote) — is skipped (the caller
+    reports it), which also makes the dollars→shares division safe. Suggestions
+    are returned sorted by ticker.
+    """
+    priced = {tk for tk, px in prices.items() if px > 0}
+    universe = sorted((set(held_value) | set(target)) & priced)
+    total_value = sum(held_value.get(tk, 0.0) for tk in universe)
+
+    if mode == "fixed_dca":
+        return _fixed_dca(universe, held_value, prices, target, total_value, new_cash)
+    if mode == "cash_flow_only":
+        return _cash_flow_only(universe, held_value, prices, target, total_value, new_cash)
+    if mode in ("to_total", "bands"):
+        # Both trade toward target; bands then gates by drift.
+        base = total_value + (new_cash if mode == "to_total" else 0.0)
+        return _to_target(
+            universe, held_value, prices, target, total_value, base,
+            rule=mode, band=(band if mode == "bands" else None),
+        )
+    msg = f"unhandled rebalance mode: {mode!r}"  # fail loud if a mode is added without a branch
+    raise ValueError(msg)
+
+
+def _cur_weight(held_value: dict[str, float], tk: str, total_value: float) -> float:
+    return held_value.get(tk, 0.0) / total_value if total_value > 0 else 0.0
+
+
+def _to_target(
+    universe: list[str],
+    held_value: dict[str, float],
+    prices: dict[str, float],
+    target: dict[str, float],
+    total_value: float,
+    base: float,
+    *,
+    rule: str,
+    band: float | None,
+) -> list[Suggestion]:
+    """Trade each ticker toward target_weight × base. If `band` is set, only act
+    on tickers whose |current − target| exceeds it (others → hold)."""
+    out: list[Suggestion] = []
+    for tk in universe:
+        tgt_w = target.get(tk, 0.0)  # held but not in target → target 0 → sell out
+        cur_w = _cur_weight(held_value, tk, total_value)
+        trade = tgt_w * base - held_value.get(tk, 0.0)
+        if band is not None and abs(cur_w - tgt_w) <= band + _BAND_EPS:
+            out.append(Suggestion(
+                tk, "hold", 0.0, 0.0, cur_w, tgt_w, rule,
+                f"within {band * 100:.1f}pp band",
+            ))
+            continue
+        if abs(trade) < _MIN_TRADE_USD:
+            out.append(Suggestion(tk, "hold", 0.0, 0.0, cur_w, tgt_w, rule, "on target"))
+            continue
+        action: Literal["buy", "sell"] = "buy" if trade > 0 else "sell"
+        drift_pp = (cur_w - tgt_w) * 100
+        if tgt_w == 0.0:
+            # Target 0% (explicitly, or by omission) → a full exit of the position.
+            reason = "target 0% → full exit (raise its weight to keep it)"
+        elif band is not None:
+            reason = f"drift {drift_pp:+.1f}pp exceeds {band * 100:.1f}pp band"
+        else:
+            reason = f"{cur_w * 100:.1f}% vs {tgt_w * 100:.1f}% target"
+        out.append(Suggestion(
+            tk, action, abs(trade) / prices[tk], abs(trade), cur_w, tgt_w, rule, reason,
+        ))
+    return out
+
+
+def _cash_flow_only(
+    universe: list[str],
+    held_value: dict[str, float],
+    prices: dict[str, float],
+    target: dict[str, float],
+    total_value: float,
+    new_cash: float,
+) -> list[Suggestion]:
+    """Deploy `new_cash` into underweights, proportional to each shortfall;
+    never sell. If nothing is underweight, fall back to buying the target mix."""
+    post_total = total_value + new_cash
+    shortfall = {
+        tk: max(0.0, target.get(tk, 0.0) * post_total - held_value.get(tk, 0.0))
+        for tk in universe
+    }
+    total_short = sum(shortfall.values())
+    out: list[Suggestion] = []
+    for tk in universe:
+        tgt_w = target.get(tk, 0.0)
+        cur_w = _cur_weight(held_value, tk, total_value)
+        if new_cash <= 0 or tgt_w <= 0:
+            out.append(Suggestion(tk, "hold", 0.0, 0.0, cur_w, tgt_w,
+                                  "cash_flow_only", "no cash to deploy"))
+            continue
+        if total_short > 0:
+            buy = new_cash * shortfall[tk] / total_short
+            reason = "fill underweight with new cash"
+        else:
+            buy = new_cash * tgt_w  # all at/above target → spread by target mix
+            reason = "no underweights; deploy by target mix"
+        if buy < _MIN_TRADE_USD:
+            out.append(Suggestion(tk, "hold", 0.0, 0.0, cur_w, tgt_w,
+                                  "cash_flow_only", "already at/above target"))
+            continue
+        out.append(Suggestion(tk, "buy", buy / prices[tk], buy, cur_w, tgt_w,
+                              "cash_flow_only", reason))
+    return out
+
+
+def _fixed_dca(
+    universe: list[str],
+    held_value: dict[str, float],
+    prices: dict[str, float],
+    target: dict[str, float],
+    total_value: float,
+    new_cash: float,
+) -> list[Suggestion]:
+    """Buy the target mix with `new_cash`, ignoring current drift entirely."""
+    out: list[Suggestion] = []
+    for tk in universe:
+        tgt_w = target.get(tk, 0.0)
+        cur_w = _cur_weight(held_value, tk, total_value)
+        buy = new_cash * tgt_w
+        if buy < _MIN_TRADE_USD:
+            out.append(Suggestion(tk, "hold", 0.0, 0.0, cur_w, tgt_w,
+                                  "fixed_dca", "not in target / no cash"))
+            continue
+        out.append(Suggestion(tk, "buy", buy / prices[tk], buy, cur_w, tgt_w,
+                              "fixed_dca", f"DCA {tgt_w * 100:.1f}% of ${new_cash:,.0f}"))
+    return out

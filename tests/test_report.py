@@ -22,6 +22,7 @@ from app.report import (
 )
 from app.returns import ReturnsSummary
 from app.risk import DrawdownInfo, MetricCI, RiskSummary
+from app.strategy import Suggestion
 
 
 @pytest.fixture
@@ -151,6 +152,25 @@ def test_holdings_only_when_no_risk_no_returns(state) -> None:
     # asof falls back to today's UTC date (no returns object to date it)
     assert isinstance(data, ReportData)
     assert "n/a" in render_text(data)  # prices absent → unpriced rows show n/a
+
+
+def test_suggestions_lead_and_render(state, prices, returns, risk) -> None:
+    sugs = [
+        Suggestion("VOO", "sell", 1000.0 / 300, 1000.0, 0.60, 0.50, "to_total",
+                   "60.0% vs 50.0% target"),
+        Suggestion("IAU", "buy", 62.5, 2500.0, 0.0, 0.25, "to_total",
+                   "0.0% vs 25.0% target"),
+        Suggestion("BND", "hold", 0.0, 0.0, 0.25, 0.25, "to_total", "on target"),
+    ]
+    data = build_report_data(state, prices, returns, risk, suggestions=sugs)
+    # Actionable panel leads the brief.
+    assert data.sections[0].title.startswith("SUGGESTED ACTIONS")
+    out = render_text(data)
+    assert "SELL" in out and "BUY" in out and "HOLD" in out
+    assert "Buy $2,500.00" in out and "Sell $1,000.00" in out
+    assert "net +$1,500.00 (cash to deploy)" in out
+    assert "## SUGGESTED ACTIONS" in render_markdown(data)
+    assert "<h3" in render_html(data)
 
 
 def test_noisy_note_appears_when_short_history(state, prices, returns) -> None:

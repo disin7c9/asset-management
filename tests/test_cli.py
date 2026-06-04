@@ -6,7 +6,8 @@ monkey-patching ``app.email._dispatch`` so no real email leaves the box.
 
 from __future__ import annotations
 
-from datetime import date
+import logging
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +15,9 @@ import pytest
 
 from app import email as E
 from app.cli import main
+from app.prices import PriceRow, PricesResult
+
+TARGET = Path(__file__).resolve().parents[1] / "data" / "sample_data" / "target.csv"
 
 
 def _today() -> str:
@@ -77,3 +81,158 @@ def test_save_to_unwritable_path_prints_but_exits_nonzero(
     rc = main(["--no-prices", "--save", "--reports-dir", str(blocker / "sub")])
     assert rc == 1  # save failed, recorded not raised
     assert "=== HOLDINGS ===" in capsys.readouterr().out  # brief still printed
+
+
+def test_rebalance_emits_suggestions(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Canned prices for the sample portfolio (held == target tickers) so no network.
+    now = datetime.now(timezone.utc)
+    canned = {
+        tk: PriceRow(tk, date.today(), px, "test", now)
+        for tk, px in {"BND": 73.0, "IAU": 84.0, "VEA": 72.0, "VOO": 697.0}.items()
+    }
+
+    def fake_fetch_latest(tickers, *a, **k):  # type: ignore[no-untyped-def]
+        rows = {tk: canned[tk] for tk in tickers if tk in canned}
+        return PricesResult(rows=rows, missing=[tk for tk in tickers if tk not in canned])
+
+    monkeypatch.setattr("app.cli.fetch_latest", fake_fetch_latest)
+    rc = main(["--no-risk", "--rebalance", "to_total", "--target", str(TARGET)])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "SUGGESTED ACTIONS (rebalance to target)" in out
+    # The actions panel leads the brief, before HOLDINGS.
+    assert out.index("SUGGESTED ACTIONS") < out.index("=== HOLDINGS ===")
+
+
+def test_rebalance_requires_target() -> None:
+    with pytest.raises(SystemExit):  # --rebalance without --target → parser.error
+        main(["--rebalance", "to_total"])
+
+
+def test_rebalance_negative_new_cash_rejected() -> None:
+    with pytest.raises(SystemExit):  # argparse parser.error → exit 2
+        main(["--rebalance", "fixed_dca", "--new-cash", "-100", "--target", str(TARGET)])
+
+
+def test_dump_target_writes_current_allocation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    now = datetime.now(timezone.utc)
+    canned = {
+        tk: PriceRow(tk, date.today(), px, "test", now)
+        for tk, px in {"BND": 73.0, "IAU": 84.0, "VEA": 72.0, "VOO": 697.0}.items()
+    }
+
+    def fake_fetch_latest(tickers, *a, **k):  # type: ignore[no-untyped-def]
+        rows = {tk: canned[tk] for tk in tickers if tk in canned}
+        return PricesResult(rows=rows, missing=[tk for tk in tickers if tk not in canned])
+
+    monkeypatch.setattr("app.cli.fetch_latest", fake_fetch_latest)
+    out_csv = tmp_path / "mytarget.csv"
+    rc = main(["--no-risk", "--dump-target", str(out_csv)])
+    assert rc == 0
+    text = out_csv.read_text(encoding="utf-8")
+    assert text.startswith("Ticker,Weight")
+    assert "VOO," in text and "BND," in text
+    # Weights are percentages summing to ~100.
+    weights = [float(line.split(",")[1]) for line in text.strip().splitlines()[1:]]
+    assert sum(weights) == pytest.approx(100.0, abs=0.1)
+
+
+def test_rebalance_skips_when_holdings_unpriced(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # All fetches miss → held tickers have no usable price → suggestions skipped,
+    # but the rest of the brief must still print (don't emit partial-book trades).
+    def empty_fetch(tickers, *a, **k):  # type: ignore[no-untyped-def]
+        return PricesResult(rows={}, missing=list(tickers))
+
+    monkeypatch.setattr("app.cli.fetch_latest", empty_fetch)
+    rc = main(["--no-risk", "--rebalance", "to_total", "--target", str(TARGET)])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "SUGGESTED ACTIONS" not in out  # skipped, not partial/wrong
+    assert "=== HOLDINGS ===" in out
+
+
+def _canned_sample_prices(monkeypatch: pytest.MonkeyPatch) -> None:
+    now = datetime.now(timezone.utc)
+    canned = {
+        tk: PriceRow(tk, date.today(), px, "test", now)
+        for tk, px in {"BND": 73.0, "IAU": 84.0, "VEA": 72.0, "VOO": 697.0}.items()
+    }
+    monkeypatch.setattr(
+        "app.cli.fetch_latest",
+        lambda tickers, *a, **k: PricesResult(
+            rows={tk: canned[tk] for tk in tickers if tk in canned},
+            missing=[tk for tk in tickers if tk not in canned],
+        ),
+    )
+
+
+def test_dump_target_never_writes_zero_for_a_holding(tmp_path: Path) -> None:
+    # A dust position must not serialize as 0 (which would reload as a deliberate
+    # exit), so a no-edit dump → rebalance round-trip never sells it.
+    from app.cli import _dump_target
+    from app.derive import DerivedState, Position
+    from app.strategy import load_target, suggest
+
+    now = datetime.now(timezone.utc)
+    state = DerivedState()
+    state.positions["VOO"] = Position("VOO", shares=1000.0, cost_basis=1.0)
+    state.positions["DUST"] = Position("DUST", shares=1.0, cost_basis=1.0)
+    prices = {
+        "VOO": PriceRow("VOO", date.today(), 100.0, "t", now),   # $100,000
+        "DUST": PriceRow("DUST", date.today(), 3.0, "t", now),   # $3 → 0.003%
+    }
+    out = tmp_path / "dump.csv"
+    _dump_target(state, prices, out)
+
+    t = load_target(out)
+    assert t["DUST"] > 0.0  # not written as 0.00 → not an accidental exit
+    hv = {tk: state.held()[tk].shares * prices[tk].close for tk in state.held()}
+    pps = {tk: prices[tk].close for tk in prices}
+    s = {x.ticker: x for x in suggest("to_total", hv, pps, t)}
+    assert s["DUST"].action != "sell"  # round-trip is HOLD, not a liquidation
+
+
+def test_rebalance_directory_target_is_nonfatal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _canned_sample_prices(monkeypatch)
+    d = tmp_path / "adir"
+    d.mkdir()
+    rc = main(["--no-risk", "--rebalance", "to_total", "--target", str(d)])
+    assert rc == 0  # IsADirectoryError caught; the rest of the brief prints
+    out = capsys.readouterr().out
+    assert "SUGGESTED ACTIONS" not in out
+    assert "=== HOLDINGS ===" in out
+
+
+def test_omitting_a_holding_warns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str],
+) -> None:
+    _canned_sample_prices(monkeypatch)
+    t = tmp_path / "omit.csv"
+    t.write_text("Ticker,Weight\nVOO,45\nVEA,20\nBND,35\n", encoding="utf-8")  # IAU omitted
+    with caplog.at_level(logging.WARNING):
+        main(["--no-risk", "--rebalance", "to_total", "--target", str(t)])
+    capsys.readouterr()
+    assert "omits held tickers" in caplog.text and "IAU" in caplog.text
+
+
+def test_explicit_zero_weight_does_not_warn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str],
+) -> None:
+    _canned_sample_prices(monkeypatch)
+    t = tmp_path / "explicit.csv"
+    t.write_text("Ticker,Weight\nVOO,45\nVEA,20\nBND,35\nIAU,0\n", encoding="utf-8")
+    with caplog.at_level(logging.WARNING):
+        main(["--no-risk", "--rebalance", "to_total", "--target", str(t)])
+    out = capsys.readouterr().out
+    assert "omits held tickers" not in caplog.text  # explicit 0 → no omission warning
+    assert "IAU" in out  # still shown as a full-exit sell

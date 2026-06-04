@@ -29,6 +29,7 @@ from app.derive import DerivedState
 from app.prices import PriceRow
 from app.returns import ReturnsSummary
 from app.risk import NOISY_THRESHOLD_DAYS, DrawdownInfo, MetricCI, RiskSummary
+from app.strategy import Suggestion
 
 _NA = "n/a"
 _DISCLAIMER = (
@@ -97,10 +98,14 @@ def build_report_data(
     returns: ReturnsSummary | None = None,
     risk: RiskSummary | None = None,
     *,
+    suggestions: list[Suggestion] | None = None,
     missing_tickers: list[str] | None = None,
     asof: date | None = None,
 ) -> ReportData:
-    """Assemble the deterministic brief as ordered sections. Drawdown leads.
+    """Assemble the deterministic brief as ordered sections.
+
+    When present, SUGGESTED ACTIONS leads (it's the call-to-action the user opens
+    the brief for); the drawdown-first risk/return context follows.
 
     `asof` dates the report (its title and the ``reports/<asof>.md`` filename).
     The composition root passes the run's single as-of date so the title, the
@@ -112,6 +117,8 @@ def build_report_data(
     missing_tickers = missing_tickers or []
     sections: list[Section] = []
 
+    if suggestions:
+        sections.append(_section_suggestions(suggestions))
     if risk is not None:
         sections.append(_section_drawdown(risk))
         sections.append(_section_risk_adjusted(risk))
@@ -131,6 +138,48 @@ def build_report_data(
         asof_date=asof_str,
         sections=tuple(sections),
     )
+
+
+_REBALANCE_LABEL = {
+    "to_total": "rebalance to target",
+    "cash_flow_only": "deploy new cash (no sells)",
+    "fixed_dca": "fixed DCA into target mix",
+    "bands": "threshold-band rebalance",
+}
+
+
+def _section_suggestions(suggestions: list[Suggestion]) -> Section:
+    """The actionable panel: per-ticker buy/sell/hold, each paired to its rule."""
+    rule = suggestions[0].rule if suggestions else ""
+    label = _REBALANCE_LABEL.get(rule, rule)
+    lines = [
+        f"{'ticker':7}{'cur%':>7}{'tgt%':>7}{'action':>7}"
+        f"{'$':>13}{'shares':>12}   why",
+        "-" * 78,
+    ]
+    # Biggest trades first; holds (0) sink to the bottom.
+    ordered = sorted(suggestions, key=lambda s: (-s.dollars, s.ticker))
+    buy_total = sell_total = 0.0
+    for s in ordered:
+        sign = 1.0 if s.action == "buy" else -1.0 if s.action == "sell" else 0.0
+        if s.action == "buy":
+            buy_total += s.dollars
+        elif s.action == "sell":
+            sell_total += s.dollars
+        dollars = f"{sign * s.dollars:+13.2f}" if s.action != "hold" else f"{'-':>13}"
+        shares = f"{sign * s.shares:+12.3f}" if s.action != "hold" else f"{'-':>12}"
+        lines.append(
+            f"{s.ticker:7}{s.current_weight * 100:7.1f}{s.target_weight * 100:7.1f}"
+            f"{s.action.upper():>7}{dollars}{shares}   {s.reason}"
+        )
+    net = buy_total - sell_total
+    lines.append(
+        f"Buy ${buy_total:,.2f} · Sell ${sell_total:,.2f} · "
+        f"net {'+' if net >= 0 else '-'}${abs(net):,.2f} "
+        f"({'cash to deploy' if net > 0 else 'cash freed' if net < 0 else 'cash-neutral'})"
+    )
+    lines.append("Suggestions are discipline, not predictions; act or override.")
+    return Section(f"SUGGESTED ACTIONS ({label})", tuple(lines))
 
 
 def _section_drawdown(risk: RiskSummary) -> Section:

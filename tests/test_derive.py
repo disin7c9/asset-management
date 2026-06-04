@@ -36,7 +36,7 @@ def _abs_close(a: float, b: float, tol: float = 1e-6) -> bool:
 def _example_csv() -> Path:
     """Resolve the example transactions CSV path relative to repo root."""
     repo_root = Path(__file__).resolve().parents[1]
-    return repo_root / "examples" / "data" / "transactions.csv"
+    return repo_root / "data" / "sample_data" / "transactions.csv"
 
 
 # --- Golden reconciliation ---

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import logging
 import sys
@@ -32,13 +33,14 @@ from app.returns import (
     twr_index,
 )
 from app.risk import RiskSummary, summarize_risk
+from app.strategy import VALID_MODES, Suggestion, load_target, suggest
 
 log = logging.getLogger(__name__)
 
 # Default CSV resolved against the repo root (parent of the `app/` package),
 # so the CLI works no matter the current working directory.
 _REPO_ROOT: Path = Path(__file__).resolve().parents[1]
-_DEFAULT_CSV: Path = _REPO_ROOT / "examples" / "data" / "transactions.csv"
+_DEFAULT_CSV: Path = _REPO_ROOT / "data" / "sample_data" / "transactions.csv"
 _DEFAULT_CACHE: Path = _REPO_ROOT / "data" / "prices"
 _DEFAULT_REPORTS: Path = _REPO_ROOT / "reports"
 
@@ -90,7 +92,48 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="email the brief as HTML via Resend (needs RESEND_API_KEY + REPORT_TO)",
     )
+    parser.add_argument(
+        "--rebalance",
+        choices=sorted(VALID_MODES),
+        default=None,
+        help="emit buy/sell suggestions toward --target using this rule",
+    )
+    parser.add_argument(
+        "--target",
+        type=Path,
+        default=None,
+        help="target-allocation CSV (Ticker,Weight); REQUIRED with --rebalance. A target "
+        "is a COMPLETE spec: held tickers not listed are sold to $0. Bootstrap one with "
+        "--dump-target, or use data/sample_data/target.csv for the bundled example.",
+    )
+    parser.add_argument(
+        "--dump-target",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="write your CURRENT allocation (held × price weights) to PATH as a target CSV, "
+        "then edit it toward your desired mix (a real-universe starting point)",
+    )
+    parser.add_argument(
+        "--new-cash",
+        type=float,
+        default=0.0,
+        help="new cash to deploy (for cash_flow_only / fixed_dca; also fed to to_total)",
+    )
+    parser.add_argument(
+        "--band",
+        type=float,
+        default=0.05,
+        help="drift threshold for --rebalance bands, as a fraction (default: 0.05 = 5pp)",
+    )
     args = parser.parse_args(argv)
+    if args.new_cash < 0:
+        parser.error("--new-cash must be >= 0")
+    if args.rebalance and args.target is None:
+        parser.error(
+            "--rebalance requires --target (bootstrap one from your holdings with "
+            "--dump-target PATH, or pass data/sample_data/target.csv for the example)"
+        )
 
     csv_path: Path = args.csv
     today = date.today()  # one as-of date for the title, the filename, and the log
@@ -107,6 +150,7 @@ def main(argv: list[str] | None = None) -> int:
         "report_saved": None,
         "email_sent": False,
         "email_detail": None,
+        "rebalance": None,
     }
 
     if not csv_path.exists():
@@ -137,9 +181,16 @@ def main(argv: list[str] | None = None) -> int:
             events, state, args, run
         )
 
+    if args.dump_target:
+        _dump_target(state, prices, args.dump_target)
+
+    suggestions: list[Suggestion] | None = None
+    if args.rebalance:
+        suggestions = _compute_suggestions(state, prices, args, run)
+
     data = build_report_data(
         state, prices=prices, returns=returns, risk=risk,
-        missing_tickers=missing, asof=today,
+        suggestions=suggestions, missing_tickers=missing, asof=today,
     )
 
     sys.stdout.write(render_text(data) + "\n")
@@ -254,9 +305,141 @@ def _compute_prices_returns_risk(
         if result.missing and run["status"] == "ok":
             run["status"] = "partial"
 
-    mkt_value = sum(held[tk].shares * prices[tk].close for tk in prices)
+    mkt_value = sum(_held_market_value(state, prices).values())
     returns = summarize(events, mkt_value, asof_date=today, true_twr=true_twr)
     return prices, returns, risk, missing
+
+
+def _held_market_value(
+    state: DerivedState, prices: dict[str, PriceRow]
+) -> dict[str, float]:
+    """Per-held-ticker market value (shares × close), priced tickers only.
+
+    The single source of held-value math for the CLI (holdings sizing, returns,
+    suggestions, and --dump-target all go through here), so a future valuation
+    change lands in one place. A ticker absent from `prices` or with a
+    non-positive close is omitted (no usable price)."""
+    held = state.held()
+    return {
+        tk: held[tk].shares * prices[tk].close
+        for tk in held
+        if tk in prices and prices[tk].close > 0
+    }
+
+
+def _compute_suggestions(
+    state: DerivedState,
+    prices: dict[str, PriceRow] | None,
+    args: argparse.Namespace,
+    run: dict[str, Any],
+) -> list[Suggestion] | None:
+    """Load the target, ensure a usable price for every (held ∪ target) ticker, run the rule.
+
+    Suggestions size trades in shares, so each ticker needs a positive price: held
+    tickers are already priced; target buy-ins are fetched on demand (counted into
+    the run summary like any other price fetch). With --no-prices there is nothing
+    to size against, so we skip. **If any held ticker lacks a usable price we skip
+    entirely** rather than compute weights over a partial portfolio (that would
+    understate the total and emit confidently-wrong trades). A bad/missing target
+    file is non-fatal — the rest of the brief still prints.
+    """
+    if args.rebalance == "bands" and args.new_cash > 0:
+        log.warning("--rebalance bands ignores --new-cash (it rebalances existing holdings)")
+    if not args.target.exists():
+        log.error("--rebalance: target file not found: %s", args.target)
+        run["rebalance"] = "skipped: no target file"
+        return None
+    try:
+        target = load_target(args.target)
+    except (ValueError, OSError) as exc:  # bad contents OR an unreadable path/dir
+        log.error("--rebalance: %s", exc)
+        run["rebalance"] = "skipped: bad target"
+        return None
+
+    combined: dict[str, PriceRow] = dict(prices or {})
+    held = state.held()
+    omitted_held = sorted(tk for tk in held if tk not in target)
+    if omitted_held:
+        log.warning(
+            "--rebalance: target omits held tickers; they are treated as 0%% "
+            "(sold to $0; bands sells only past the band) — add them to keep them: %s",
+            ", ".join(omitted_held),
+        )
+    need = sorted((set(target) | set(held)) - set(combined))
+    if need:
+        if args.no_prices:
+            log.warning("--rebalance needs prices to size trades; remove --no-prices")
+            run["rebalance"] = "skipped: --no-prices"
+            return None
+        result = fetch_latest(need, cache_dir=args.cache_dir, online=not args.offline)
+        combined.update(result.rows)
+        run["n_prices_fetched"] += len(result.rows)
+        run["fallbacks_used"] += result.fallbacks_used
+        if result.missing:
+            run["n_prices_missing"] += len(result.missing)
+            if run["status"] == "ok":
+                run["status"] = "partial"
+            log.warning("--rebalance: no price for: %s", ", ".join(result.missing))
+
+    price_per_share = {tk: row.close for tk, row in combined.items() if row.close > 0}
+    unpriced_held = sorted(tk for tk in held if tk not in price_per_share)
+    if unpriced_held:
+        log.warning(
+            "--rebalance skipped: held tickers lack a usable price: %s",
+            ", ".join(unpriced_held),
+        )
+        run["rebalance"] = "skipped: unpriced holdings"
+        return None
+
+    held_value = _held_market_value(state, combined)
+    sugg = suggest(
+        args.rebalance, held_value, price_per_share, target,
+        new_cash=args.new_cash, band=args.band,
+    )
+    run["rebalance"] = args.rebalance
+    return sugg
+
+
+def _dump_target(
+    state: DerivedState,
+    prices: dict[str, PriceRow] | None,
+    path: Path,
+) -> None:
+    """Write the user's CURRENT allocation as a target CSV they can edit.
+
+    Weights are current market-value shares (held × price), so the file already
+    lists the real universe; the user edits the numbers toward their desired mix.
+    Needs prices (skips under --no-prices); unpriced holdings are noted, not guessed.
+    """
+    if not prices:
+        log.warning("--dump-target needs prices; remove --no-prices")
+        return
+    values = _held_market_value(state, prices)
+    total = sum(values.values())
+    if total <= 0:
+        log.warning("--dump-target: no priced holdings to write")
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(["Ticker", "Weight"])
+        # Deterministic order (value desc, then ticker). Critically, a held
+        # position must NEVER serialize as 0 — on reload a 0 means a deliberate
+        # exit, so a no-edit round-trip would sell it. Widen precision for tiny
+        # weights and floor to a strictly-positive value.
+        for tk, val in sorted(values.items(), key=lambda kv: (-kv[1], kv[0])):
+            pct = val / total * 100
+            w_str = f"{pct:.2f}"
+            if float(w_str) == 0.0:
+                w_str = f"{max(pct, 1e-6):.6f}"
+            writer.writerow([tk, w_str])
+    log.info(
+        "wrote current allocation (%d tickers) to %s — edit toward your target",
+        len(values), path,
+    )
+    omitted = sorted(tk for tk in state.held() if tk not in values)
+    if omitted:
+        log.warning("--dump-target: skipped unpriced holdings: %s", ", ".join(omitted))
 
 
 def _log_run_summary(run: dict[str, Any]) -> None:
@@ -264,7 +447,7 @@ def _log_run_summary(run: dict[str, Any]) -> None:
 
     Schema: {date, source, n_events_replayed, n_prices_fetched, n_prices_missing,
     n_series_fetched, n_series_missing, fallbacks_used, status, report_saved,
-    email_sent, email_detail?, error?}.
+    email_sent, email_detail?, rebalance, error?}.
     """
     log.info("run_summary %s", json.dumps(run, separators=(",", ":")))
 
