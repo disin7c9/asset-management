@@ -34,6 +34,14 @@ log = logging.getLogger(__name__)
 Mode = Literal["to_total", "cash_flow_only", "fixed_dca", "bands"]
 VALID_MODES: frozenset[str] = frozenset(get_args(Mode))  # tracks the type
 
+StrategyKind = Literal["discipline", "edge"]
+# Every v1 mode is *discipline*: rebalancing makes no claim to beat the market, so
+# it needs no backtest to be honest and may always suggest. An *edge* strategy
+# (timing/momentum, post-v1) MUST pass a walk-forward backtest before it may
+# surface a suggestion — enforced by `may_suggest`. The map is the single source
+# of truth; an unknown mode is treated as edge (fail-safe → must be validated).
+_MODE_KIND: dict[str, StrategyKind] = {m: "discipline" for m in VALID_MODES}
+
 # Trades below this dollar magnitude are treated as "hold" (avoids micro-orders
 # and floating-point residue after an exact rebalance).
 _MIN_TRADE_USD = 1.0
@@ -101,6 +109,19 @@ def load_target(path: Path) -> dict[str, float]:
     return {tk: w / total for tk, w in raw.items()}
 
 
+def strategy_kind(mode: str) -> StrategyKind:
+    """Discipline or edge. Unknown modes default to edge (must be validated)."""
+    return _MODE_KIND.get(mode, "edge")
+
+
+def may_suggest(mode: str, *, backtest_validated: bool = False) -> bool:
+    """The discipline-vs-edge gate. A discipline strategy may always surface a
+    suggestion; an *edge* strategy may only after a walk-forward backtest has
+    validated it. (No edge strategies exist in v1, so this is a dormant guard
+    that makes the future safe — and refuses unknown modes by default.)"""
+    return strategy_kind(mode) == "discipline" or backtest_validated
+
+
 def suggest(
     mode: Mode,
     held_value: dict[str, float],
@@ -119,6 +140,15 @@ def suggest(
     reports it), which also makes the dollars→shares division safe. Suggestions
     are returned sorted by ticker.
     """
+    if not may_suggest(mode):
+        # Enforce the gate at the chokepoint, not just in the CLI: ANY caller of
+        # suggest() (a future API, a backtest-driven path) is refused an edge
+        # strategy until a walk-forward backtest validates it.
+        msg = (
+            f"{mode!r} is an edge strategy and must pass a walk-forward backtest "
+            "before it may suggest"
+        )
+        raise ValueError(msg)
     priced = {tk for tk, px in prices.items() if px > 0}
     universe = sorted((set(held_value) | set(target)) & priced)
     total_value = sum(held_value.get(tk, 0.0) for tk in universe)

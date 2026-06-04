@@ -6,7 +6,13 @@ from pathlib import Path
 
 import pytest
 
-from app.strategy import Suggestion, load_target, suggest
+from app.strategy import (
+    Suggestion,
+    load_target,
+    may_suggest,
+    strategy_kind,
+    suggest,
+)
 
 # A simple, hand-checkable book: $10,000 split 60/40 VOO/BND; IAU is a buy-in.
 HELD = {"VOO": 6000.0, "BND": 4000.0}
@@ -166,6 +172,22 @@ def test_unpriced_target_ticker_is_skipped() -> None:
     assert "IAU" not in s
 
 
+# ── discipline-vs-edge gate ────────────────────────────────────────────────
+
+
+def test_all_v1_modes_are_discipline_and_may_suggest() -> None:
+    for mode in ("to_total", "cash_flow_only", "fixed_dca", "bands"):
+        assert strategy_kind(mode) == "discipline"
+        assert may_suggest(mode) is True
+
+
+def test_unknown_mode_is_edge_and_gated() -> None:
+    # An unrecognized/future strategy defaults to edge → blocked until validated.
+    assert strategy_kind("momentum") == "edge"
+    assert may_suggest("momentum") is False
+    assert may_suggest("momentum", backtest_validated=True) is True
+
+
 def test_drift_property() -> None:
     s = _by_ticker(suggest("to_total", HELD, PRICES, TARGET))
     assert s["VOO"].drift == pytest.approx(s["VOO"].current_weight - s["VOO"].target_weight)
@@ -187,9 +209,11 @@ def test_bands_boundary_deterministic_hold() -> None:
     assert s["VOO"].action == "hold" and s["BND"].action == "hold"
 
 
-def test_unknown_mode_raises() -> None:
-    with pytest.raises(ValueError, match="unhandled rebalance mode"):
-        suggest("bogus", HELD, PRICES, TARGET)  # type: ignore[arg-type]
+def test_suggest_refuses_edge_mode_at_the_chokepoint() -> None:
+    # The gate is enforced INSIDE suggest(), so any caller is refused an unknown/
+    # edge mode (not just the CLI).
+    with pytest.raises(ValueError, match="edge strategy"):
+        suggest("momentum", HELD, PRICES, TARGET)  # type: ignore[arg-type]
 
 
 def test_load_target_nonnumeric_weight(tmp_path: Path) -> None:

@@ -154,6 +154,25 @@ def test_holdings_only_when_no_risk_no_returns(state) -> None:
     assert "n/a" in render_text(data)  # prices absent → unpriced rows show n/a
 
 
+def test_backtest_section_renders(state, prices) -> None:
+    import pandas as pd
+
+    from app.backtest import backtest_compare
+
+    dates = pd.bdate_range("2024-01-01", periods=80)
+    a = pd.Series([100.0 + i for i in range(80)], index=dates, dtype=float)
+    b = pd.Series([50.0] * 80, index=dates, dtype=float)
+    bt = backtest_compare({"A": a, "B": b}, {"A": 0.5, "B": 0.5},
+                          schedule="quarterly", bootstrap_n=30)
+    assert bt is not None
+    data = build_report_data(state, prices, backtest=bt)
+    assert any(s.title.startswith("BACKTEST") for s in data.sections)
+    out = render_text(data)
+    assert "rebalanced (quarterly)" in out and "buy & hold" in out
+    assert "Max drawdown" in out and "Final value" in out
+    assert "simulation, not a prediction" in out
+
+
 def test_suggestions_lead_and_render(state, prices, returns, risk) -> None:
     sugs = [
         Suggestion("VOO", "sell", 1000.0 / 300, 1000.0, 0.60, 0.50, "to_total",

@@ -33,7 +33,8 @@ from app.returns import (
     twr_index,
 )
 from app.risk import RiskSummary, summarize_risk
-from app.strategy import VALID_MODES, Suggestion, load_target, suggest
+from app.backtest import BacktestResult, backtest_compare
+from app.strategy import VALID_MODES, Suggestion, load_target, may_suggest, suggest
 
 log = logging.getLogger(__name__)
 
@@ -52,8 +53,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--csv",
         type=Path,
-        default=_DEFAULT_CSV,
-        help=f"path to the ghostfolio-format transaction CSV (default: {_DEFAULT_CSV})",
+        default=None,  # None = not given → fall back to the bundled example (and warn on real intent)
+        help=f"path to the ghostfolio-format transaction CSV (default: the bundled example, {_DEFAULT_CSV.name})",
     )
     parser.add_argument(
         "--cache-dir",
@@ -126,16 +127,48 @@ def main(argv: list[str] | None = None) -> int:
         default=0.05,
         help="drift threshold for --rebalance bands, as a fraction (default: 0.05 = 5pp)",
     )
+    parser.add_argument(
+        "--backtest",
+        action="store_true",
+        help="notional $10k historical simulation of --target: rebalanced vs buy-and-hold",
+    )
+    parser.add_argument(
+        "--backtest-start",
+        type=date.fromisoformat,
+        default=None,
+        metavar="YYYY-MM-DD",
+        help="start date for --backtest (default: earliest date all target tickers have prices)",
+    )
+    parser.add_argument(
+        "--rebalance-every",
+        choices=("monthly", "quarterly", "annually"),
+        default="quarterly",
+        help="rebalance schedule for the --backtest rebalanced leg (default: quarterly)",
+    )
     args = parser.parse_args(argv)
     if args.new_cash < 0:
         parser.error("--new-cash must be >= 0")
-    if args.rebalance and args.target is None:
+    if (args.rebalance or args.backtest) and args.target is None:
         parser.error(
-            "--rebalance requires --target (bootstrap one from your holdings with "
-            "--dump-target PATH, or pass data/sample_data/target.csv for the example)"
+            "--rebalance/--backtest require --target (bootstrap one from your holdings "
+            "with --dump-target PATH, or pass data/sample_data/target.csv for the example)"
+        )
+    if args.backtest_start is not None and args.backtest_start > date.today():
+        parser.error("--backtest-start must not be in the future")
+    # Footgun guard: a real-intent flag with no --csv (args.csv is None) silently
+    # uses the bundled example portfolio, so the HOLDINGS panel would show the
+    # sample (not your data) next to your real target/backtest. Warn — keyed on
+    # "was --csv supplied?", so an explicit sample path doesn't misfire.
+    if args.csv is None and (
+        args.rebalance or args.backtest or args.save or args.send or args.dump_target
+    ):
+        log.warning(
+            "no --csv given: using the bundled EXAMPLE portfolio (%s) — the HOLDINGS "
+            "panel is the example, not your data. Pass --csv your.csv for your own book.",
+            _DEFAULT_CSV.name,
         )
 
-    csv_path: Path = args.csv
+    csv_path: Path = args.csv if args.csv is not None else _DEFAULT_CSV
     today = date.today()  # one as-of date for the title, the filename, and the log
     run: dict[str, Any] = {
         "date": today.isoformat(),
@@ -151,6 +184,7 @@ def main(argv: list[str] | None = None) -> int:
         "email_sent": False,
         "email_detail": None,
         "rebalance": None,
+        "backtest": None,
     }
 
     if not csv_path.exists():
@@ -188,9 +222,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.rebalance:
         suggestions = _compute_suggestions(state, prices, args, run)
 
+    backtest: BacktestResult | None = None
+    if args.backtest:
+        backtest = _compute_backtest(args, run)
+
     data = build_report_data(
         state, prices=prices, returns=returns, risk=risk,
-        suggestions=suggestions, missing_tickers=missing, asof=today,
+        suggestions=suggestions, backtest=backtest, missing_tickers=missing, asof=today,
     )
 
     sys.stdout.write(render_text(data) + "\n")
@@ -343,6 +381,16 @@ def _compute_suggestions(
     understate the total and emit confidently-wrong trades). A bad/missing target
     file is non-fatal — the rest of the brief still prints.
     """
+    if not may_suggest(args.rebalance):
+        # The discipline-vs-edge gate: an edge strategy must pass a walk-forward
+        # backtest before it may suggest. No edge strategies exist in v1, so this
+        # is a dormant safety guard (and refuses unknown modes).
+        log.warning(
+            "--rebalance %s is an edge strategy and must pass a walk-forward backtest "
+            "before it may suggest (not implemented in v1)", args.rebalance,
+        )
+        run["rebalance"] = "skipped: unvalidated edge strategy"
+        return None
     if args.rebalance == "bands" and args.new_cash > 0:
         log.warning("--rebalance bands ignores --new-cash (it rebalances existing holdings)")
     if not args.target.exists():
@@ -442,12 +490,44 @@ def _dump_target(
         log.warning("--dump-target: skipped unpriced holdings: %s", ", ".join(omitted))
 
 
+def _compute_backtest(
+    args: argparse.Namespace, run: dict[str, Any]
+) -> BacktestResult | None:
+    """Notional backtest of the target: fetch its price history and simulate the
+    rebalanced leg vs buy-and-hold. Independent of the user's holdings (notional);
+    a bad target or missing history is non-fatal — the rest of the brief prints."""
+    try:
+        target = load_target(args.target)
+    except (ValueError, OSError) as exc:
+        log.error("--backtest: %s", exc)
+        run["backtest"] = "skipped: bad target"
+        return None
+    today = date.today()
+    lookback = args.backtest_start or (today - timedelta(days=3653))  # ~10y of history
+    series = fetch_series(
+        sorted(target), lookback, today, cache_dir=args.cache_dir, online=not args.offline
+    )
+    if not series.rows:
+        log.warning("--backtest: no price history for the target tickers")
+        run["backtest"] = "skipped: no prices"
+        return None
+    result = backtest_compare(
+        series.rows, target, schedule=args.rebalance_every,
+        start=args.backtest_start, end=today,
+    )
+    if result is None:
+        run["backtest"] = "skipped: insufficient history"
+        return None
+    run["backtest"] = args.rebalance_every
+    return result
+
+
 def _log_run_summary(run: dict[str, Any]) -> None:
     """Emit one structured JSON line summarizing the run.
 
     Schema: {date, source, n_events_replayed, n_prices_fetched, n_prices_missing,
     n_series_fetched, n_series_missing, fallbacks_used, status, report_saved,
-    email_sent, email_detail?, rebalance, error?}.
+    email_sent, email_detail?, rebalance, backtest, error?}.
     """
     log.info("run_summary %s", json.dumps(run, separators=(",", ":")))
 

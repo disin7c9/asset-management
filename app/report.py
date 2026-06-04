@@ -25,6 +25,7 @@ from collections import Counter
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 
+from app.backtest import BacktestResult
 from app.derive import DerivedState
 from app.prices import PriceRow
 from app.returns import ReturnsSummary
@@ -99,6 +100,7 @@ def build_report_data(
     risk: RiskSummary | None = None,
     *,
     suggestions: list[Suggestion] | None = None,
+    backtest: BacktestResult | None = None,
     missing_tickers: list[str] | None = None,
     asof: date | None = None,
 ) -> ReportData:
@@ -125,6 +127,8 @@ def build_report_data(
     if returns is not None and returns.period_days > 0:
         sections.append(_section_returns(returns))
     sections.append(_section_holdings(state, prices))
+    if backtest is not None and backtest.legs:
+        sections.append(_section_backtest(backtest))
 
     footer = _footer_section(prices, missing_tickers)
     if footer is not None:
@@ -286,6 +290,48 @@ def _section_holdings(state: DerivedState, prices: dict[str, PriceRow]) -> Secti
         # the bottom line must NOT subtract them again.
         lines.append(f"Net P&L (unrealized + realized): ${total_unreal + real:+,.2f}")
     return Section("HOLDINGS", tuple(lines))
+
+
+def _section_backtest(bt: BacktestResult) -> Section:
+    """Two-leg comparison (rebalanced vs buy-and-hold), drawdown-first."""
+    legs = bt.legs
+    lw, cw = 26, 24  # label width, per-leg column width
+
+    def row(label: str, cells: list[str]) -> str:
+        return f"{label:<{lw}}" + "".join(f"{c:>{cw}}" for c in cells)
+
+    def ratio(x: float) -> str:
+        return _NA if not math.isfinite(x) else f"{x:+.2f}"
+
+    def dd_ci(ci: MetricCI) -> str:
+        if not math.isfinite(ci.point):
+            return _NA
+        return f"{ci.low * 100:.1f}% .. {ci.high * 100:.1f}%"
+
+    lines = [
+        row("", [leg.label for leg in legs]),
+        "-" * (lw + cw * len(legs)),
+        row("Max drawdown", [_pct_or_na(leg.risk.max_drawdown_ci.point) for leg in legs]),
+        row("  95% CI", [dd_ci(leg.risk.max_drawdown_ci) for leg in legs]),
+        row("Sharpe (252-basis)", [ratio(leg.risk.sharpe.point) for leg in legs]),
+        row("Sortino", [ratio(leg.risk.sortino.point) for leg in legs]),
+        row("Annualized return", [_pct_or_na(leg.annualized_return) for leg in legs]),
+        row("Final value", [f"${leg.final_value:,.0f}" for leg in legs]),
+    ]
+    if any(leg.risk.is_noisy for leg in legs):
+        lines.append(
+            f"  ⚠ short window (< {NOISY_THRESHOLD_DAYS} return-days ≈ 2y); treat as noisy."
+        )
+    if bt.missing:
+        lines.append(f"  excluded (no price history): {', '.join(bt.missing)}")
+    lines.append(
+        "Rebalancing is discipline, not a prediction; past results don't guarantee future ones."
+    )
+    title = (
+        f"BACKTEST (notional ${bt.initial:,.0f} · {bt.start} → {bt.end} · "
+        "simulation, not a prediction)"
+    )
+    return Section(title, tuple(lines))
 
 
 def _footer_section(

@@ -15,7 +15,7 @@ import pytest
 
 from app import email as E
 from app.cli import main
-from app.prices import PriceRow, PricesResult
+from app.prices import PriceRow, PricesResult, SeriesResult
 
 TARGET = Path(__file__).resolve().parents[1] / "data" / "sample_data" / "target.csv"
 
@@ -209,6 +209,73 @@ def test_rebalance_directory_target_is_nonfatal(
     out = capsys.readouterr().out
     assert "SUGGESTED ACTIONS" not in out
     assert "=== HOLDINGS ===" in out
+
+
+def test_cli_backtest_renders_section(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import pandas as pd
+
+    dates = pd.bdate_range("2024-01-01", periods=120)
+    rows = {
+        "VOO": pd.Series([100.0 + i * 0.5 for i in range(120)], index=dates, dtype=float),
+        "VEA": pd.Series([50.0 + i * 0.2 for i in range(120)], index=dates, dtype=float),
+        "BND": pd.Series([70.0] * 120, index=dates, dtype=float),
+        "IAU": pd.Series([40.0 + i * 0.1 for i in range(120)], index=dates, dtype=float),
+    }
+
+    def fake_fetch_series(tickers, *a, **k):  # type: ignore[no-untyped-def]
+        present = {tk: rows[tk] for tk in tickers if tk in rows}
+        return SeriesResult(rows=present, missing=[tk for tk in tickers if tk not in rows])
+
+    monkeypatch.setattr("app.cli.fetch_series", fake_fetch_series)
+    # --no-prices skips the holdings price panel; --backtest still fetches series.
+    rc = main(["--no-prices", "--backtest", "--rebalance-every", "monthly",
+               "--target", str(TARGET)])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "BACKTEST" in out
+    assert "rebalanced (monthly)" in out and "buy & hold" in out
+
+
+def test_backtest_requires_target() -> None:
+    with pytest.raises(SystemExit):
+        main(["--backtest"])
+
+
+def test_backtest_start_in_future_rejected() -> None:
+    with pytest.raises(SystemExit):
+        main(["--backtest", "--target", str(TARGET), "--backtest-start", "2999-01-01"])
+
+
+def test_default_csv_with_real_intent_warns(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # No --csv + a real-intent flag → warn that holdings are the bundled example.
+    monkeypatch.setattr(
+        "app.cli.fetch_series", lambda *a, **k: SeriesResult(rows={}, missing=[])
+    )
+    with caplog.at_level(logging.WARNING):
+        main(["--no-prices", "--backtest", "--target", str(TARGET)])
+    capsys.readouterr()
+    assert "EXAMPLE portfolio" in caplog.text
+
+
+def test_explicit_csv_suppresses_footgun_warning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str],
+) -> None:
+    csv = tmp_path / "mine.csv"
+    csv.write_text("Date,Code,Action,Quantity,Price,Fee\n2024-01-02,VOO,buy,1,100,0\n",
+                   encoding="utf-8")
+    monkeypatch.setattr(
+        "app.cli.fetch_series", lambda *a, **k: SeriesResult(rows={}, missing=[])
+    )
+    with caplog.at_level(logging.WARNING):
+        main(["--csv", str(csv), "--no-prices", "--backtest", "--target", str(TARGET)])
+    capsys.readouterr()
+    assert "EXAMPLE portfolio" not in caplog.text
 
 
 def test_omitting_a_holding_warns(
