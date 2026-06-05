@@ -6,6 +6,7 @@ monkey-patching ``app.email._dispatch`` so no real email leaves the box.
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -18,6 +19,15 @@ from app.cli import main
 from app.prices import PriceRow, PricesResult, SeriesResult
 
 TARGET = Path(__file__).resolve().parents[1] / "data" / "sample_data" / "target.csv"
+
+
+def _run_summary(caplog: pytest.LogCaptureFixture) -> dict[str, Any]:
+    """Parse the last structured ``run_summary`` JSON line cli.main emitted."""
+    for rec in reversed(caplog.records):
+        msg = rec.getMessage()
+        if rec.name == "app.cli" and msg.startswith("run_summary "):
+            return json.loads(msg[len("run_summary ") :])  # type: ignore[no-any-return]
+    raise AssertionError("no run_summary line was logged")
 
 
 def _today() -> str:
@@ -303,3 +313,239 @@ def test_explicit_zero_weight_does_not_warn(
     out = capsys.readouterr().out
     assert "omits held tickers" not in caplog.text  # explicit 0 → no omission warning
     assert "IAU" in out  # still shown as a full-exit sell
+
+
+# ── --offline end-to-end (no network) ───────────────────────────────────────
+
+
+def test_offline_never_touches_the_network(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    # --offline must serve from cache only. Make BOTH network wrappers fail the
+    # test if reached; an empty cache → all prices missing, but the brief prints.
+    import app.prices as P
+
+    monkeypatch.setattr(P, "_fetch_yf", lambda *a, **k: pytest.fail("network call in --offline"))
+    monkeypatch.setattr(
+        P, "_fetch_stooq_csv", lambda *a, **k: pytest.fail("network call in --offline")
+    )
+    rc = main(["--offline", "--cache-dir", str(tmp_path)])
+    assert rc == 0
+    assert "=== HOLDINGS ===" in capsys.readouterr().out
+
+
+# ── run_summary structured-log paths ────────────────────────────────────────
+
+
+def test_missing_csv_returns_2_and_logs_error(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level(logging.INFO):
+        rc = main(["--csv", str(tmp_path / "nope.csv")])
+    assert rc == 2
+    run = _run_summary(caplog)
+    assert run["status"] == "error" and run["error"] == "csv_not_found"
+
+
+def test_run_summary_counts_prices_on_series_path(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # Regression for P1#1: the common risk-on path must record n_prices_fetched
+    # (it was stuck at 0 because only the --no-risk branch set it), and
+    # fallbacks_used must reflect the series provenance.
+    import pandas as pd
+
+    dates = pd.bdate_range("2024-01-01", periods=400)
+
+    def fake_series(tickers, *a, **k):  # type: ignore[no-untyped-def]
+        rows = {
+            tk: pd.Series([100.0 + i * 0.1 for i in range(len(dates))], index=dates, dtype=float)
+            for tk in tickers
+        }
+        prov = {tk: ("stooq", datetime.now(timezone.utc)) for tk in tickers}
+        return SeriesResult(rows=rows, missing=[], provenance=prov)
+
+    monkeypatch.setattr("app.cli.fetch_series", fake_series)
+    with caplog.at_level(logging.INFO):
+        rc = main([])  # default sample CSV, risk panel ON
+    capsys.readouterr()
+    assert rc == 0
+    run = _run_summary(caplog)
+    assert run["n_prices_fetched"] > 0      # was 0 before the fix
+    assert run["n_prices_missing"] == 0
+    assert run["n_series_fetched"] > 0
+    assert run["fallbacks_used"] == run["n_series_fetched"]  # all provenance is stooq
+
+
+def test_rebalance_missing_target_file_skip_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str],
+) -> None:
+    _canned_sample_prices(monkeypatch)
+    with caplog.at_level(logging.INFO):
+        rc = main(["--no-risk", "--rebalance", "to_total", "--target", str(tmp_path / "nope.csv")])
+    capsys.readouterr()
+    assert rc == 0
+    assert _run_summary(caplog)["rebalance"] == "skipped: no target file"
+
+
+def test_rebalance_no_prices_skip_reason(
+    caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str],
+) -> None:
+    # --no-prices leaves nothing to size trades against → skip (no network either).
+    with caplog.at_level(logging.INFO):
+        rc = main(["--no-prices", "--rebalance", "to_total", "--target", str(TARGET)])
+    capsys.readouterr()
+    assert rc == 0
+    assert _run_summary(caplog)["rebalance"] == "skipped: --no-prices"
+
+
+def test_backtest_bad_target_skip_reason(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str],
+) -> None:
+    d = tmp_path / "adir"
+    d.mkdir()  # a directory → load_target raises OSError → non-fatal skip
+    with caplog.at_level(logging.INFO):
+        rc = main(["--no-prices", "--backtest", "--target", str(d)])
+    capsys.readouterr()
+    assert rc == 0
+    assert _run_summary(caplog)["backtest"] == "skipped: bad target"
+
+
+def test_email_failure_marks_status_partial(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(E, "_dispatch", lambda p, k: (_ for _ in ()).throw(AssertionError))
+    monkeypatch.delenv("RESEND_API_KEY", raising=False)
+    monkeypatch.delenv("REPORT_TO", raising=False)
+    monkeypatch.setattr("app.cli.load_dotenv", lambda *a, **k: False)
+    with caplog.at_level(logging.INFO):
+        rc = main(["--no-prices", "--send"])
+    capsys.readouterr()
+    assert rc == 1
+    run = _run_summary(caplog)
+    assert run["status"] == "partial" and run["email_sent"] is False
+
+
+# ── P1 regressions: cash-mode warning + --no-risk scope ──────────────────────
+
+
+def test_cash_mode_without_cash_warns(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str],
+) -> None:
+    # P1#3: fixed_dca / cash_flow_only with --new-cash 0 deploy nothing → warn.
+    _canned_sample_prices(monkeypatch)
+    with caplog.at_level(logging.WARNING):
+        main(["--no-risk", "--rebalance", "fixed_dca", "--target", str(TARGET)])
+    capsys.readouterr()
+    assert "nothing to invest" in caplog.text
+
+
+def test_no_risk_still_runs_explicit_backtest(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    # P1#2 (documented scope): --no-risk drops the HOLDINGS risk panel but the
+    # explicitly-requested --backtest still reports its own risk metrics.
+    import pandas as pd
+
+    _canned_sample_prices(monkeypatch)  # held latest prices, no network
+    dates = pd.bdate_range("2024-01-01", periods=120)
+    rows = {
+        tk: pd.Series([100.0 + i * 0.5 for i in range(120)], index=dates, dtype=float)
+        for tk in ("VOO", "VEA", "BND", "IAU")
+    }
+    monkeypatch.setattr(
+        "app.cli.fetch_series",
+        lambda tickers, *a, **k: SeriesResult(
+            rows={tk: rows[tk] for tk in tickers if tk in rows},
+            missing=[tk for tk in tickers if tk not in rows],
+        ),
+    )
+    rc = main(["--no-risk", "--backtest", "--target", str(TARGET)])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "=== BACKTEST" in out          # backtest panel present despite --no-risk
+    assert "=== RISK-ADJUSTED" not in out  # holdings risk panel suppressed
+    assert "=== DRAWDOWN" not in out
+
+
+def test_nonpositive_priced_holding_suppresses_money_weighted(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # Review #1: a held ticker priced with a non-usable close (NaN/<=0) is dropped
+    # from market value, so the book is only PARTIALLY priced. Money-weighted
+    # figures (MWR / Modified Dietz) must then be n/a — not a confident wrong
+    # number computed over a partial book — while path-based TWR is preserved.
+    import pandas as pd
+
+    dates = pd.bdate_range("2024-01-01", periods=400)
+
+    def fake_series(tickers, *a, **k):  # type: ignore[no-untyped-def]
+        rows = {}
+        for tk in tickers:
+            s = pd.Series([100.0 + i * 0.1 for i in range(400)], index=dates, dtype=float)
+            if tk == "VOO":          # one held ticker gets an unusable tail price
+                s = s.copy()
+                s.iloc[-1] = float("nan")
+            rows[tk] = s
+        prov = {tk: ("cache", datetime.now(timezone.utc)) for tk in tickers}
+        return SeriesResult(rows=rows, missing=[], provenance=prov)
+
+    monkeypatch.setattr("app.cli.fetch_series", fake_series)
+    with caplog.at_level(logging.INFO):
+        rc = main([])  # risk-on (so true TWR is computed and the RETURNS panel renders)
+    out = capsys.readouterr().out
+    assert rc == 0
+    twr_line = next(line for line in out.splitlines() if "Time-weighted" in line)
+    mwr_line = next(line for line in out.splitlines() if "Money-weighted" in line)
+    dietz_line = next(line for line in out.splitlines() if "Modified Dietz" in line)
+    assert not twr_line.strip().endswith("n/a")  # path-based TWR survives
+    assert mwr_line.strip().endswith("n/a")       # money-weighted suppressed
+    assert dietz_line.strip().endswith("n/a")
+    run = _run_summary(caplog)
+    assert run["status"] == "partial"
+    assert run["n_prices_missing"] >= 1  # VOO counted unpriced (dropped from value)
+
+
+def test_unhandled_split_ticker_excluded_from_twr_and_noted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str],
+) -> None:
+    # Real-data guard (Shinhan/NVDA): a ticker bought at ~10× its split-adjusted
+    # close (an unhandled split) must be EXCLUDED from the time-weighted series so
+    # it can't fabricate a return — with a warning and a report note. Mirrors the
+    # NVDA case: the split ticker is sold out, so current holdings stay clean.
+    import pandas as pd
+
+    csv = tmp_path / "book.csv"
+    csv.write_text(
+        "Date,Code,Action,Quantity,Price,Fee\n"
+        "2024-01-02,VOO,buy,10,100,0\n"
+        "2024-01-02,SPLT,buy,1,1000,0\n"   # exec 1000 vs adjusted close ~100 → 10×
+        "2024-01-03,SPLT,sell,1,1010,0\n"  # sold out → not a current holding
+        "2024-02-01,VOO,buy,5,100,0\n",
+        encoding="utf-8",
+    )
+    dates = pd.bdate_range("2024-01-02", periods=400)
+
+    def fake_series(tickers, *a, **k):  # type: ignore[no-untyped-def]
+        rows = {
+            tk: pd.Series([100.0 + i * 0.05 for i in range(400)], index=dates, dtype=float)
+            for tk in tickers
+        }
+        prov = {tk: ("cache", datetime.now(timezone.utc)) for tk in tickers}
+        return SeriesResult(rows=rows, missing=[], provenance=prov)
+
+    monkeypatch.setattr("app.cli.fetch_series", fake_series)
+    with caplog.at_level(logging.WARNING):
+        rc = main(["--csv", str(csv)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "SPLT" in caplog.text and "split" in caplog.text.lower()  # warned
+    assert "excluded from TWR" in out and "SPLT" in out              # noted in the brief
+    twr_line = next(line for line in out.splitlines() if "Time-weighted" in line)
+    assert not twr_line.strip().endswith("n/a")  # TWR computed over the clean sub-book

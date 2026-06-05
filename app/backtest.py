@@ -21,8 +21,8 @@ uses its Layer-2 siblings — acyclic: neither imports back).
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import date
+from dataclasses import dataclass, field
+from datetime import date, datetime
 
 import pandas as pd
 
@@ -51,6 +51,7 @@ class BacktestResult:
     schedule: str
     legs: tuple[BacktestLeg, ...]  # (rebalanced, buy_and_hold)
     missing: tuple[str, ...]       # target tickers with no usable price history
+    provenance: dict[str, tuple[str, datetime]] = field(default_factory=dict)  # ticker → (source, fetched_at)
 
 
 def _period_key(ts: pd.Timestamp, schedule: str) -> object:
@@ -158,10 +159,12 @@ def backtest_compare(
     end: date | None = None,
     bootstrap_n: int = 1000,
     seed: int = 42,
+    provenance: dict[str, tuple[str, datetime]] | None = None,
 ) -> BacktestResult | None:
     """Simulate rebalanced-to-target vs buy-and-hold and bundle both legs with
     their drawdown-first risk + return. Returns None if there is no usable price
-    history for any target ticker."""
+    history for any target ticker. `provenance` (ticker → source, fetched_at) is
+    carried through for the report's freshness line."""
     priced = _priced_tickers(series, target)
     missing = tuple(sorted(tk for tk in target if tk not in priced))
     if not priced:
@@ -184,4 +187,5 @@ def backtest_compare(
         schedule=schedule,
         legs=(reb, bh),
         missing=missing,
+        provenance={tk: prov for tk, prov in (provenance or {}).items() if tk in priced},
     )

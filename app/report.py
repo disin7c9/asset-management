@@ -57,6 +57,7 @@ class ReportData:
     title: str
     asof_date: str
     sections: tuple[Section, ...]
+    generated_at: datetime
 
 
 # ── value formatting (shared by every section) ─────────────────────────────
@@ -90,6 +91,16 @@ def _ci_ratio(ci: MetricCI) -> str:
     return _ci(ci, scale=1.0, suffix="")
 
 
+def _mag_ci(ci: MetricCI) -> str:
+    """Positive-magnitude percentage CI (Ulcer/CDaR) — no leading sign."""
+    if not math.isfinite(ci.point):
+        return _NA
+    return (
+        f"{ci.point * 100:.2f}%  "
+        f"(95% CI {ci.low * 100:.2f}% .. {ci.high * 100:.2f}%)"
+    )
+
+
 # ── build: state/prices/returns/risk → ordered sections ────────────────────
 
 
@@ -103,6 +114,8 @@ def build_report_data(
     backtest: BacktestResult | None = None,
     missing_tickers: list[str] | None = None,
     asof: date | None = None,
+    generated_at: datetime | None = None,
+    twr_excluded: list[str] | None = None,
 ) -> ReportData:
     """Assemble the deterministic brief as ordered sections.
 
@@ -110,13 +123,16 @@ def build_report_data(
     the brief for); the drawdown-first risk/return context follows.
 
     `asof` dates the report (its title and the ``reports/<asof>.md`` filename).
-    The composition root passes the run's single as-of date so the title, the
-    saved filename, and the ``run_summary`` ``date`` all agree. When omitted it
-    falls back to the returns period end, else to today's *local* date (to match
-    ``cli``'s ``date.today()``) — never a second clock that could disagree.
+    `generated_at` is the run's wall-clock instant, used for the provenance
+    footer's price-age and "as of HH:MM" stamp. BOTH are passed by the
+    composition root so this function is **pure** (same inputs → same output) —
+    no hidden clock read. The lone `datetime.now()` fallback below is for callers
+    that don't supply one (tests); cli always passes the real value.
     """
     prices = prices or {}
     missing_tickers = missing_tickers or []
+    twr_excluded = twr_excluded or []
+    gen = generated_at if generated_at is not None else datetime.now(timezone.utc)
     sections: list[Section] = []
 
     if suggestions:
@@ -125,22 +141,23 @@ def build_report_data(
         sections.append(_section_drawdown(risk))
         sections.append(_section_risk_adjusted(risk))
     if returns is not None and returns.period_days > 0:
-        sections.append(_section_returns(returns))
+        sections.append(_section_returns(returns, twr_excluded))
     sections.append(_section_holdings(state, prices))
     if backtest is not None and backtest.legs:
         sections.append(_section_backtest(backtest))
 
-    footer = _footer_section(prices, missing_tickers)
+    footer = _footer_section(prices, missing_tickers, gen)
     if footer is not None:
         sections.append(footer)
 
     if asof is None:
-        asof = returns.asof_date if returns is not None else date.today()
+        asof = returns.asof_date if returns is not None else gen.date()
     asof_str = asof.isoformat()
     return ReportData(
         title=f"Portfolio brief — {asof_str}",
         asof_date=asof_str,
         sections=tuple(sections),
+        generated_at=gen,
     )
 
 
@@ -193,8 +210,8 @@ def _section_drawdown(risk: RiskSummary) -> Section:
         f"Max drawdown:      {_ci_pct(risk.max_drawdown_ci)}",
         f"  peak {dd.peak_date} → trough {dd.trough_date} → {rec}  "
         f"({dd.duration_days} days)",
-        f"Ulcer index:       {risk.ulcer_index * 100:.2f}%   "
-        f"CDaR (worst 5%):  {risk.cdar * 100:.2f}%",
+        f"Ulcer index:       {_mag_ci(risk.ulcer_index)}",
+        f"CDaR (worst 5%):   {_mag_ci(risk.cdar)}",
         f"You've spent {dd.time_underwater_pct * 100:.0f}% of this period "
         "below a previous high.",
         *_noisy_note(risk),
@@ -225,7 +242,9 @@ def _section_risk_adjusted(risk: RiskSummary) -> Section:
     )
 
 
-def _section_returns(returns: ReturnsSummary) -> Section:
+def _section_returns(
+    returns: ReturnsSummary, twr_excluded: list[str] | None = None
+) -> Section:
     twr = returns.true_twr_annualized
     lines = [
         f"Period: {returns.period_start} → {returns.asof_date} "
@@ -235,7 +254,15 @@ def _section_returns(returns: ReturnsSummary) -> Section:
         f"{_pct_or_na(returns.money_weighted_annualized)}",
         f"Modified Dietz (approx TWR):             "
         f"{_pct_or_na(returns.modified_dietz_annualized)}",
+        "  (point figures: accounting identities over your cash flows, not sampled "
+        "statistics → no band; see RISK-ADJUSTED for bootstrapped CIs)",
     ]
+    if twr_excluded:
+        lines.append(
+            f"  ⚠ excluded from TWR & risk: {', '.join(twr_excluded)} "
+            "(unadjusted stock split — raw share counts vs split-adjusted prices; "
+            "MWR/Dietz unaffected). Corporate-action handling lands in v1.x."
+        )
     if any(
         v is None or not math.isfinite(v)
         for v in (twr, returns.money_weighted_annualized,
@@ -308,13 +335,20 @@ def _section_backtest(bt: BacktestResult) -> Section:
             return _NA
         return f"{ci.low * 100:.1f}% .. {ci.high * 100:.1f}%"
 
+    def ratio_ci(ci: MetricCI) -> str:
+        if not math.isfinite(ci.point):
+            return _NA
+        return f"{ci.low:+.2f} .. {ci.high:+.2f}"
+
     lines = [
         row("", [leg.label for leg in legs]),
         "-" * (lw + cw * len(legs)),
         row("Max drawdown", [_pct_or_na(leg.risk.max_drawdown_ci.point) for leg in legs]),
         row("  95% CI", [dd_ci(leg.risk.max_drawdown_ci) for leg in legs]),
         row("Sharpe (252-basis)", [ratio(leg.risk.sharpe.point) for leg in legs]),
+        row("  95% CI", [ratio_ci(leg.risk.sharpe) for leg in legs]),
         row("Sortino", [ratio(leg.risk.sortino.point) for leg in legs]),
+        row("  95% CI", [ratio_ci(leg.risk.sortino) for leg in legs]),
         row("Annualized return", [_pct_or_na(leg.annualized_return) for leg in legs]),
         row("Final value", [f"${leg.final_value:,.0f}" for leg in legs]),
     ]
@@ -324,6 +358,11 @@ def _section_backtest(bt: BacktestResult) -> Section:
         )
     if bt.missing:
         lines.append(f"  excluded (no price history): {', '.join(bt.missing)}")
+    if bt.provenance:
+        srcs = ", ".join(sorted({s for s, _ in bt.provenance.values()}))
+        oldest = min((fa for _, fa in bt.provenance.values()), default=None)
+        asof = f" · oldest fetch {oldest.date()}" if oldest is not None else ""
+        lines.append(f"  prices: {srcs}{asof}")
     lines.append(
         "Rebalancing is discipline, not a prediction; past results don't guarantee future ones."
     )
@@ -335,13 +374,13 @@ def _section_backtest(bt: BacktestResult) -> Section:
 
 
 def _footer_section(
-    prices: dict[str, PriceRow], missing_tickers: list[str]
+    prices: dict[str, PriceRow], missing_tickers: list[str], generated_at: datetime
 ) -> Section | None:
     lines: list[str] = []
     if missing_tickers:
         lines.append(f"Prices unavailable for: {', '.join(sorted(missing_tickers))}")
     if prices:
-        lines.append(_provenance_footer(prices))
+        lines.append(_provenance_footer(prices, generated_at))
     lines.append(_DISCLAIMER)
     return Section("", tuple(lines))
 
@@ -357,18 +396,22 @@ def _format_timedelta(td: timedelta) -> str:
     return f"{total / 86400:.1f}d"
 
 
-def _provenance_footer(prices: dict[str, PriceRow]) -> str:
-    """One-line summary of where the prices came from + how fresh they are."""
+def _provenance_footer(prices: dict[str, PriceRow], generated_at: datetime) -> str:
+    """One-line summary of where the prices came from + how fresh they are.
+
+    Age is measured against `generated_at` (the run instant), not the wall clock,
+    so the footer is deterministic given (prices, generated_at) and the age is the
+    *real* staleness (now − the price's true fetched_at), not a fabricated 0s."""
     by_source: Counter[str] = Counter(p.source for p in prices.values())
     src_parts = ", ".join(f"{n} {s}" for s, n in sorted(by_source.items()))
-    ages = [p.cache_age for p in prices.values()]
+    ages = [max(generated_at - p.fetched_at, timedelta(0)) for p in prices.values()]
     oldest = max(ages) if ages else timedelta(0)
     newest = min(ages) if ages else timedelta(0)
     if oldest == newest:
         fresh = _format_timedelta(newest)
     else:
         fresh = f"{_format_timedelta(newest)} .. {_format_timedelta(oldest)} old"
-    asof_now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    asof_now = generated_at.strftime("%Y-%m-%d %H:%M UTC")
     return f"Prices: {src_parts}  (age: {fresh} as of {asof_now})"
 
 

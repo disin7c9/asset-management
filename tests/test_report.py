@@ -6,7 +6,7 @@ summaries directly so we never touch the network or the price cache.
 
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
@@ -69,8 +69,8 @@ def risk() -> RiskSummary:
         n_days=600,  # > NOISY_THRESHOLD_DAYS so no noisy note
         drawdown=dd,
         max_drawdown_ci=MetricCI(-0.0984, -0.1721, -0.0558),
-        ulcer_index=0.0238,
-        cdar=0.0673,
+        ulcer_index=MetricCI(0.0238, 0.018, 0.031),
+        cdar=MetricCI(0.0673, 0.045, 0.092),
         sharpe=MetricCI(1.75, 0.68, 2.83),
         sortino=MetricCI(2.66, 0.96, 4.63),
         calmar=MetricCI(1.97, 0.52, 4.83),
@@ -162,8 +162,10 @@ def test_backtest_section_renders(state, prices) -> None:
     dates = pd.bdate_range("2024-01-01", periods=80)
     a = pd.Series([100.0 + i for i in range(80)], index=dates, dtype=float)
     b = pd.Series([50.0] * 80, index=dates, dtype=float)
+    now = datetime.now(timezone.utc)
+    prov = {"A": ("yfinance", now), "B": ("cache", now)}
     bt = backtest_compare({"A": a, "B": b}, {"A": 0.5, "B": 0.5},
-                          schedule="quarterly", bootstrap_n=30)
+                          schedule="quarterly", bootstrap_n=30, provenance=prov)
     assert bt is not None
     data = build_report_data(state, prices, backtest=bt)
     assert any(s.title.startswith("BACKTEST") for s in data.sections)
@@ -171,6 +173,29 @@ def test_backtest_section_renders(state, prices) -> None:
     assert "rebalanced (quarterly)" in out and "buy & hold" in out
     assert "Max drawdown" in out and "Final value" in out
     assert "simulation, not a prediction" in out
+    # P0-3: Sharpe/Sortino now carry a 95% CI row (not bare points).
+    assert out.count("95% CI") >= 3
+    # P0-1c: the backtest carries its price provenance.
+    assert "prices: cache, yfinance" in out
+
+
+def test_ulcer_cdar_and_returns_carry_bands_and_labels(state, prices, returns, risk) -> None:
+    out = render_text(build_report_data(state, prices, returns, risk))
+    ulcer_line = next(ln for ln in out.splitlines() if ln.startswith("Ulcer index:"))
+    cdar_line = next(ln for ln in out.splitlines() if ln.startswith("CDaR"))
+    assert "95% CI" in ulcer_line and "95% CI" in cdar_line  # P0-3b
+    assert "point figures" in out  # P0-3c: returns labelled point-only
+
+
+def test_provenance_footer_real_source_and_deterministic(state) -> None:
+    gen = datetime(2026, 6, 4, 12, 0, tzinfo=timezone.utc)
+    fetched = gen - timedelta(hours=20)
+    px = {"VOO": PriceRow("VOO", date(2026, 6, 3), 600.0, "cache", fetched)}
+    out1 = render_text(build_report_data(state, px, generated_at=gen))
+    out2 = render_text(build_report_data(state, px, generated_at=gen))
+    assert out1 == out2  # P0-4: deterministic given generated_at (no hidden clock)
+    assert "1 cache" in out1  # P0-1: real source, not the fabricated "series"
+    assert "20.0h" in out1   # P0-1: real age, not "0s"
 
 
 def test_suggestions_lead_and_render(state, prices, returns, risk) -> None:
@@ -198,8 +223,8 @@ def test_noisy_note_appears_when_short_history(state, prices, returns) -> None:
         n_days=120,  # < NOISY_THRESHOLD_DAYS
         drawdown=dd,
         max_drawdown_ci=MetricCI(-0.05, -0.10, -0.02),
-        ulcer_index=0.01,
-        cdar=0.03,
+        ulcer_index=MetricCI(0.01, 0.005, 0.02),
+        cdar=MetricCI(0.03, 0.01, 0.05),
         sharpe=MetricCI(0.5, -0.5, 1.5),
         sortino=MetricCI(0.7, -0.4, 1.8),
         calmar=MetricCI(0.4, -0.6, 1.4),

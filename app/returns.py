@@ -83,7 +83,7 @@ def cash_flows_from_events(events: list[Event]) -> list[CashFlow]:
         elif ev.action == "sell":
             cfs.append(CashFlow(ev.date, ev.quantity * ev.price - ev.fee))
         elif ev.action in ("dividend", "interest"):
-            cfs.append(CashFlow(ev.date, ev.cash))
+            cfs.append(CashFlow(ev.date, ev.cash - ev.fee))  # net of any withholding fee
         elif ev.action == "fee":
             cfs.append(CashFlow(ev.date, -ev.fee))
     return cfs
@@ -185,6 +185,7 @@ def summarize(
     asof_date: date,
     *,
     true_twr: float | None = None,
+    fully_priced: bool = True,
 ) -> ReturnsSummary:
     """Compute the per-period numbers the report layer renders.
 
@@ -192,11 +193,20 @@ def summarize(
     `true_twr` is computed upstream from the daily-return series (it needs the
     price history this function doesn't see) and folded into the summary so the
     report layer reads a single object instead of a side parameter.
+
+    `fully_priced` MUST be False when any held ticker lacks a usable price:
+    money-weighted returns (MWR, Modified Dietz) need the *whole* portfolio's
+    current value, and `current_value` here sums only the priced holdings — so a
+    partial book would yield a confidently-wrong figure. We return None for both
+    (rendered `n/a`) rather than understate. (true TWR is a priced-subset, time-
+    weighted measure and is left as-is.)
     """
     if not events:
         return ReturnsSummary(asof_date, asof_date, 0.0, 0.0, true_twr_annualized=true_twr)
-    cfs = cash_flows_from_events(events)
     period_start = min(ev.date for ev in events)
+    if not fully_priced:
+        return ReturnsSummary(period_start, asof_date, None, None, true_twr_annualized=true_twr)
+    cfs = cash_flows_from_events(events)
     period_days = (asof_date - period_start).days
     mwr = _mwr_from_cfs(cfs, current_value, asof_date)
     md_period = _md_from_cfs(cfs, current_value, asof_date)
@@ -291,7 +301,7 @@ def build_daily_returns(
         elif ev.action == "sell":
             sell_proceeds[d] += ev.quantity * ev.price - ev.fee
         elif ev.action in ("dividend", "interest"):
-            income[d] += ev.cash
+            income[d] += ev.cash - ev.fee  # net of any withholding fee
         elif ev.action == "fee":
             income[d] -= ev.fee
 
@@ -329,6 +339,47 @@ def true_twr_annualized(daily_returns: "pd.Series[float]") -> float | None:
     if total_growth <= 0.0:
         return None
     return float(total_growth ** (_TRADING_DAYS_PER_YEAR / n) - 1.0)
+
+
+def price_basis_mismatches(
+    events: list[Event],
+    series_by_ticker: dict[str, "pd.Series[float]"],
+    *,
+    factor: float = 2.0,
+) -> list[str]:
+    """Tickers whose trade execution price disagrees with the price *history* by
+    more than `factor`× on the trade date — the fingerprint of an unhandled stock
+    split.
+
+    The log records **raw** share counts and execution prices; yfinance closes
+    are **split-adjusted**. So for a ticker that split during its holding period,
+    shares × price is inconsistent across the split and `build_daily_returns`
+    fabricates a return (e.g. a 10:1 split shows the buy at ~10× the adjusted
+    close → a spurious +900% day). A clean ≥2:1 split leaves a ratio far beyond
+    any intraday fill-vs-close gap, so a generous `factor` flags splits without
+    false-positiving on normal moves. The caller excludes the flagged ticker from
+    the time-weighted series (TWR + risk) — the honest stopgap until v1.x adjusts
+    share counts for corporate actions. Buys and sells carry an execution price;
+    dividend/fee rows do not. Returns a sorted list (empty when nothing suspect).
+    Pure.
+    """
+    suspect: set[str] = set()
+    for ev in events:
+        if ev.action not in ("buy", "sell") or ev.price <= 0:
+            continue
+        s = series_by_ticker.get(ev.ticker)
+        if s is None or s.empty:
+            continue
+        at_or_before = s.index[s.index <= pd.Timestamp(ev.date)]
+        if len(at_or_before) == 0:
+            continue
+        close = float(s.loc[at_or_before[-1]])
+        if close <= 0:
+            continue
+        ratio = ev.price / close
+        if ratio >= factor or ratio <= 1.0 / factor:
+            suspect.add(ev.ticker)
+    return sorted(suspect)
 
 
 def _xirr_newton(pairs: list[tuple[float, float]], guess: float = 0.1) -> float:

@@ -13,7 +13,7 @@ import pandas as pd
 import pytest
 
 from app import prices as P
-from app.prices import PriceRow, PricesResult, fetch_latest, fetch_series
+from app.prices import PriceRow, PricesResult, SeriesResult, fetch_latest, fetch_series
 
 
 def _fake_yf_df(price: float, on: date) -> pd.DataFrame:
@@ -306,3 +306,172 @@ def test_fetch_series_writes_and_reuses_cache(
     monkeypatch.setattr(P, "_fetch_stooq_csv", lambda *a, **k: pytest.fail("stooq should not be called"))
     result = fetch_series(["VOO"], start, end, cache_dir=tmp_path)
     assert len(result.rows["VOO"]) == 3
+
+
+def test_fetch_series_records_provenance(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # A yfinance hit must be recorded as ("yfinance", <fetched_at>) so the CLI can
+    # stamp honest provenance (P0-1) instead of a fabricated "series" label.
+    monkeypatch.setattr(P, "_fetch_yf", lambda tk, s, e: _fake_yf_df(100.0, date(2024, 1, 2)))
+    monkeypatch.setattr(P, "_fetch_stooq_csv", lambda tk: "")
+    res = fetch_series(["VOO"], date(2024, 1, 1), date(2024, 1, 3),
+                       cache_dir=tmp_path, online=True)
+    assert "VOO" in res.rows
+    assert res.provenance["VOO"][0] == "yfinance"
+
+
+def test_series_fallbacks_used_counts_stooq() -> None:
+    now = datetime.now(timezone.utc)
+    res = SeriesResult(
+        rows={"A": pd.Series(dtype=float), "B": pd.Series(dtype=float)},
+        provenance={"A": ("stooq", now), "B": ("yfinance", now)},
+    )
+    assert res.fallbacks_used == 1
+
+
+# ── series-cache resilience (mirror the latest-cache hardening) ──────────────
+
+
+def _write_series_cache(
+    path: Path, dates: list[str], closes: list[float], fetched_at: datetime
+) -> None:
+    pd.DataFrame(
+        {
+            "date": [pd.Timestamp(d) for d in dates],
+            "close": closes,
+            "fetched_at": pd.Timestamp(fetched_at),
+        }
+    ).to_parquet(path, index=False)
+
+
+_DAYS = ["2024-01-01", "2024-01-02", "2024-01-03"]
+
+
+def test_series_cache_stale_is_refetched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_series_cache(
+        tmp_path / "VOO_series.parquet", _DAYS, [1.0, 2.0, 3.0],
+        datetime.now(timezone.utc) - timedelta(days=3),  # stale
+    )
+    monkeypatch.setattr(P, "_fetch_yf", lambda t, s, e: _fake_yf_history([10.0, 11.0, 12.0], date(2024, 1, 1)))
+    monkeypatch.setattr(P, "_fetch_stooq_csv", lambda t: None)
+    res = fetch_series(["VOO"], date(2024, 1, 1), date(2024, 1, 3), cache_dir=tmp_path)
+    assert list(res.rows["VOO"].round(1)) == [10.0, 11.0, 12.0]  # refetched, not 1/2/3
+    assert res.provenance["VOO"][0] == "yfinance"
+
+
+def test_series_cache_future_stamp_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_series_cache(
+        tmp_path / "VOO_series.parquet", _DAYS, [1.0, 2.0, 3.0],
+        datetime.now(timezone.utc) + timedelta(hours=24),  # future-stamped
+    )
+    monkeypatch.setattr(P, "_fetch_yf", lambda t, s, e: _fake_yf_history([10.0, 11.0, 12.0], date(2024, 1, 1)))
+    monkeypatch.setattr(P, "_fetch_stooq_csv", lambda t: None)
+    res = fetch_series(["VOO"], date(2024, 1, 1), date(2024, 1, 3), cache_dir=tmp_path)
+    assert list(res.rows["VOO"].round(1)) == [10.0, 11.0, 12.0]  # refused → refetched
+
+
+def test_series_cache_corrupt_is_nonfatal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "VOO_series.parquet").write_bytes(b"this is not parquet")
+    monkeypatch.setattr(P, "_fetch_yf", lambda t, s, e: _fake_yf_history([5.0, 6.0, 7.0], date(2024, 1, 1)))
+    monkeypatch.setattr(P, "_fetch_stooq_csv", lambda t: None)
+    res = fetch_series(["VOO"], date(2024, 1, 1), date(2024, 1, 3), cache_dir=tmp_path)
+    assert list(res.rows["VOO"].round(1)) == [5.0, 6.0, 7.0]  # unreadable → refetched
+
+
+# ── latest-from-series-cache fallback (P1#4: unify the two caches) ───────────
+
+
+def test_latest_falls_back_to_series_cache_offline(tmp_path: Path) -> None:
+    # A risk-on run writes only <T>_series.parquet; --offline fetch_latest must
+    # still serve the latest close from that series tail (not report it missing).
+    _write_series_cache(
+        tmp_path / "VOO_series.parquet",
+        ["2024-01-02", "2024-01-03", "2024-01-04", "2024-01-05"],
+        [10.0, 11.0, 12.0, 13.0],
+        datetime.now(timezone.utc) - timedelta(hours=1),  # fresh
+    )
+    res = fetch_latest(["VOO"], asof_date=date(2024, 1, 5), cache_dir=tmp_path, online=False)
+    assert res.rows["VOO"].source == "cache"
+    assert res.rows["VOO"].close == 13.0  # last close ≤ asof
+    assert res.missing == []
+
+
+def test_latest_series_fallback_respects_asof(tmp_path: Path) -> None:
+    # The fallback returns the last close at/before asof, not the very last row.
+    _write_series_cache(
+        tmp_path / "VOO_series.parquet",
+        ["2024-01-02", "2024-01-03", "2024-01-04", "2024-01-05"],
+        [10.0, 11.0, 12.0, 13.0],
+        datetime.now(timezone.utc) - timedelta(hours=1),
+    )
+    res = fetch_latest(["VOO"], asof_date=date(2024, 1, 3), cache_dir=tmp_path, online=False)
+    assert res.rows["VOO"].close == 11.0
+
+
+def test_latest_stale_series_cache_not_served_offline(tmp_path: Path) -> None:
+    _write_series_cache(
+        tmp_path / "VOO_series.parquet", _DAYS, [1.0, 2.0, 3.0],
+        datetime.now(timezone.utc) - timedelta(days=3),  # stale → not served
+    )
+    res = fetch_latest(["VOO"], asof_date=date(2024, 1, 3), cache_dir=tmp_path, online=False)
+    assert res.missing == ["VOO"]
+
+
+def test_latest_cache_still_preferred_over_series(tmp_path: Path) -> None:
+    # When both caches are fresh, the dedicated latest cache wins (exact asof match).
+    asof = date(2024, 1, 3)
+    _write_cache_row(tmp_path / "VOO.parquet", asof, 99.0, datetime.now(timezone.utc) - timedelta(minutes=5))
+    _write_series_cache(
+        tmp_path / "VOO_series.parquet", _DAYS, [1.0, 2.0, 3.0],
+        datetime.now(timezone.utc) - timedelta(minutes=5),
+    )
+    res = fetch_latest(["VOO"], asof_date=asof, cache_dir=tmp_path, online=False)
+    assert res.rows["VOO"].close == 99.0  # from VOO.parquet, not the series tail (3.0)
+
+
+def test_online_latest_miss_does_not_serve_stale_series_tail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Review #2: ONLINE, the series-cache fallback must not shadow the network.
+    # A fresh-within-TTL series cache dated days before asof would otherwise be
+    # served as "latest" instead of fetching the current price.
+    _write_series_cache(
+        tmp_path / "VOO_series.parquet", _DAYS, [10.0, 11.0, 12.0],
+        datetime.now(timezone.utc) - timedelta(hours=1),  # fresh, but dated 2024-01-03
+    )  # no VOO.parquet → dedicated latest cache misses
+    monkeypatch.setattr(P, "_fetch_yf", lambda t, s, e: _fake_yf_df(99.0, date(2024, 1, 10)))
+    monkeypatch.setattr(P, "_fetch_stooq_csv", lambda t: None)
+    res = fetch_latest(["VOO"], asof_date=date(2024, 1, 10), cache_dir=tmp_path, online=True)
+    assert res.rows["VOO"].source == "yfinance"  # fetched fresh, NOT the stale tail
+    assert res.rows["VOO"].close == 99.0
+
+
+def test_series_cache_nat_fetched_at_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Review #4: an all-NaT fetched_at must not pass the freshness gate (NaT
+    # comparisons are False → it would otherwise be "fresh forever").
+    pd.DataFrame(
+        {"date": [pd.Timestamp("2024-01-01")], "close": [5.0], "fetched_at": [pd.NaT]}
+    ).to_parquet(tmp_path / "VOO_series.parquet", index=False)
+    monkeypatch.setattr(P, "_fetch_yf", lambda t, s, e: _fake_yf_history([10.0, 11.0, 12.0], date(2024, 1, 1)))
+    monkeypatch.setattr(P, "_fetch_stooq_csv", lambda t: None)
+    res = fetch_series(["VOO"], date(2024, 1, 1), date(2024, 1, 3), cache_dir=tmp_path)
+    assert list(res.rows["VOO"].round(1)) == [10.0, 11.0, 12.0]  # refused → refetched
+    assert res.provenance["VOO"][0] == "yfinance"
+
+
+def test_latest_nat_series_cache_not_served_offline(tmp_path: Path) -> None:
+    # The NaT guard also protects the latest-from-series fallback under --offline.
+    pd.DataFrame(
+        {"date": [pd.Timestamp("2024-01-01")], "close": [5.0], "fetched_at": [pd.NaT]}
+    ).to_parquet(tmp_path / "VOO_series.parquet", index=False)
+    res = fetch_latest(["VOO"], asof_date=date(2024, 1, 3), cache_dir=tmp_path, online=False)
+    assert res.missing == ["VOO"]

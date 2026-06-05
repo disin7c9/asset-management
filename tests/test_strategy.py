@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 import pytest
+from hypothesis import assume, given
+from hypothesis import strategies as st
 
 from app.strategy import (
     Suggestion,
@@ -221,3 +224,83 @@ def test_load_target_nonnumeric_weight(tmp_path: Path) -> None:
     p.write_text("Ticker,Weight\nVOO,0.5x\n", encoding="utf-8")
     with pytest.raises(ValueError, match="non-numeric"):
         load_target(p)
+
+
+# ── property-based invariants (the v1 product) ──────────────────────────────
+
+_TICKERS = ["A", "B", "C", "D", "E"]
+_finite = {"allow_nan": False, "allow_infinity": False}
+
+
+@st.composite
+def _books(draw: st.DrawFn) -> tuple[dict[str, float], dict[str, float], dict[str, float]]:
+    """A random (held_value, prices, target) over a shared, fully-priced universe.
+
+    Target weights are normalized to sum to 1 (as `load_target` would), so the
+    'resulting weight == target' and cash-neutral identities hold exactly. A
+    weight may be 0 (a deliberate exit). Every ticker has a positive price, so
+    none are dropped — the invariants quantify over the whole universe."""
+    n = draw(st.integers(min_value=1, max_value=5))
+    tickers = _TICKERS[:n]
+    held = {tk: draw(st.floats(min_value=0.0, max_value=1e6, **_finite)) for tk in tickers}
+    prices = {tk: draw(st.floats(min_value=1.0, max_value=1000.0, **_finite)) for tk in tickers}
+    weights = [draw(st.floats(min_value=0.0, max_value=1.0, **_finite)) for _ in tickers]
+    assume(sum(weights) > 0)  # a target must be normalizable
+    total_w = sum(weights)
+    target = {tk: w / total_w for tk, w in zip(tickers, weights, strict=True)}
+    return held, prices, target
+
+
+@given(_books())
+def test_prop_to_total_is_cash_neutral(book: tuple[dict[str, float], ...]) -> None:
+    # With no new cash, Σbuys == Σsells (up to the per-ticker $1 min-trade hold).
+    held, prices, target = book
+    sugs = suggest("to_total", held, prices, target, new_cash=0.0)
+    buys = sum(s.dollars for s in sugs if s.action == "buy")
+    sells = sum(s.dollars for s in sugs if s.action == "sell")
+    assert buys == pytest.approx(sells, abs=float(len(held)))  # ≤ n dropped sub-$1 trades
+
+
+@given(_books())
+def test_prop_to_total_reaches_target_weights(
+    book: tuple[dict[str, float], ...],
+) -> None:
+    # Pin the OUTCOME (not just "moved toward"): after a cash-neutral to_total
+    # rebalance every ticker's resulting weight EQUALS its target — exactly when
+    # traded, within one min-trade dollar's worth of weight when the drift was
+    # sub-$1 and the ticker held. This catches a wrong base / mis-normalization
+    # (which would land resulting_w on tgt_w·base/total ≠ tgt_w); an invariant
+    # reconstructed only from the suggestion's own dollars could not.
+    held, prices, target = book
+    total = sum(held.values())
+    assume(total > 0)  # weights are undefined for an empty book
+    sugs = {s.ticker: s for s in suggest("to_total", held, prices, target, new_cash=0.0)}
+    for tk, s in sugs.items():
+        signed = s.dollars * (1 if s.action == "buy" else -1 if s.action == "sell" else 0)
+        resulting_w = (held.get(tk, 0.0) + signed) / total  # cash-neutral → base unchanged
+        tgt_w = target.get(tk, 0.0)
+        assert abs(resulting_w - tgt_w) <= 1.0 / total + 1e-9  # ≤ one min-trade dollar
+
+
+@given(_books(), st.floats(min_value=0.0, max_value=1e5, **_finite))
+def test_prop_cash_modes_within_budget_and_never_sell(
+    book: tuple[dict[str, float], ...], new_cash: float
+) -> None:
+    held, prices, target = book
+    for mode in ("cash_flow_only", "fixed_dca"):
+        sugs = suggest(mode, held, prices, target, new_cash=new_cash)  # type: ignore[arg-type]
+        assert all(s.action in ("buy", "hold") for s in sugs)  # tax-friendly: never sells
+        spent = sum(s.dollars for s in sugs if s.action == "buy")
+        assert spent <= new_cash + 1e-6 + new_cash * 1e-9  # never deploy more than available
+
+
+@given(_books(), st.floats(min_value=0.0, max_value=1e5, **_finite))
+def test_prop_no_negative_or_nan_trades(
+    book: tuple[dict[str, float], ...], new_cash: float
+) -> None:
+    held, prices, target = book
+    for mode in ("to_total", "cash_flow_only", "fixed_dca", "bands"):
+        for s in suggest(mode, held, prices, target, new_cash=new_cash):  # type: ignore[arg-type]
+            assert math.isfinite(s.shares) and s.shares >= 0.0
+            assert math.isfinite(s.dollars) and s.dollars >= 0.0
+            assert (s.action == "hold") == (s.dollars == 0.0)  # hold ⟺ zero-dollar trade

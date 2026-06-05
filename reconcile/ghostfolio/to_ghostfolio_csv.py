@@ -15,7 +15,7 @@ from __future__ import annotations
 import csv
 from pathlib import Path
 
-SRC = Path("examples/data/transactions.csv")
+SRC = Path("data/sample_data/transactions.csv")
 OUT = Path("reconcile/ghostfolio/ghostfolio_import.csv")
 
 rows_out: list[dict[str, str]] = []

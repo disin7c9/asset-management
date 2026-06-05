@@ -94,10 +94,13 @@ def derive(events: list[Event]) -> DerivedState:
                 pos.cost_basis = 0.0
 
         elif ev.action == "dividend":
-            state.realized[ev.ticker] += ev.cash
+            # Net any fee on the row (e.g. dividend withholding tax) out of income,
+            # consistent with how buy/sell fees reduce P&L. (Fee is also tracked
+            # in state.fees informationally.)
+            state.realized[ev.ticker] += ev.cash - ev.fee
 
         elif ev.action == "interest":
-            state.realized[ev.ticker] += ev.cash
+            state.realized[ev.ticker] += ev.cash - ev.fee
 
         elif ev.action == "fee":
             # Tracked in state.fees only; no position change.

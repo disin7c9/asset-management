@@ -63,8 +63,8 @@ class RiskSummary:
     n_days: int
     drawdown: DrawdownInfo
     max_drawdown_ci: MetricCI    # depth as a negative fraction, with band
-    ulcer_index: float           # positive magnitude
-    cdar: float                  # positive magnitude (avg of worst-5% drawdowns)
+    ulcer_index: MetricCI        # positive magnitude, with band
+    cdar: MetricCI               # positive magnitude (avg of worst-5% drawdowns), with band
     sharpe: MetricCI
     sortino: MetricCI
     calmar: MetricCI
@@ -152,6 +152,16 @@ def _max_drawdown_depth(returns: "pd.Series[float]") -> float:
     return float(empyrical.max_drawdown(returns))
 
 
+def _ulcer_from_returns(returns: "pd.Series[float]") -> float:
+    """Ulcer index from a return series (builds the growth index internally)."""
+    return ulcer_index((1.0 + returns).cumprod())
+
+
+def _cdar_from_returns(returns: "pd.Series[float]") -> float:
+    """CDaR from a return series (builds the growth index internally)."""
+    return cdar((1.0 + returns).cumprod())
+
+
 # ── bootstrap confidence intervals ────────────────────────────────────────
 
 
@@ -220,14 +230,22 @@ def summarize_risk(
     """Compute the full risk panel. Returns None if there isn't enough data."""
     if daily_returns.empty or len(daily_returns) < 2 or index.empty:
         return None
+    # Path-dependent extrema (max-DD, Ulcer, CDaR) need a LARGER bootstrap block
+    # than mean-type ratios: an ~n**(1/3) block can't reassemble a multi-month
+    # decline, biasing those bands shallow. Use ~√n for them; ratios keep the default.
+    path_block = max(2, round(len(daily_returns) ** 0.5))
     return RiskSummary(
         n_days=len(daily_returns),
         drawdown=max_drawdown(index),
         max_drawdown_ci=bootstrap_ci(
-            _max_drawdown_depth, daily_returns, n=bootstrap_n, seed=seed
+            _max_drawdown_depth, daily_returns, n=bootstrap_n, seed=seed, block=path_block
         ),
-        ulcer_index=ulcer_index(index),
-        cdar=cdar(index),
+        ulcer_index=bootstrap_ci(
+            _ulcer_from_returns, daily_returns, n=bootstrap_n, seed=seed, block=path_block
+        ),
+        cdar=bootstrap_ci(
+            _cdar_from_returns, daily_returns, n=bootstrap_n, seed=seed, block=path_block
+        ),
         sharpe=bootstrap_ci(sharpe, daily_returns, n=bootstrap_n, seed=seed),
         sortino=bootstrap_ci(sortino, daily_returns, n=bootstrap_n, seed=seed),
         calmar=bootstrap_ci(calmar, daily_returns, n=bootstrap_n, seed=seed),

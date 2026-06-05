@@ -10,7 +10,7 @@ later slice) before they may surface a suggestion.
 Every suggestion carries the **named rule** that produced it and a one-line
 reason, so the user learns the rule rather than trusting a black box.
 
-Modes (v0):
+Modes (v1):
     to_total        sell + buy to hit target weights exactly (deploys new cash too)
     cash_flow_only  invest new cash into underweights; never sell (tax-friendly)
     fixed_dca       buy the target mix with a fixed cash amount, ignoring drift

@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import math
 from datetime import date
 
 import pandas as pd
 import pytest
+from hypothesis import given, settings
+from hypothesis import strategies as st
 
 from app.backtest import backtest_compare, simulate
 
@@ -83,3 +86,81 @@ def test_simulate_drops_zero_first_price() -> None:
     curve = simulate(series, {"A": 0.5, "B": 0.5}, schedule="never", initial=1000.0)
     assert not curve.empty
     assert curve.iloc[0] == pytest.approx(1000.0)  # weight renormalized onto B
+
+
+# ── property-based invariants ───────────────────────────────────────────────
+
+_TICKERS = ["A", "B", "C"]
+_finite = {"allow_nan": False, "allow_infinity": False}
+
+
+@st.composite
+def _price_book(draw: st.DrawFn) -> tuple[dict[str, "pd.Series[float]"], dict[str, float]]:
+    """A random set of strictly-positive daily price paths + a normalized target."""
+    n_tk = draw(st.integers(min_value=1, max_value=3))
+    n_days = draw(st.integers(min_value=35, max_value=80))
+    dates = pd.bdate_range("2024-01-03", periods=n_days)
+    series: dict[str, pd.Series[float]] = {}
+    raw_w: list[float] = []
+    for i in range(n_tk):
+        start_px = draw(st.floats(min_value=5.0, max_value=400.0, **_finite))
+        rets = draw(
+            st.lists(
+                st.floats(min_value=-0.08, max_value=0.08, **_finite),
+                min_size=n_days - 1, max_size=n_days - 1,
+            )
+        )
+        px = [start_px]
+        for r in rets:
+            px.append(max(0.01, px[-1] * (1.0 + r)))  # stay strictly positive
+        series[_TICKERS[i]] = pd.Series(px, index=dates, dtype=float)
+        raw_w.append(draw(st.floats(min_value=0.1, max_value=1.0, **_finite)))
+    total = sum(raw_w)
+    target = {_TICKERS[i]: raw_w[i] / total for i in range(n_tk)}
+    return series, target
+
+
+@settings(max_examples=40, deadline=None)
+@given(_price_book())
+def test_prop_curves_start_at_initial_and_stay_positive(
+    book: tuple[dict[str, "pd.Series[float]"], dict[str, float]],
+) -> None:
+    series, target = book
+    for sched in ("never", "monthly", "quarterly"):
+        curve = simulate(series, target, schedule=sched, initial=10_000.0)
+        assert not curve.empty
+        assert curve.iloc[0] == pytest.approx(10_000.0)  # weights sum to 1 → day-0 = initial
+        assert curve.notna().all() and (curve > 0).all()  # no NaN, never wiped out
+
+
+@settings(max_examples=30, deadline=None)
+@given(st.integers(min_value=40, max_value=80), st.floats(min_value=1.0, max_value=500.0, **_finite))
+def test_prop_flat_market_stays_at_initial(n_days: int, px: float) -> None:
+    # Constant prices → every day is worth `initial`, and rebalancing changes nothing.
+    dates = pd.bdate_range("2024-01-03", periods=n_days)
+    series = {
+        "A": pd.Series([px] * n_days, index=dates, dtype=float),
+        "B": pd.Series([px * 2.0] * n_days, index=dates, dtype=float),
+    }
+    for sched in ("never", "monthly", "quarterly"):
+        curve = simulate(series, {"A": 0.5, "B": 0.5}, schedule=sched, initial=10_000.0)
+        assert curve.min() == pytest.approx(10_000.0)
+        assert curve.max() == pytest.approx(10_000.0)
+
+
+@settings(max_examples=25, deadline=None)
+@given(_price_book())
+def test_prop_compare_legs_are_finite_and_well_formed(
+    book: tuple[dict[str, "pd.Series[float]"], dict[str, float]],
+) -> None:
+    series, target = book
+    res = backtest_compare(series, target, schedule="monthly", bootstrap_n=20, seed=1)
+    if res is None:  # too-short a window to score is an acceptable graceful outcome
+        return
+    assert len(res.legs) == 2
+    assert res.start <= res.end
+    for leg in res.legs:
+        assert math.isfinite(leg.final_value) and leg.final_value > 0
+        # max drawdown is a loss (≤ 0) with an ordered bootstrap band.
+        dd = leg.risk.max_drawdown_ci
+        assert dd.low <= dd.point <= dd.high <= 1e-9

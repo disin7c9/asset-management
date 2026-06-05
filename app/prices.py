@@ -59,11 +59,25 @@ class SeriesResult:
     """Outcome of a `fetch_series` call. Never raises on per-ticker failure.
 
     `rows` maps ticker → a pandas Series of daily close prices indexed by a
-    normalized (midnight) DatetimeIndex.
+    normalized (midnight) DatetimeIndex. `provenance` maps ticker → the real
+    `(source, fetched_at)` of that series — `source ∈ {cache, yfinance, stooq}`
+    and `fetched_at` is when the data was actually obtained (the cache's stored
+    timestamp on a hit) — so the caller can stamp honest provenance instead of
+    a placeholder.
     """
 
     rows: dict[str, "pd.Series[float]"] = field(default_factory=dict)
     missing: list[str] = field(default_factory=list)
+    provenance: dict[str, tuple[str, datetime]] = field(default_factory=dict)
+
+    @property
+    def fallbacks_used(self) -> int:
+        """Tickers served by the secondary (stooq) provider after yfinance failed.
+
+        Mirrors `PricesResult.fallbacks_used`: counts the stooq wins on *this*
+        run. A cache hit reports source "cache" (its original provider isn't
+        re-derived), so historical fallbacks aren't double-counted."""
+        return sum(1 for src, _ in self.provenance.values() if src == "stooq")
 
 
 @dataclass(frozen=True)
@@ -121,7 +135,15 @@ def fetch_latest(
             rows[ticker] = cached
             continue
         if not online:
-            missing.append(ticker)
+            # Offline only: the dedicated latest cache missed, so fall back to the
+            # *series* cache tail — a risk-on run writes only <T>_series.parquet,
+            # so the series can hold a price the latest cache lacks. Online we
+            # prefer a fresh network fetch over a possibly stale-dated tail.
+            from_series = _latest_from_series_cache(ticker, asof, cache) if cache else None
+            if from_series is not None:
+                rows[ticker] = from_series
+            else:
+                missing.append(ticker)
             continue
         live = _from_yfinance(ticker, asof) or _from_stooq(ticker, asof)
         if live is None:
@@ -200,6 +222,8 @@ def _from_cache(ticker: str, asof: date, cache_dir: Path) -> PriceRow | None:
         fetched_at = ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
     else:
         fetched_at = fetched_at_ts
+    if pd.isna(fetched_at):
+        return None  # NaT timestamp (corrupt) — unusable, refetch
 
     now = _now_utc()
     # Refuse future-stamped entries (clock skew or tampered file).
@@ -298,30 +322,35 @@ def fetch_series(
 
     rows: dict[str, pd.Series[float]] = {}
     missing: list[str] = []
+    provenance: dict[str, tuple[str, datetime]] = {}
 
     for ticker in dict.fromkeys(tickers):
         cached = _series_from_cache(ticker, start, end, cache) if cache else None
         if cached is not None:
-            rows[ticker] = cached
+            rows[ticker], cached_at = cached
+            provenance[ticker] = ("cache", cached_at)
             continue
         if not online:
             missing.append(ticker)
             continue
         live = _series_from_yfinance(ticker, start, end)
+        source = "yfinance"
         if live is None or live.empty:
             live = _series_from_stooq(ticker, start, end)
+            source = "stooq"
         if live is None or live.empty:
             missing.append(ticker)
             continue
         if cache:
             _write_series_cache(ticker, live, cache)
         rows[ticker] = live
+        provenance[ticker] = (source, _now_utc())
 
     log.info(
         "series fetched: returned=%d missing=%d range=%s..%s",
         len(rows), len(missing), start, end,
     )
-    return SeriesResult(rows=rows, missing=missing)
+    return SeriesResult(rows=rows, missing=missing, provenance=provenance)
 
 
 def _normalize_close(df: pd.DataFrame) -> "pd.Series[float] | None":
@@ -367,10 +396,16 @@ def _series_from_stooq(ticker: str, start: date, end: date) -> "pd.Series[float]
     return pd.Series(closes, index=pd.DatetimeIndex(dates), dtype=float).sort_index()
 
 
-def _series_from_cache(
-    ticker: str, start: date, end: date, cache_dir: Path
-) -> "pd.Series[float] | None":
-    path = cache_dir / f"{ticker}_series.parquet"
+def _read_fresh_series_cache(
+    path: Path, ticker: str
+) -> "tuple[pd.Series[float], datetime] | None":
+    """Read a series-cache parquet → (sorted series, fetched_at), or None.
+
+    Shared by `_series_from_cache` (price history) and `_latest_from_series_cache`
+    (the latest-from-series fallback). Returns None if the file is absent,
+    unreadable, malformed (missing date/close/fetched_at), future-stamped, or
+    stale (older than the TTL). Does NOT apply any date-range filter — callers
+    slice for what they need."""
     if not path.exists():
         return None
     try:
@@ -378,22 +413,62 @@ def _series_from_cache(
     except Exception as exc:  # noqa: BLE001
         log.warning("series cache read failed for %s: %s", ticker, exc)
         return None
-    if df.empty or "fetched_at" not in df.columns:
+    if df.empty or not {"date", "close", "fetched_at"} <= set(df.columns):
         return None
-    fetched = pd.to_datetime(df["fetched_at"]).max().to_pydatetime()
+    fetched_ts = pd.to_datetime(df["fetched_at"]).max()
+    if pd.isna(fetched_ts):
+        return None  # NaT timestamp (corrupt/empty) — unusable, refetch
+    fetched = fetched_ts.to_pydatetime()
     if fetched.tzinfo is None:
         fetched = fetched.replace(tzinfo=timezone.utc)
     now = _now_utc()
     if fetched > now or now - fetched > _CACHE_TTL:
         return None  # stale or future-stamped → refetch
     idx = pd.to_datetime(df["date"]).dt.normalize()
-    series = pd.Series(df["close"].astype(float).to_numpy(), index=pd.DatetimeIndex(idx))
-    series = series.sort_index()
+    series = pd.Series(
+        df["close"].astype(float).to_numpy(), index=pd.DatetimeIndex(idx)
+    ).sort_index()
+    return series, fetched
+
+
+def _series_from_cache(
+    ticker: str, start: date, end: date, cache_dir: Path
+) -> "tuple[pd.Series[float], datetime] | None":
+    """Return (series, fetched_at) from the cache, or None if absent/stale."""
+    read = _read_fresh_series_cache(cache_dir / f"{ticker}_series.parquet", ticker)
+    if read is None:
+        return None
+    series, fetched = read
     # The cached series must cover the requested end date to be usable as-is.
     if series.index.max() < pd.Timestamp(end - timedelta(days=4)):
         return None
     mask = (series.index >= pd.Timestamp(start)) & (series.index <= pd.Timestamp(end))
-    return series[mask]
+    return series[mask], fetched
+
+
+def _latest_from_series_cache(
+    ticker: str, asof: date, cache_dir: Path
+) -> PriceRow | None:
+    """Derive a latest-price row from the *series* cache tail (source="cache").
+
+    Unifies the two on-disk caches so a risk-on run's series cache can serve a
+    latest price the dedicated latest cache lacks — notably under `--no-risk
+    --offline`. Returns the last close at/before `asof` from a fresh cached
+    series (same TTL + future-stamp rules as the latest cache), else None."""
+    read = _read_fresh_series_cache(cache_dir / f"{ticker}_series.parquet", ticker)
+    if read is None:
+        return None
+    series, fetched = read
+    series = series[series.index <= pd.Timestamp(asof)]
+    if series.empty:
+        return None
+    return PriceRow(
+        ticker=ticker,
+        asof_date=series.index[-1].date(),
+        close=float(series.iloc[-1]),
+        source="cache",
+        fetched_at=fetched,
+    )
 
 
 def _write_series_cache(ticker: str, series: "pd.Series[float]", cache_dir: Path) -> None:

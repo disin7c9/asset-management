@@ -210,3 +210,17 @@ def test_invariant_drawdown_non_positive_and_cdar_bounded(rets: list[float]) -> 
     assert info.depth <= 1e-12  # drawdown is ≤ 0
     assert ulcer_index(index) >= 0.0
     assert cdar(index) <= abs(info.depth) + 1e-9  # CDaR ≤ worst single drawdown
+
+
+def test_summarize_risk_bands_ulcer_and_cdar() -> None:
+    # Ulcer/CDaR are now bootstrapped → MetricCI bracketing the point (P2 fix).
+    rng = np.random.default_rng(0)
+    daily = pd.Series(
+        rng.normal(0.0005, 0.01, 300),
+        index=pd.bdate_range("2023-01-01", periods=300),
+    )
+    s = summarize_risk(daily, (1.0 + daily).cumprod(), bootstrap_n=60)
+    assert s is not None
+    assert isinstance(s.ulcer_index, MetricCI) and isinstance(s.cdar, MetricCI)
+    assert s.ulcer_index.low <= s.ulcer_index.point <= s.ulcer_index.high
+    assert s.cdar.low <= s.cdar.point <= s.cdar.high

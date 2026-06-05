@@ -24,15 +24,20 @@ from pathlib import Path
 
 import quantstats as qs
 
+from app.backtest import backtest_compare, simulate
 from app.derive import derive
 from app.events import load_events
 from app.prices import fetch_series
 from app.returns import build_daily_returns, true_twr_annualized, twr_index
 from app.risk import calmar, max_drawdown, sharpe, sortino, summarize_risk
+from app.strategy import load_target
+
+_SAMPLE_CSV = Path("data/sample_data/transactions.csv")
+_SAMPLE_TARGET = Path("data/sample_data/target.csv")
 
 
 def main() -> None:
-    events = load_events(Path("examples/data/transactions.csv"))
+    events = load_events(_SAMPLE_CSV)
     derive(events)  # sanity: replay must succeed
     traded = sorted({ev.ticker for ev in events})
     start = min(ev.date for ev in events)
@@ -85,6 +90,31 @@ def main() -> None:
     assert rk is not None
     print(f"\n  risk panel n_days={rk.n_days}  noisy={rk.is_noisy}  "
           f"maxDD CI=[{rk.max_drawdown_ci.low:+.4f}, {rk.max_drawdown_ci.high:+.4f}]")
+
+    _reconcile_backtest(series.rows)
+
+
+def _reconcile_backtest(series: dict) -> None:  # type: ignore[type-arg]
+    """Validate the backtest engine's leg metrics against quantstats on the SAME
+    simulated equity curve. Previously the entire backtest was unvalidated."""
+    target = load_target(_SAMPLE_TARGET)
+    res = backtest_compare(series, target, schedule="quarterly", bootstrap_n=200)
+    if res is None:
+        print("\n  [backtest] no usable history — skipped")
+        return
+    print(f"\nBACKTEST LEGS vs quantstats (same simulated curve · {res.start}→{res.end})")
+    for leg, sched in ((res.legs[0], "quarterly"), (res.legs[1], "never")):
+        curve = simulate(series, target, schedule=sched)
+        d = curve.pct_change().dropna()
+        qs_sharpe = float(qs.stats.sharpe(d))
+        qs_maxdd = float(qs.stats.max_drawdown(d))
+        for name, ours, theirs in (
+            (f"{leg.label} Sharpe", leg.risk.sharpe.point, qs_sharpe),
+            (f"{leg.label} MaxDD", leg.risk.max_drawdown_ci.point, qs_maxdd),
+        ):
+            delta = ours - theirs
+            flag = "OK" if abs(delta) < max(0.02, abs(theirs) * 0.05) else "CHECK"
+            print(f"  {name:28} ours={ours:+.4f}   quantstats={theirs:+.4f}   Δ={delta:+.4f}  [{flag}]")
 
 
 if __name__ == "__main__":

@@ -28,6 +28,7 @@ from app.report import (
 from app.returns import (
     ReturnsSummary,
     build_daily_returns,
+    price_basis_mismatches,
     summarize,
     true_twr_annualized,
     twr_index,
@@ -75,7 +76,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--no-risk",
         action="store_true",
-        help="skip the drawdown/risk panel (needs price history; slower than --no-prices)",
+        help="skip the HOLDINGS drawdown/risk panel (needs price history; slower than "
+        "--no-prices). Scope is the holdings panel only: an explicitly-requested "
+        "--backtest still reports its own risk metrics.",
     )
     parser.add_argument(
         "--save",
@@ -209,9 +212,10 @@ def main(argv: list[str] | None = None) -> int:
     returns: ReturnsSummary | None = None
     risk: RiskSummary | None = None
     missing: list[str] = []
+    twr_excluded: list[str] = []
 
     if not args.no_prices and state.held():
-        prices, returns, risk, missing = _compute_prices_returns_risk(
+        prices, returns, risk, missing, twr_excluded = _compute_prices_returns_risk(
             events, state, args, run
         )
 
@@ -228,7 +232,8 @@ def main(argv: list[str] | None = None) -> int:
 
     data = build_report_data(
         state, prices=prices, returns=returns, risk=risk,
-        suggestions=suggestions, backtest=backtest, missing_tickers=missing, asof=today,
+        suggestions=suggestions, backtest=backtest, missing_tickers=missing,
+        asof=today, generated_at=datetime.now(timezone.utc), twr_excluded=twr_excluded,
     )
 
     sys.stdout.write(render_text(data) + "\n")
@@ -286,6 +291,7 @@ def _compute_prices_returns_risk(
     ReturnsSummary | None,
     RiskSummary | None,
     list[str],
+    list[str],
 ]:
     """Fetch prices, derive returns + risk. Single price source per mode.
 
@@ -301,6 +307,7 @@ def _compute_prices_returns_risk(
     prices: dict[str, PriceRow] = {}
     risk: RiskSummary | None = None
     true_twr: float | None = None
+    twr_excluded: list[str] = []
 
     series = None
     if not args.no_risk and events:
@@ -312,40 +319,74 @@ def _compute_prices_returns_risk(
         if series.missing and run["status"] == "ok":
             run["status"] = "partial"
         if series.rows:
-            daily = build_daily_returns(events, series.rows, asof_date=today)
+            # Guard against unhandled stock splits: the log holds raw share counts
+            # but yfinance prices are split-adjusted, so a ticker that split during
+            # its holding period would fabricate a return in the time-weighted
+            # series. Exclude such a ticker from TWR + risk (and warn) — the honest
+            # stopgap until v1.x adjusts share counts for corporate actions.
+            twr_series = series.rows
+            twr_excluded = price_basis_mismatches(events, series.rows)
+            if twr_excluded:
+                log.warning(
+                    "excluding %s from TWR & risk: execution price disagrees with the "
+                    "split-adjusted price history (likely an unhandled stock split). The "
+                    "time-weighted series mixes raw share counts with adjusted prices and "
+                    "would fabricate a return. MWR / Modified Dietz are unaffected; full "
+                    "corporate-action handling is a v1.x item.",
+                    ", ".join(twr_excluded),
+                )
+                twr_series = {
+                    tk: s for tk, s in series.rows.items() if tk not in twr_excluded
+                }
+            daily = build_daily_returns(events, twr_series, asof_date=today)
             true_twr = true_twr_annualized(daily)
             risk = summarize_risk(daily, twr_index(daily))
 
     if series is not None and series.rows:
-        # Derive each held ticker's latest price from its series tail (one source).
-        fetched_at = datetime.now(timezone.utc)
+        # Derive each held ticker's latest price from its series tail, carrying the
+        # series' REAL provenance (cache/yfinance/stooq + true fetch time) — not a
+        # fabricated "series"/now() stamp, so the footer's source + age are honest.
         for tk in held:
             s = series.rows.get(tk)
             if s is not None and not s.empty:
+                source, fetched_at = series.provenance.get(
+                    tk, ("cache", datetime.now(timezone.utc))
+                )
                 prices[tk] = PriceRow(
                     ticker=tk,
                     asof_date=s.index[-1].date(),
                     close=float(s.iloc[-1]),
-                    source="series",
+                    source=source,
                     fetched_at=fetched_at,
                 )
-        missing = [tk for tk in held if tk not in prices]
+        run["fallbacks_used"] = series.fallbacks_used
     else:
         # No risk panel (or series unavailable): fetch latest prices for held.
         result: PricesResult = fetch_latest(
             list(held), cache_dir=args.cache_dir, online=online
         )
         prices = result.rows
-        missing = result.missing
-        run["n_prices_fetched"] = len(result.rows)
-        run["n_prices_missing"] = len(result.missing)
         run["fallbacks_used"] = result.fallbacks_used
-        if result.missing and run["status"] == "ok":
-            run["status"] = "partial"
 
-    mkt_value = sum(_held_market_value(state, prices).values())
-    returns = summarize(events, mkt_value, asof_date=today, true_twr=true_twr)
-    return prices, returns, risk, missing
+    # One definition of "priced" for the whole report: a held ticker with a
+    # positive, usable close — what market value (and so MWR / Modified Dietz)
+    # actually need. A ticker present in `prices` but with a non-positive or NaN
+    # close is dropped from value, so it must count as unpriced here too; else a
+    # partial book would be scored as fully priced and the money-weighted figures
+    # would print a confident wrong number. Counters + partial-status are set here
+    # once, for both branches (the series counts are recorded by the caller).
+    priced_held = _held_market_value(state, prices)
+    prices = {tk: prices[tk] for tk in priced_held}  # drop non-positive/NaN quotes
+    missing = [tk for tk in held if tk not in priced_held]
+    run["n_prices_fetched"] = len(priced_held)
+    run["n_prices_missing"] = len(missing)
+    if missing and run["status"] == "ok":
+        run["status"] = "partial"
+    mkt_value = sum(priced_held.values())
+    returns = summarize(
+        events, mkt_value, asof_date=today, true_twr=true_twr, fully_priced=not missing
+    )
+    return prices, returns, risk, missing, twr_excluded
 
 
 def _held_market_value(
@@ -393,6 +434,11 @@ def _compute_suggestions(
         return None
     if args.rebalance == "bands" and args.new_cash > 0:
         log.warning("--rebalance bands ignores --new-cash (it rebalances existing holdings)")
+    if args.rebalance in ("fixed_dca", "cash_flow_only") and args.new_cash <= 0:
+        log.warning(
+            "--rebalance %s deploys new cash but --new-cash is 0 → nothing to invest "
+            "(every line will be HOLD); pass --new-cash N", args.rebalance,
+        )
     if not args.target.exists():
         log.error("--rebalance: target file not found: %s", args.target)
         run["rebalance"] = "skipped: no target file"
@@ -513,7 +559,7 @@ def _compute_backtest(
         return None
     result = backtest_compare(
         series.rows, target, schedule=args.rebalance_every,
-        start=args.backtest_start, end=today,
+        start=args.backtest_start, end=today, provenance=series.provenance,
     )
     if result is None:
         run["backtest"] = "skipped: insufficient history"

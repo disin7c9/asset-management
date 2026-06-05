@@ -18,6 +18,7 @@ from app.returns import (
     cash_flows_from_events,
     modified_dietz_return,
     money_weighted_return,
+    price_basis_mismatches,
     summarize,
     true_twr_annualized,
     twr_index,
@@ -354,3 +355,53 @@ def test_invariant_modified_dietz_is_scale_invariant(qty: float, price: float, g
     md_b = modified_dietz_return(events_b, current_value=current_b, asof_date=date(2024, 1, 1))
     assert md_a is not None and md_b is not None
     assert isclose(md_a, md_b, abs_tol=1e-6)
+
+
+def test_summarize_suppresses_money_weighted_when_partially_priced() -> None:
+    # If any held ticker is unpriced, current_value is partial → MWR/Dietz would
+    # be confidently wrong, so both must be None. true TWR (priced-subset) stays.
+    events = [Event(date(2024, 1, 1), "VOO", "buy", quantity=10.0, price=100.0, fee=0.0)]
+    s = summarize(events, 1234.0, date(2026, 1, 1), true_twr=0.12, fully_priced=False)
+    assert s.money_weighted_annualized is None
+    assert s.modified_dietz_annualized is None
+    assert s.true_twr_annualized == 0.12
+
+
+def test_cash_flows_net_dividend_fee() -> None:
+    events = [Event(date(2024, 3, 1), "VOO", "dividend",
+                    quantity=0.0, price=0.0, cash=50.0, fee=3.0)]
+    cfs = cash_flows_from_events(events)
+    assert len(cfs) == 1
+    assert cfs[0].amount == pytest.approx(47.0)  # 50 cash − 3 withholding
+
+
+def test_price_basis_mismatches_flags_split_not_normal_gap() -> None:
+    # A buy at ~10× the split-adjusted close is the fingerprint of an unhandled
+    # split (NVDA 10:1); a ~1% fill-vs-close gap is normal and must not flag.
+    dates = pd.date_range("2024-01-02", periods=5, freq="D")
+    series = {
+        "NVDA": pd.Series([110.0] * 5, index=dates, dtype=float),  # split-adjusted
+        "VOO": pd.Series([100.0] * 5, index=dates, dtype=float),
+    }
+    events = [
+        Event(date(2024, 1, 2), "NVDA", "buy", quantity=1.0, price=1120.0, fee=0.0),
+        Event(date(2024, 1, 2), "VOO", "buy", quantity=1.0, price=101.0, fee=0.0),
+    ]
+    assert price_basis_mismatches(events, series) == ["NVDA"]
+
+
+def test_price_basis_mismatches_handles_reverse_split_and_edges() -> None:
+    dates = pd.date_range("2024-01-02", periods=3, freq="D")
+    series = {
+        "RVRS": pd.Series([10.0] * 3, index=dates, dtype=float),  # adjusted up after a 1:10
+        "OK": pd.Series([50.0] * 3, index=dates, dtype=float),
+        "NOPX": pd.Series([0.0] * 3, index=dates, dtype=float),  # bad/zero close → skip
+    }
+    events = [
+        Event(date(2024, 1, 2), "RVRS", "sell", quantity=1.0, price=1.0, fee=0.0),  # 0.1× → flag
+        Event(date(2024, 1, 2), "OK", "buy", quantity=1.0, price=50.0, fee=0.0),
+        Event(date(2024, 1, 2), "NOPX", "buy", quantity=1.0, price=99.0, fee=0.0),  # close 0 → skip
+        Event(date(2024, 1, 2), "GONE", "buy", quantity=1.0, price=5.0, fee=0.0),   # no series → skip
+        Event(date(2024, 3, 1), "OK", "dividend", quantity=0.0, price=0.0, cash=5.0, fee=0.0),
+    ]
+    assert price_basis_mismatches(events, series) == ["RVRS"]

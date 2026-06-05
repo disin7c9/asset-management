@@ -108,6 +108,20 @@ def test_invariant_share_balance_after_buys_then_sell(
     ), (pos.shares, expected)
 
 
+def test_dividend_fee_is_netted_into_realized() -> None:
+    # A withholding fee on a dividend row reduces realized income (and is still
+    # tracked informationally in total_fees) — was previously dropped.
+    events = [
+        Event(date=date(2024, 1, 1), ticker="VOO",
+              action="buy", quantity=10.0, price=100.0, fee=0.0),
+        Event(date=date(2024, 3, 1), ticker="VOO",
+              action="dividend", quantity=0.0, price=0.0, cash=50.0, fee=3.0),
+    ]
+    state = derive(events)
+    assert isclose(state.realized["VOO"], 47.0)  # 50 cash − 3 withholding
+    assert isclose(state.total_fees(), 3.0)
+
+
 @given(
     dividends=st.lists(
         st.floats(min_value=0.0, max_value=1000, allow_nan=False, allow_infinity=False),
