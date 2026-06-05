@@ -30,6 +30,14 @@ def _run_summary(caplog: pytest.LogCaptureFixture) -> dict[str, Any]:
     raise AssertionError("no run_summary line was logged")
 
 
+@pytest.fixture(autouse=True)
+def _no_network_splits(monkeypatch: pytest.MonkeyPatch) -> None:
+    # cli now fetches stock splits on every run; default tests must not hit the
+    # network for it. Return "no splits known" → no adjustment (the price-basis
+    # guard remains the safety net). A split-specific test overrides this.
+    monkeypatch.setattr("app.cli.fetch_splits", lambda *a, **k: {})
+
+
 def _today() -> str:
     # Must match cli.main's `today = date.today()` (local), which dates the file.
     return date.today().isoformat()
@@ -549,3 +557,46 @@ def test_unhandled_split_ticker_excluded_from_twr_and_noted(
     assert "excluded from TWR" in out and "SPLT" in out              # noted in the brief
     twr_line = next(line for line in out.splitlines() if "Time-weighted" in line)
     assert not twr_line.strip().endswith("n/a")  # TWR computed over the clean sub-book
+
+
+def test_split_handled_by_adjustment_keeps_ticker_in_twr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str],
+) -> None:
+    # Slice 7 wiring: when split data IS available, the adjustment fixes the basis
+    # so the ticker is NOT excluded from TWR (guard stays silent) — the real fix,
+    # not the guard fallback. Mirrors NVDA once corporate actions are handled.
+    import pandas as pd
+
+    csv = tmp_path / "book.csv"
+    csv.write_text(
+        "Date,Code,Action,Quantity,Price,Fee\n"
+        "2024-01-02,VOO,buy,10,100,0\n"
+        "2024-01-02,SPLT,buy,1,1000,0\n"   # raw pre-split: 1 share @ $1000
+        "2024-02-01,VOO,buy,5,100,0\n",
+        encoding="utf-8",
+    )
+    dates = pd.bdate_range("2024-01-02", periods=400)
+
+    def fake_series(tickers, *a, **k):  # type: ignore[no-untyped-def]
+        rows = {
+            tk: pd.Series([100.0 + i * 0.05 for i in range(400)], index=dates, dtype=float)
+            for tk in tickers
+        }
+        prov = {tk: ("cache", datetime.now(timezone.utc)) for tk in tickers}
+        return SeriesResult(rows=rows, missing=[], provenance=prov)
+
+    monkeypatch.setattr("app.cli.fetch_series", fake_series)
+    # SPLT did a 10:1 AFTER the buy → adjustment makes it 10 @ $100, matching the series.
+    monkeypatch.setattr(
+        "app.cli.fetch_splits", lambda *a, **k: {"SPLT": [(date(2024, 1, 15), 10.0)]}
+    )
+    with caplog.at_level(logging.INFO):
+        rc = main(["--csv", str(csv)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "excluded from TWR" not in out          # adjustment handled it, not the guard
+    assert "excluding SPLT" not in caplog.text
+    assert "split-adjusted share counts for: SPLT" in caplog.text  # the adjustment actually ran
+    splt_line = next(line for line in out.splitlines() if line.startswith("SPLT"))
+    assert "10.000" in splt_line                   # 1 raw share → 10 split-adjusted (not still 1)

@@ -13,7 +13,14 @@ import pandas as pd
 import pytest
 
 from app import prices as P
-from app.prices import PriceRow, PricesResult, SeriesResult, fetch_latest, fetch_series
+from app.prices import (
+    PriceRow,
+    PricesResult,
+    SeriesResult,
+    fetch_latest,
+    fetch_series,
+    fetch_splits,
+)
 
 
 def _fake_yf_df(price: float, on: date) -> pd.DataFrame:
@@ -475,3 +482,70 @@ def test_latest_nat_series_cache_not_served_offline(tmp_path: Path) -> None:
     ).to_parquet(tmp_path / "VOO_series.parquet", index=False)
     res = fetch_latest(["VOO"], asof_date=date(2024, 1, 3), cache_dir=tmp_path, online=False)
     assert res.missing == ["VOO"]
+
+
+# ── fetch_splits (slice 7: corporate actions) ──────────────────────────────
+
+
+def _fake_splits(pairs: list[tuple[str, float]]) -> "pd.Series[float]":
+    idx = pd.DatetimeIndex([pd.Timestamp(d) for d, _ in pairs])
+    return pd.Series([r for _, r in pairs], index=idx, dtype=float)
+
+
+def test_fetch_splits_parses_and_caches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(P, "_fetch_yf_splits", lambda tk: _fake_splits([("2024-06-10", 10.0)]))
+    res = fetch_splits(["NVDA"], cache_dir=tmp_path)
+    assert res["NVDA"] == [(date(2024, 6, 10), 10.0)]
+    assert (tmp_path / "NVDA_splits.parquet").exists()
+    # Second call must hit the cache (network wrapper fails the test if called).
+    monkeypatch.setattr(P, "_fetch_yf_splits", lambda tk: pytest.fail("should not refetch"))
+    assert fetch_splits(["NVDA"], cache_dir=tmp_path)["NVDA"] == [(date(2024, 6, 10), 10.0)]
+
+
+def test_fetch_splits_no_splits_cached_as_empty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(P, "_fetch_yf_splits", lambda tk: None)  # no split history
+    assert fetch_splits(["VOO"], cache_dir=tmp_path)["VOO"] == []
+    # The "no splits" fact is cached (placeholder) → offline returns [] without refetch.
+    assert fetch_splits(["VOO"], cache_dir=tmp_path, online=False)["VOO"] == []
+
+
+def test_fetch_splits_offline_no_cache_is_empty(tmp_path: Path) -> None:
+    # Unknown offline → no adjustment (the price-basis-mismatch guard is the net).
+    assert fetch_splits(["XYZ"], cache_dir=tmp_path, online=False) == {"XYZ": []}
+
+
+def test_fetch_splits_drops_noise(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A 1:1 ratio is a no-op and must be dropped; a real reverse split is kept.
+    monkeypatch.setattr(
+        P, "_fetch_yf_splits",
+        lambda tk: _fake_splits([("2023-01-01", 1.0), ("2024-01-01", 0.1)]),
+    )
+    assert fetch_splits(["RV"], cache_dir=tmp_path)["RV"] == [(date(2024, 1, 1), 0.1)]
+
+
+def test_fetch_splits_corrupt_cache_is_nonfatal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A cache file with fetched_at but missing ratio/date must refetch, not KeyError
+    # (mirrors the series-cache corrupt test; fetch_splits documents "never raises").
+    pd.DataFrame(
+        {"fetched_at": [pd.Timestamp(datetime.now(timezone.utc))]}
+    ).to_parquet(tmp_path / "FOO_splits.parquet", index=False)
+    monkeypatch.setattr(P, "_fetch_yf_splits", lambda tk: _fake_splits([("2024-06-10", 10.0)]))
+    assert fetch_splits(["FOO"], cache_dir=tmp_path)["FOO"] == [(date(2024, 6, 10), 10.0)]
+
+
+def test_fetch_splits_skips_nat_date(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A NaT split date must be dropped, not crash sorted()/the date comparison
+    # (pd.Timestamp(NaT).date() returns NaT without raising).
+    s = pd.Series([5.0, 2.0], index=pd.DatetimeIndex([pd.NaT, pd.Timestamp("2024-01-01")]))
+    monkeypatch.setattr(P, "_fetch_yf_splits", lambda tk: s)
+    assert fetch_splits(["X"], cache_dir=tmp_path)["X"] == [(date(2024, 1, 1), 2.0)]

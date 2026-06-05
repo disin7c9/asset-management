@@ -13,11 +13,12 @@ from typing import Any
 
 from dotenv import load_dotenv
 
+from app.corporate_actions import adjust_for_splits
 from app.derive import DerivedState, derive
 from app.email import send_report
 from app.events import Event, load_events
 from app.log_config import setup_logging
-from app.prices import PriceRow, PricesResult, fetch_latest, fetch_series
+from app.prices import PriceRow, PricesResult, fetch_latest, fetch_series, fetch_splits
 from app.report import (
     ReportData,
     build_report_data,
@@ -200,6 +201,22 @@ def main(argv: list[str] | None = None) -> int:
     try:
         events = load_events(csv_path)
         run["n_events_replayed"] = len(events)
+        # Split-adjust raw share counts (yfinance prices are split-adjusted) so
+        # holdings AND the time-weighted series share one basis — the real fix for
+        # the NVDA-style corruption. Cache-only under --offline/--no-prices; the
+        # price-basis-mismatch guard stays the net for any split we couldn't fetch.
+        splits = fetch_splits(
+            sorted({ev.ticker for ev in events}),
+            cache_dir=args.cache_dir,
+            online=not args.offline and not args.no_prices,
+        )
+        raw_events = events
+        events = adjust_for_splits(raw_events, splits)
+        adjusted_tickers = sorted({
+            a.ticker for a, b in zip(raw_events, events, strict=True) if a != b
+        })
+        if adjusted_tickers:
+            log.info("split-adjusted share counts for: %s", ", ".join(adjusted_tickers))
         state = derive(events)
     except (ValueError, KeyError) as exc:
         log.error("failed to process %s: %s", csv_path, exc)

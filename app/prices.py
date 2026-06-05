@@ -487,6 +487,131 @@ def _write_series_cache(ticker: str, series: "pd.Series[float]", cache_dir: Path
         log.warning("series cache write failed for %s: %s", ticker, exc)
 
 
+# ── corporate actions: stock splits (slice 7) ──────────────────────────────
+
+_SPLITS_TTL = timedelta(days=7)  # splits are stable facts; a weekly refetch catches new ones
+
+
+def _fetch_yf_splits(ticker: str) -> "pd.Series[float] | None":
+    """Split history for a ticker (index=date, value=ratio). None on failure.
+
+    Thin wrapper around `yf.Ticker(...).splits`, monkey-patched in tests so no
+    real HTTP happens.
+    """
+    try:
+        s = yf.Ticker(ticker).splits
+    except Exception as exc:  # noqa: BLE001 — yfinance raises many specific things
+        log.warning("yfinance splits fetch failed for %s: %s", ticker, exc)
+        return None
+    return s
+
+
+def _parse_splits(s: "pd.Series[float] | None") -> list[tuple[date, float]]:
+    """yfinance splits Series → sorted [(effective_date, ratio)].
+
+    Keeps real splits (ratio > 0 and ≠ 1.0); a 1:1 ratio is a no-op (and our
+    no-split cache placeholder), so it's dropped → a clean empty list.
+    """
+    if s is None or len(s) == 0:
+        return []
+    rows: list[tuple[date, float]] = []
+    for ts, ratio in s.items():
+        if pd.isna(ts):
+            continue  # NaT index: .date() returns NaT (no raise) → would crash sort/compare
+        try:
+            d = pd.Timestamp(ts).date()
+            r = float(ratio)
+        except (ValueError, TypeError):
+            continue
+        if r > 0 and r != 1.0:
+            rows.append((d, r))
+    return sorted(rows)
+
+
+def _splits_from_cache(ticker: str, cache_dir: Path) -> list[tuple[date, float]] | None:
+    """Cached split history, or None if absent/stale. A no-split ticker is cached
+    as a harmless identity placeholder so we don't refetch it every run."""
+    path = cache_dir / f"{ticker}_splits.parquet"
+    if not path.exists():
+        return None
+    try:
+        df = pd.read_parquet(path)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("splits cache read failed for %s: %s", ticker, exc)
+        return None
+    if df.empty or not {"date", "ratio", "fetched_at"} <= set(df.columns):
+        return None  # malformed (missing a column) → refetch, don't KeyError
+    fetched_ts = pd.to_datetime(df["fetched_at"]).max()
+    if pd.isna(fetched_ts):
+        return None
+    fetched = fetched_ts.to_pydatetime()
+    if fetched.tzinfo is None:
+        fetched = fetched.replace(tzinfo=timezone.utc)
+    now = _now_utc()
+    if fetched > now or now - fetched > _SPLITS_TTL:
+        return None  # stale or future-stamped → refetch
+    return _parse_splits(pd.Series(df["ratio"].to_numpy(), index=pd.to_datetime(df["date"])))
+
+
+def _write_splits_cache(
+    ticker: str, rows: list[tuple[date, float]], cache_dir: Path
+) -> None:
+    fetched = pd.Timestamp(_now_utc())
+    if rows:
+        df = pd.DataFrame(
+            {
+                "date": [pd.Timestamp(d) for d, _ in rows],
+                "ratio": [r for _, r in rows],
+                "fetched_at": fetched,
+            }
+        )
+    else:
+        # No splits — store an identity placeholder (ratio 1.0, epoch date) so the
+        # cache records "checked, none"; it's a no-op in cumulative_split_factor.
+        df = pd.DataFrame(
+            {"date": [pd.Timestamp("1970-01-01")], "ratio": [1.0], "fetched_at": fetched}
+        )
+    try:
+        df.to_parquet(cache_dir / f"{ticker}_splits.parquet", index=False)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("splits cache write failed for %s: %s", ticker, exc)
+
+
+def fetch_splits(
+    tickers: Iterable[str],
+    *,
+    cache_dir: Path | None = None,
+    online: bool = True,
+) -> dict[str, list[tuple[date, float]]]:
+    """Fetch stock-split history per ticker → {ticker: [(effective_date, ratio)]}.
+
+    Cache → yfinance, same as prices. Never raises: a ticker that fails (or is
+    unknown offline) maps to `[]` (no adjustment), and the price-basis-mismatch
+    guard remains the safety net for any split we couldn't fetch.
+    """
+    cache = cache_dir if cache_dir is not None else _CACHE_DIR_DEFAULT
+    try:
+        cache.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        log.warning("cache dir unwritable (%s) — proceeding without cache", exc)
+        cache = None  # type: ignore[assignment]
+
+    out: dict[str, list[tuple[date, float]]] = {}
+    for ticker in dict.fromkeys(tickers):
+        cached = _splits_from_cache(ticker, cache) if cache else None
+        if cached is not None:
+            out[ticker] = cached
+            continue
+        if not online:
+            out[ticker] = []  # unknown offline → no adjustment (guard catches splits)
+            continue
+        rows = _parse_splits(_fetch_yf_splits(ticker))
+        if cache:
+            _write_splits_cache(ticker, rows, cache)
+        out[ticker] = rows
+    return out
+
+
 def _write_cache(row: PriceRow, cache_dir: Path) -> None:
     path = cache_dir / f"{row.ticker}.parquet"
     # The cache stores only what the reader needs (no redundant `source`).

@@ -2,7 +2,7 @@
 
 A small Python tool for tracking a personal portfolio of stocks and ETFs.
 
-Reads an append-only CSV transaction log (date, ticker, action, quantity, price, fee per row), replays it, and prints a **drawdown-first** brief: how far the portfolio fell from its peak (with a bootstrap confidence band), risk-adjusted ratios, time- and money-weighted returns, and current holdings. Holdings are *derived* from the log — never stored — so the same input always produces the same output. Prices are fetched from multiple sources with fallback and an on-disk cache; every displayed number is traceable to its source, and figures that can't be computed honestly (too-short a window, no real solution) print `n/a` rather than a fabricated number.
+Reads an append-only CSV transaction log (date, ticker, action, quantity, price, fee per row), replays it, and prints a **drawdown-first** brief: how far the portfolio fell from its peak (with a bootstrap confidence band), risk-adjusted ratios, time- and money-weighted returns, and current holdings. Holdings are *derived* from the log — never stored — so the same input always produces the same output. Prices are fetched from multiple sources with fallback and an on-disk cache; every displayed number is traceable to its source, and figures that can't be computed honestly (too-short a window, no real solution) print `n/a` rather than a fabricated number. **Stock splits are adjusted automatically** (share counts are reconciled with the split-adjusted price history), so a split during your holding period doesn't distort the returns.
 
 ## Requirements
 
@@ -123,7 +123,8 @@ asset-management/
 ├── app/
 │   ├── events.py     CSV → typed event list
 │   ├── derive.py     events → holdings + cost basis + realized P&L
-│   ├── prices.py     multi-source price fetch (latest + history) with provenance + cache
+│   ├── corporate_actions.py  split-adjust raw share counts (stock splits)
+│   ├── prices.py     multi-source price fetch (latest + history + splits) with provenance + cache
 │   ├── returns.py    events + prices → equity curve, true TWR, MWR (XIRR), Modified Dietz
 │   ├── risk.py       drawdown family + Sharpe/Sortino/Calmar with bootstrap CIs
 │   ├── strategy.py   holdings + target → named buy/sell suggestions (rebalance modes) + edge gate
