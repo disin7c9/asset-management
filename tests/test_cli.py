@@ -557,6 +557,48 @@ def test_unhandled_split_ticker_excluded_from_twr_and_noted(
     assert "excluded from TWR" in out and "SPLT" in out              # noted in the brief
     twr_line = next(line for line in out.splitlines() if "Time-weighted" in line)
     assert not twr_line.strip().endswith("n/a")  # TWR computed over the clean sub-book
+    # The dollar P&L curve drops the excluded ticker too, so "Gains given back"
+    # would silently omit a holding → it must be suppressed (not shown), like MWR.
+    assert "Gains given back" not in out
+
+
+def test_cash_pseudo_ticker_not_fetched_no_false_partial(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str],
+) -> None:
+    # A book with deposit/withdraw (CASH legs) must NOT ask the price fetcher for
+    # "CASH" — that would land in series.missing and falsely flip status to partial.
+    import pandas as pd
+
+    csv = tmp_path / "book.csv"
+    csv.write_text(
+        "Date,Code,Action,Quantity,Price,Fee\n"
+        "2024-01-02,CASH,deposit,0,5000,0\n"
+        "2024-01-02,VOO,buy,10,100,0\n"
+        "2024-06-03,CASH,withdraw,0,200,0\n",
+        encoding="utf-8",
+    )
+    dates = pd.bdate_range("2024-01-02", periods=400)
+    asked: list[str] = []
+
+    def fake_series(tickers, *a, **k):  # type: ignore[no-untyped-def]
+        asked.extend(tickers)
+        rows = {
+            tk: pd.Series([100.0 + i * 0.05 for i in range(400)], index=dates, dtype=float)
+            for tk in tickers
+        }
+        prov = {tk: ("cache", datetime.now(timezone.utc)) for tk in tickers}
+        return SeriesResult(rows=rows, missing=[], provenance=prov)
+
+    monkeypatch.setattr("app.cli.fetch_series", fake_series)
+    with caplog.at_level(logging.INFO):
+        rc = main(["--csv", str(csv)])
+    capsys.readouterr()
+    assert rc == 0
+    assert "CASH" not in asked              # pseudo-ticker excluded from the fetch set
+    run = _run_summary(caplog)
+    assert run["status"] == "ok"            # not falsely "partial"
+    assert run["n_series_missing"] == 0
 
 
 def test_split_handled_by_adjustment_keeps_ticker_in_twr(

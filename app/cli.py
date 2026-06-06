@@ -16,7 +16,7 @@ from dotenv import load_dotenv
 from app.corporate_actions import adjust_for_splits
 from app.derive import DerivedState, derive
 from app.email import send_report
-from app.events import Event, load_events
+from app.events import CASH_TICKER, Event, load_events
 from app.log_config import setup_logging
 from app.prices import PriceRow, PricesResult, fetch_latest, fetch_series, fetch_splits
 from app.report import (
@@ -29,12 +29,14 @@ from app.report import (
 from app.returns import (
     ReturnsSummary,
     build_daily_returns,
+    pnl_curve,
     price_basis_mismatches,
     summarize,
     true_twr_annualized,
     twr_index,
+    value_curve,
 )
-from app.risk import RiskSummary, summarize_risk
+from app.risk import DollarDrawdown, RiskSummary, dollar_drawdown, summarize_risk
 from app.backtest import BacktestResult, backtest_compare
 from app.strategy import VALID_MODES, Suggestion, load_target, may_suggest, suggest
 
@@ -230,10 +232,11 @@ def main(argv: list[str] | None = None) -> int:
     risk: RiskSummary | None = None
     missing: list[str] = []
     twr_excluded: list[str] = []
+    dollar_dd: DollarDrawdown | None = None
 
     if not args.no_prices and state.held():
-        prices, returns, risk, missing, twr_excluded = _compute_prices_returns_risk(
-            events, state, args, run
+        prices, returns, risk, missing, twr_excluded, dollar_dd = (
+            _compute_prices_returns_risk(events, state, args, run)
         )
 
     if args.dump_target:
@@ -251,6 +254,7 @@ def main(argv: list[str] | None = None) -> int:
         state, prices=prices, returns=returns, risk=risk,
         suggestions=suggestions, backtest=backtest, missing_tickers=missing,
         asof=today, generated_at=datetime.now(timezone.utc), twr_excluded=twr_excluded,
+        dollar_dd=dollar_dd,
     )
 
     sys.stdout.write(render_text(data) + "\n")
@@ -309,6 +313,7 @@ def _compute_prices_returns_risk(
     RiskSummary | None,
     list[str],
     list[str],
+    DollarDrawdown | None,
 ]:
     """Fetch prices, derive returns + risk. Single price source per mode.
 
@@ -325,10 +330,14 @@ def _compute_prices_returns_risk(
     risk: RiskSummary | None = None
     true_twr: float | None = None
     twr_excluded: list[str] = []
+    dollar_dd: DollarDrawdown | None = None
 
     series = None
     if not args.no_risk and events:
-        traded = sorted({ev.ticker for ev in events})
+        # Real securities only — the CASH pseudo-ticker (deposit/withdraw legs) has
+        # no price history; fetching it would land in series.missing and falsely
+        # flip the run status to "partial" on every book that holds cash flows.
+        traded = sorted({ev.ticker for ev in events} - {CASH_TICKER})
         start = min(ev.date for ev in events) - timedelta(days=5)
         series = fetch_series(traded, start, today, cache_dir=args.cache_dir, online=online)
         run["n_series_fetched"] = len(series.rows)
@@ -355,9 +364,15 @@ def _compute_prices_returns_risk(
                 twr_series = {
                     tk: s for tk, s in series.rows.items() if tk not in twr_excluded
                 }
-            daily = build_daily_returns(events, twr_series, asof_date=today)
+            # Build the holdings value curve once; both the TWR series and the
+            # dollar P&L curve share it (same priced universe, no double work).
+            value = value_curve(events, twr_series, today)
+            daily = build_daily_returns(events, twr_series, asof_date=today, value=value)
             true_twr = true_twr_annualized(daily)
             risk = summarize_risk(daily, twr_index(daily))
+            # 'Gains given back' — the flow-neutral dollar P&L drawdown over the
+            # same priced universe (deposits/withdrawals/trades cancel).
+            dollar_dd = dollar_drawdown(pnl_curve(events, twr_series, today, value=value))
 
     if series is not None and series.rows:
         # Derive each held ticker's latest price from its series tail, carrying the
@@ -399,11 +414,18 @@ def _compute_prices_returns_risk(
     run["n_prices_missing"] = len(missing)
     if missing and run["status"] == "ok":
         run["status"] = "partial"
+    if missing or twr_excluded:
+        # Incomplete P&L curve → suppress the felt-dollar drawdown (as we do MWR /
+        # Modified Dietz). Either a held ticker is unpriced (`missing`), or a split-
+        # mismatched ticker was dropped from the curve (`twr_excluded`); in both
+        # cases "Gains given back" would silently omit a holding, so print n/a
+        # rather than a confident number missing part of the book.
+        dollar_dd = None
     mkt_value = sum(priced_held.values())
     returns = summarize(
         events, mkt_value, asof_date=today, true_twr=true_twr, fully_priced=not missing
     )
-    return prices, returns, risk, missing, twr_excluded
+    return prices, returns, risk, missing, twr_excluded, dollar_dd
 
 
 def _held_market_value(

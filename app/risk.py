@@ -24,7 +24,7 @@ import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 import empyrical
 import numpy as np
@@ -59,6 +59,26 @@ class DrawdownInfo:
 
 
 @dataclass(frozen=True)
+class DollarDrawdown:
+    """The 'gains given back' drawdown: the largest dollar decline in cumulative
+    market P&L (`returns.pnl_curve`) — how many dollars of profit you watched
+    evaporate from a peak.
+
+    Flow-neutral: deposits, withdrawals, and trades all cancel in P&L, so funding
+    and broker transfers don't distort it (the raw value/account-value curves dip
+    on sells and transfers respectively, fabricating drawdowns). Realized-path
+    figure, no bootstrap CI."""
+
+    giveback_dollars: float   # negative: trough_pnl − peak_pnl
+    peak_pnl: float           # cumulative market P&L at the peak
+    trough_pnl: float         # cumulative market P&L at the trough
+    peak_date: date
+    trough_date: date
+    recovery_date: date | None
+    duration_days: int
+
+
+@dataclass(frozen=True)
 class RiskSummary:
     n_days: int
     drawdown: DrawdownInfo
@@ -83,33 +103,66 @@ def _drawdown_curve(index: "pd.Series[float]") -> "pd.Series[float]":
     return index / running_peak - 1.0
 
 
+def _drawdown_walk(
+    level: "pd.Series[float]", drop: "pd.Series[float]"
+) -> "tuple[Any, Any, Any | None, int]":
+    """Peak / trough / recovery index labels + duration (days) of the deepest
+    drawdown.
+
+    `drop` (≤ 0) defines the trough via its idxmin — fractional for the growth
+    index, dollars for the P&L curve; `level` defines the peak (its running max up
+    to the trough) and the recovery threshold. Labels are returned RAW (the index
+    may be ints in tests), so callers wrap `pd.Timestamp` for `.date()`. Shared by
+    max_drawdown + dollar_drawdown so the recovery / duration walk lives once.
+    """
+    trough_ts = drop.idxmin()
+    peak_ts = level.loc[:trough_ts].idxmax()
+    peak_level = float(level.loc[peak_ts])
+    post = level.loc[trough_ts:]
+    recovered = post[post >= peak_level]
+    recovery_ts = recovered.index[0] if len(recovered) > 0 else None
+    end_ts = recovery_ts if recovery_ts is not None else level.index[-1]
+    duration_days = int((pd.Timestamp(end_ts) - pd.Timestamp(peak_ts)).days)
+    return peak_ts, trough_ts, recovery_ts, duration_days
+
+
 def max_drawdown(index: "pd.Series[float]") -> DrawdownInfo:
     """Largest peak-to-trough decline of the index, with dates + recovery."""
     dd = _drawdown_curve(index)
-    trough_ts = dd.idxmin()
-    depth = float(dd.loc[trough_ts])
-    # Peak = the date the running max was set at/just before the trough.
-    pre_trough = index.loc[:trough_ts]
-    peak_ts = pre_trough.idxmax()
-    peak_value = float(index.loc[peak_ts])
-
-    # Recovery = first day after the trough reaching the prior peak again.
-    post = index.loc[trough_ts:]
-    recovered = post[post >= peak_value]
-    recovery_ts = recovered.index[0] if len(recovered) > 0 else None
-
-    last_ts = index.index[-1]
-    end_ts = recovery_ts if recovery_ts is not None else last_ts
-    duration_days = int((pd.Timestamp(end_ts) - pd.Timestamp(peak_ts)).days)
-    time_underwater = float((dd < 0).mean())
-
+    peak_ts, trough_ts, recovery_ts, duration_days = _drawdown_walk(index, dd)
     return DrawdownInfo(
-        depth=depth,
+        depth=float(dd.loc[trough_ts]),
         peak_date=pd.Timestamp(peak_ts).date(),
         trough_date=pd.Timestamp(trough_ts).date(),
         recovery_date=pd.Timestamp(recovery_ts).date() if recovery_ts is not None else None,
         duration_days=duration_days,
-        time_underwater_pct=time_underwater,
+        time_underwater_pct=float((dd < 0).mean()),
+    )
+
+
+def dollar_drawdown(pnl_curve: "pd.Series[float]") -> DollarDrawdown | None:
+    """Largest dollar decline in cumulative market P&L — 'gains given back'.
+
+    Operates on `returns.pnl_curve` (flow-neutral), so it's the felt dollar loss
+    undistorted by funding or broker transfers. Returns None for < 2 points, or
+    when the curve never declines from a peak (nothing given back).
+    """
+    if len(pnl_curve) < 2:
+        return None
+    drop = pnl_curve - pnl_curve.cummax()  # dollars below the prior P&L peak (≤ 0)
+    if float(drop.min()) >= -1e-9:
+        return None  # monotonic / no decline → nothing given back (no degenerate line)
+    peak_ts, trough_ts, recovery_ts, duration_days = _drawdown_walk(pnl_curve, drop)
+    peak_pnl = float(pnl_curve.loc[peak_ts])
+    trough_pnl = float(pnl_curve.loc[trough_ts])
+    return DollarDrawdown(
+        giveback_dollars=trough_pnl - peak_pnl,
+        peak_pnl=peak_pnl,
+        trough_pnl=trough_pnl,
+        peak_date=pd.Timestamp(peak_ts).date(),
+        trough_date=pd.Timestamp(trough_ts).date(),
+        recovery_date=pd.Timestamp(recovery_ts).date() if recovery_ts is not None else None,
+        duration_days=duration_days,
     )
 
 

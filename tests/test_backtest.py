@@ -161,6 +161,10 @@ def test_prop_compare_legs_are_finite_and_well_formed(
     assert res.start <= res.end
     for leg in res.legs:
         assert math.isfinite(leg.final_value) and leg.final_value > 0
-        # max drawdown is a loss (≤ 0) with an ordered bootstrap band.
+        # max drawdown ≤ 0 with an ordered bootstrap band. The point estimate may
+        # fall OUTSIDE the band: resampling tends to break up the worst consecutive
+        # run, so the realized maxDD is often deeper than the resampled 95% — honest,
+        # not a bug. So assert the band is ordered + non-positive, not point-within.
         dd = leg.risk.max_drawdown_ci
-        assert dd.low <= dd.point <= dd.high <= 1e-9
+        assert dd.low <= dd.high <= 1e-9
+        assert dd.point <= 1e-9

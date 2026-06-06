@@ -9,6 +9,8 @@ Validation strategy (no hand calculation):
 
 from __future__ import annotations
 
+from datetime import date
+
 import empyrical
 import numpy as np
 import pandas as pd
@@ -21,6 +23,7 @@ from app.risk import (
     bootstrap_ci,
     calmar,
     cdar,
+    dollar_drawdown,
     max_drawdown,
     sharpe,
     sortino,
@@ -224,3 +227,41 @@ def test_summarize_risk_bands_ulcer_and_cdar() -> None:
     assert isinstance(s.ulcer_index, MetricCI) and isinstance(s.cdar, MetricCI)
     assert s.ulcer_index.low <= s.ulcer_index.point <= s.ulcer_index.high
     assert s.cdar.low <= s.cdar.point <= s.cdar.high
+
+
+# ── dollar drawdown: 'gains given back' (flow-neutral P&L) — slice 8 ─────────
+
+
+def test_dollar_drawdown_gains_given_back() -> None:
+    # Cumulative P&L over 5 days; the largest decline is 500 → 200 (gave back $300).
+    pnl = _index([0.0, 500.0, 200.0, 400.0, 700.0])
+    dd = dollar_drawdown(pnl)
+    assert dd is not None
+    assert dd.peak_pnl == pytest.approx(500.0)
+    assert dd.trough_pnl == pytest.approx(200.0)
+    assert dd.giveback_dollars == pytest.approx(-300.0)
+    assert dd.peak_date == date(2024, 1, 2)
+    assert dd.trough_date == date(2024, 1, 3)
+    assert dd.recovery_date == date(2024, 1, 5)  # first day P&L ≥ 500 again
+
+
+def test_dollar_drawdown_handles_negative_pnl() -> None:
+    # P&L can go negative (underwater); giveback is still peak − trough in dollars.
+    pnl = _index([100.0, -50.0, -200.0, 0.0])
+    dd = dollar_drawdown(pnl)
+    assert dd is not None
+    assert dd.peak_pnl == pytest.approx(100.0)
+    assert dd.trough_pnl == pytest.approx(-200.0)
+    assert dd.giveback_dollars == pytest.approx(-300.0)
+    assert dd.recovery_date is None  # never back to +100
+
+
+def test_dollar_drawdown_none_when_too_short() -> None:
+    assert dollar_drawdown(_index([0.0])) is None
+    assert dollar_drawdown(pd.Series(dtype=float)) is None
+
+
+def test_dollar_drawdown_none_when_no_decline() -> None:
+    # Monotonically rising P&L → nothing given back → None (no degenerate
+    # "$0, peak == trough == first day" line).
+    assert dollar_drawdown(_index([0.0, 100.0, 250.0, 400.0])) is None

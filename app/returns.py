@@ -203,7 +203,13 @@ def summarize(
     """
     if not events:
         return ReturnsSummary(asof_date, asof_date, 0.0, 0.0, true_twr_annualized=true_twr)
-    period_start = min(ev.date for ev in events)
+    # Period starts at the first *investment* event, not a funding deposit that may
+    # precede the first buy — an idle cash gap would lengthen the annualization
+    # window with no offsetting flow and dilute the money-weighted figures. (This
+    # matches the cash-flow window Modified Dietz / MWR are actually computed over,
+    # since deposits/withdrawals are not cash flows there.)
+    invested = [ev.date for ev in events if ev.action not in ("deposit", "withdraw")]
+    period_start = min(invested) if invested else min(ev.date for ev in events)
     if not fully_priced:
         return ReturnsSummary(period_start, asof_date, None, None, true_twr_annualized=true_twr)
     cfs = cash_flows_from_events(events)
@@ -220,34 +226,37 @@ def summarize(
     )
 
 
-def build_daily_returns(
+def _snap_to_index(d: date, idx: "pd.DatetimeIndex") -> "pd.Timestamp":
+    """Map an event date onto the trading day its cash should land on: the first
+    index day on/after the date, clamped to the last day so cash is never dropped.
+
+    A date before idx[0] (e.g. income predating the first priced day) snaps to
+    idx[0] — on a cumulative curve a constant offset doesn't move drawdowns, and it
+    beats silently discarding the cash. Shared by build_daily_returns + pnl_curve.
+    """
+    ts = pd.Timestamp(d)
+    if ts in idx:
+        return ts
+    later = idx[idx >= ts]
+    return later[0] if len(later) > 0 else idx[-1]
+
+
+def value_curve(
     events: list[Event],
     series_by_ticker: dict[str, "pd.Series[float]"],
     asof_date: date,
 ) -> "pd.Series[float]":
-    """Reconstruct the daily time-weighted return series from the log + prices.
+    """Daily portfolio market value Σ shares(d)×price(d) over the priced master
+    index — contributions included (that day's buys are in shares(d)).
 
-    Time-weighted: external cash flows (buys/sells) are neutralized so the
-    series reflects investment performance, not contribution timing. Dividend
-    and interest income is added back as return the holdings earned.
-
-    Daily return on day d (for days where the prior value exceeds dust):
-        gain(d) = V(d) - V(d-1) - buy_cost(d) + sell_proceeds(d) + income(d)
-        r(d)    = gain(d) / V(d-1)
-
-    where V(d) is the market value of replayed holdings at that day's close.
-    Returns an empty Series if there is no priced history.
-
-    Only events for tickers present in `series_by_ticker` are used: a ticker
-    with no price history contributes neither value NOR cash flow, so the TWR
-    is computed consistently over the *priced* sub-portfolio. (A ticker whose
-    buy cost was counted but whose value was absent would corrupt the curve.)
+    The shared basis for the time-weighted return series AND the felt dollar
+    drawdown; the cli builds it once and passes it to both. Only tickers present in
+    `series_by_ticker` contribute (a ticker priced-but-absent, or absent-but-traded,
+    would corrupt the curve), so the value is over the *priced* sub-portfolio. Empty
+    Series if no priced history.
     """
     if not events or not series_by_ticker:
         return pd.Series(dtype=float)
-
-    # Drop events whose ticker has no price series (keeps cash flows and market
-    # value over the same ticker set — see docstring).
     events = [ev for ev in events if ev.ticker in series_by_ticker]
     if not events:
         return pd.Series(dtype=float)
@@ -262,9 +271,7 @@ def build_daily_returns(
     if len(idx) == 0:
         return pd.Series(dtype=float)
 
-    # Per-ticker: cumulative shares timeline + price, aligned to the master index.
-    shares_by_day: dict[str, pd.Series[float]] = {}
-    price_by_day: dict[str, pd.Series[float]] = {}
+    value = pd.Series(0.0, index=idx)
     for tk, series in series_by_ticker.items():
         deltas: dict[pd.Timestamp, float] = defaultdict(float)
         for ev in events:
@@ -274,28 +281,98 @@ def build_daily_returns(
                 deltas[pd.Timestamp(ev.date)] += ev.quantity
             elif ev.action == "sell":
                 deltas[pd.Timestamp(ev.date)] -= ev.quantity
-        step = pd.Series(deltas, dtype=float).sort_index().cumsum()
-        shares_by_day[tk] = step.reindex(idx, method="ffill").fillna(0.0)
-        price_by_day[tk] = series.reindex(idx, method="ffill")
+        if deltas:
+            shares = pd.Series(deltas, dtype=float).sort_index().cumsum().reindex(idx, method="ffill").fillna(0.0)
+        else:
+            shares = pd.Series(0.0, index=idx)  # priced but never bought/sold → 0 shares
+        value = value.add(shares * series.reindex(idx, method="ffill"), fill_value=0.0)
+    return value
 
-    # Market value per day = sum_ticker shares(d) * price(d).
-    value = pd.Series(0.0, index=idx)
-    for tk in series_by_ticker:
-        value = value.add(shares_by_day[tk] * price_by_day[tk], fill_value=0.0)
+
+def _cash_delta(ev: Event) -> float:
+    """Signed USD effect of one event on the cash balance."""
+    if ev.action == "deposit":
+        return ev.cash
+    if ev.action == "withdraw":
+        return -ev.cash
+    if ev.action == "buy":
+        return -(ev.quantity * ev.price + ev.fee)
+    if ev.action == "sell":
+        return ev.quantity * ev.price - ev.fee
+    if ev.action in ("dividend", "interest"):
+        return ev.cash - ev.fee
+    if ev.action == "fee":
+        return -ev.fee
+    return 0.0
+
+
+def pnl_curve(
+    events: list[Event],
+    series_by_ticker: dict[str, "pd.Series[float]"],
+    asof_date: date,
+    *,
+    value: "pd.Series[float] | None" = None,
+) -> "pd.Series[float]":
+    """Daily cumulative market P&L in dollars = holdings value + cumulative
+    investment cash flows (sells − buys + income − fees), with **external** flows
+    (deposits/withdrawals) excluded.
+
+    This is flow-neutral: funding and broker transfers cancel out (they move both
+    the balance and the cost base equally), so a drawdown of this curve is the
+    real 'dollars of profit given back' — undistorted by trades OR transfers, the
+    confounds that wreck the raw value / account-value curves. Computed over the
+    same priced-securities universe as the time-weighted return (`build_daily_
+    returns`): only tickers with a price series count, so CASH-tickered income
+    (broker interest on idle cash) is excluded here exactly as it is from TWR —
+    it's a cash earning, not a market gain, and still shows in Net P&L / MWR.
+    Empty if no priced history.
+    """
+    holdings = value_curve(events, series_by_ticker, asof_date) if value is None else value
+    if holdings.empty:
+        return pd.Series(dtype=float)
+    idx = holdings.index
+    flows = pd.Series(0.0, index=idx)
+    for ev in events:
+        if ev.action in ("deposit", "withdraw"):
+            continue  # external cash flow → cancels in P&L (raises balance AND cost base)
+        if ev.ticker not in series_by_ticker:
+            continue  # priced securities only (matches value_curve / TWR; drops CASH)
+        flows[_snap_to_index(ev.date, idx)] += _cash_delta(ev)
+    return holdings.add(flows.cumsum(), fill_value=0.0)
+
+
+def build_daily_returns(
+    events: list[Event],
+    series_by_ticker: dict[str, "pd.Series[float]"],
+    asof_date: date,
+    *,
+    value: "pd.Series[float] | None" = None,
+) -> "pd.Series[float]":
+    """Reconstruct the daily time-weighted return series from the log + prices.
+
+    Time-weighted: external cash flows (buys/sells) are neutralized so the series
+    reflects investment performance, not contribution timing. Dividend/interest
+    income is added back as return the holdings earned.
+
+        gain(d) = V(d) - V(d-1) - buy_cost(d) + sell_proceeds(d) + income(d)
+        r(d)    = gain(d) / V(d-1)        (only where V(d-1) > dust)
+
+    V(d) is `value_curve` (the priced sub-portfolio's market value); the cli passes
+    it in precomputed (shared with the dollar drawdown). Empty Series if there is no
+    priced history.
+    """
+    value = value_curve(events, series_by_ticker, asof_date) if value is None else value
+    if value.empty:
+        return pd.Series(dtype=float)
+    idx = value.index
+    priced = [ev for ev in events if ev.ticker in series_by_ticker]
 
     # Per-day external flows + income, keyed to the master index.
     buy_cost = pd.Series(0.0, index=idx)
     sell_proceeds = pd.Series(0.0, index=idx)
     income = pd.Series(0.0, index=idx)
-    for ev in events:
-        d = pd.Timestamp(ev.date)
-        if d not in idx:
-            # Snap an off-calendar event date to the next trading day; if the
-            # event falls after the last trading day (e.g. a Saturday asof with
-            # a Saturday-dated dividend), clamp to the last day so its cash is
-            # not silently dropped.
-            later = idx[idx >= d]
-            d = later[0] if len(later) > 0 else idx[-1]
+    for ev in priced:
+        d = _snap_to_index(ev.date, idx)
         if ev.action == "buy":
             buy_cost[d] += ev.quantity * ev.price + ev.fee
         elif ev.action == "sell":
@@ -308,8 +385,7 @@ def build_daily_returns(
     prev_value = value.shift(1)
     gain = value - prev_value - buy_cost + sell_proceeds + income
     daily = gain / prev_value
-    # Only keep days where the prior value was a real position.
-    daily = daily[prev_value > _VALUE_DUST]
+    daily = daily[prev_value > _VALUE_DUST]  # only where prior value was a real position
     return daily.dropna()
 
 

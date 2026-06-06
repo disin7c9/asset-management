@@ -21,7 +21,7 @@ from app.report import (
     render_text,
 )
 from app.returns import ReturnsSummary
-from app.risk import DrawdownInfo, MetricCI, RiskSummary
+from app.risk import DollarDrawdown, DrawdownInfo, MetricCI, RiskSummary
 from app.strategy import Suggestion
 
 
@@ -105,6 +105,23 @@ def test_text_render_has_headers_and_numbers(state, prices, returns, risk) -> No
     assert "Time-weighted (true TWR):                +19.37%" in out
     # Net P&L = unrealized + realized (fees already netted; not subtracted again)
     assert "Net P&L (unrealized + realized):" in out
+
+
+def test_dollar_drawdown_line_rendered(state, prices, returns, risk) -> None:
+    ddl = DollarDrawdown(
+        giveback_dollars=-1293.0, peak_pnl=2174.0, trough_pnl=881.0,
+        peak_date=date(2026, 1, 23), trough_date=date(2026, 3, 30),
+        recovery_date=date(2026, 5, 1), duration_days=98,
+    )
+    out = render_text(build_report_data(state, prices, returns, risk, dollar_dd=ddl))
+    assert "Gains given back: -$1,293" in out
+    assert "peak profit $2,174 (2026-01-23) → $881 (2026-03-30)" in out
+    assert "flow-neutral" in out
+
+
+def test_dollar_drawdown_absent_when_none(state, prices, returns, risk) -> None:
+    out = render_text(build_report_data(state, prices, returns, risk))  # dollar_dd defaults None
+    assert "Account $ drawdown" not in out
 
 
 def test_markdown_has_headings_and_fences(state, prices, returns, risk) -> None:

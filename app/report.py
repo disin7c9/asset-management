@@ -29,7 +29,7 @@ from app.backtest import BacktestResult
 from app.derive import DerivedState
 from app.prices import PriceRow
 from app.returns import ReturnsSummary
-from app.risk import NOISY_THRESHOLD_DAYS, DrawdownInfo, MetricCI, RiskSummary
+from app.risk import NOISY_THRESHOLD_DAYS, DollarDrawdown, DrawdownInfo, MetricCI, RiskSummary
 from app.strategy import Suggestion
 
 _NA = "n/a"
@@ -65,6 +65,11 @@ class ReportData:
 
 def _pct_or_na(x: float | None) -> str:
     return _NA if x is None or not math.isfinite(x) else f"{x * 100:+.2f}%"
+
+
+def _usd(x: float) -> str:
+    """Dollar amount with sign, no cents: `$1,234` or `-$1,234`."""
+    return f"-${abs(x):,.0f}" if x < 0 else f"${x:,.0f}"
 
 
 def _ci(ci: MetricCI, *, scale: float, suffix: str) -> str:
@@ -116,6 +121,7 @@ def build_report_data(
     asof: date | None = None,
     generated_at: datetime | None = None,
     twr_excluded: list[str] | None = None,
+    dollar_dd: DollarDrawdown | None = None,
 ) -> ReportData:
     """Assemble the deterministic brief as ordered sections.
 
@@ -138,7 +144,7 @@ def build_report_data(
     if suggestions:
         sections.append(_section_suggestions(suggestions))
     if risk is not None:
-        sections.append(_section_drawdown(risk))
+        sections.append(_section_drawdown(risk, dollar_dd))
         sections.append(_section_risk_adjusted(risk))
     if returns is not None and returns.period_days > 0:
         sections.append(_section_returns(returns, twr_excluded))
@@ -203,7 +209,9 @@ def _section_suggestions(suggestions: list[Suggestion]) -> Section:
     return Section(f"SUGGESTED ACTIONS ({label})", tuple(lines))
 
 
-def _section_drawdown(risk: RiskSummary) -> Section:
+def _section_drawdown(
+    risk: RiskSummary, dollar_dd: DollarDrawdown | None = None
+) -> Section:
     dd: DrawdownInfo = risk.drawdown
     rec = dd.recovery_date.isoformat() if dd.recovery_date else "not yet recovered"
     lines = [
@@ -214,8 +222,22 @@ def _section_drawdown(risk: RiskSummary) -> Section:
         f"CDaR (worst 5%):   {_mag_ci(risk.cdar)}",
         f"You've spent {dd.time_underwater_pct * 100:.0f}% of this period "
         "below a previous high.",
-        *_noisy_note(risk),
     ]
+    if dollar_dd is not None:
+        d_rec = (
+            dollar_dd.recovery_date.isoformat()
+            if dollar_dd.recovery_date else "not yet recovered"
+        )
+        lines.append(
+            f"Gains given back: {_usd(dollar_dd.giveback_dollars)}  — peak profit "
+            f"{_usd(dollar_dd.peak_pnl)} ({dollar_dd.peak_date}) → "
+            f"{_usd(dollar_dd.trough_pnl)} ({dollar_dd.trough_date}) → {d_rec}"
+        )
+        lines.append(
+            "  (dollars of profit given back from a peak; flow-neutral — funding & "
+            "transfers don't distort it)"
+        )
+    lines.extend(_noisy_note(risk))
     return Section("DRAWDOWN (investment, time-weighted)", tuple(lines))
 
 

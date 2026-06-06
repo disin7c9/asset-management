@@ -17,18 +17,31 @@ from datetime import date
 from pathlib import Path
 from typing import Literal, get_args
 
-Action = Literal["buy", "sell", "dividend", "fee", "interest"]
+Action = Literal["buy", "sell", "dividend", "fee", "interest", "deposit", "withdraw"]
 VALID_ACTIONS: frozenset[str] = frozenset(get_args(Action))
 
-# Same-day order: buys first, dividends/fees/interest next, sells last.
-# Prevents a same-day SELL-before-BUY in the CSV from triggering a spurious
-# "no shares held" error when the day's net activity is valid.
+# Actions whose cash amount rides in the CSV's Price column (no per-share price):
+# income (dividend/interest) and external cash flows (deposit/withdraw).
+_CASH_IN_PRICE: frozenset[str] = frozenset(
+    {"dividend", "interest", "deposit", "withdraw"}
+)
+
+# Pseudo-ticker that carries external cash flows (deposit/withdraw). It is never a
+# real security, so it is excluded from price fetches and the priced-value curves.
+CASH_TICKER = "CASH"
+
+# Same-day order: fund (deposit) + buys first, income/fees next, sells, then
+# withdrawals. Prevents a same-day SELL-before-BUY in the CSV from triggering a
+# spurious "no shares held" error when the day's net activity is valid. (Cash
+# flows carry no position, so their order only affects readability.)
 _ACTION_ORDER: dict[str, int] = {
+    "deposit": 0,
     "buy": 0,
     "dividend": 1,
     "fee": 1,
     "interest": 1,
     "sell": 2,
+    "withdraw": 3,
 }
 
 REQUIRED_COLUMNS: frozenset[str] = frozenset(
@@ -42,9 +55,10 @@ log = logging.getLogger(__name__)
 class Event:
     """One row of the transaction log.
 
-    `price` is per-share for trades; for dividends/interest the cash amount
-    lives in `cash` instead (the CSV's Price column is mapped there at load
-    time, so `price` stays semantically a per-share number).
+    `price` is per-share for trades; for dividend/interest/deposit/withdraw the
+    cash amount lives in `cash` instead (the CSV's Price column is mapped there
+    at load time, so `price` stays semantically a per-share number). `ticker` is
+    a `CASH` pseudo-symbol for deposit/withdraw (external cash flows).
     """
 
     date: date
@@ -131,10 +145,11 @@ def load_events(path: Path) -> list[Event]:
             action = _parse_action(row["Action"])
             price = _to_float(row.get("Price"))
             quantity = _to_float(row.get("Quantity"))
-            # For dividend/interest rows the CSV's Price column carries cash,
-            # not per-share price. Move it to `cash` to keep the schema honest.
-            cash = price if action in ("dividend", "interest") else 0.0
-            if action in ("dividend", "interest"):
+            # For income (dividend/interest) and cash-flow (deposit/withdraw) rows
+            # the CSV's Price column carries cash, not per-share price. Move it to
+            # `cash` to keep the schema honest.
+            cash = price if action in _CASH_IN_PRICE else 0.0
+            if action in _CASH_IN_PRICE:
                 price = 0.0
 
             events.append(

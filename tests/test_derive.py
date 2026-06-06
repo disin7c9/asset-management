@@ -122,6 +122,22 @@ def test_dividend_fee_is_netted_into_realized() -> None:
     assert isclose(state.total_fees(), 3.0)
 
 
+def test_standalone_fee_event_nets_into_realized() -> None:
+    # A separate fee/tax row (e.g. foreign withholding exported as its own line)
+    # reduces realized P&L for that ticker, and is still counted in total_fees.
+    events = [
+        Event(date=date(2024, 1, 1), ticker="SCHP",
+              action="buy", quantity=10.0, price=27.0, fee=0.0),
+        Event(date=date(2024, 3, 1), ticker="SCHP",
+              action="dividend", quantity=0.0, price=0.0, cash=5.0, fee=0.0),
+        Event(date=date(2024, 3, 8), ticker="SCHP",
+              action="fee", quantity=0.0, price=0.0, fee=0.30),  # foreign withholding tax
+    ]
+    state = derive(events)
+    assert isclose(state.realized["SCHP"], 4.70)  # 5.0 dividend − 0.30 tax
+    assert isclose(state.total_fees(), 0.30)
+
+
 @given(
     dividends=st.lists(
         st.floats(min_value=0.0, max_value=1000, allow_nan=False, allow_infinity=False),

@@ -18,12 +18,17 @@ from app.returns import (
     cash_flows_from_events,
     modified_dietz_return,
     money_weighted_return,
+    pnl_curve,
     price_basis_mismatches,
     summarize,
     true_twr_annualized,
     twr_index,
+    value_curve,
 )
-from app.returns import _xirr_newton  # noqa: PLC2701 — exercised directly in regression tests
+from app.returns import (
+    _snap_to_index,  # noqa: PLC2701 — exercised directly in tests
+    _xirr_newton,  # noqa: PLC2701 — exercised directly in tests
+)
 
 
 def _price_series(values: list[float], start: str = "2024-01-01") -> "pd.Series[float]":
@@ -373,6 +378,72 @@ def test_cash_flows_net_dividend_fee() -> None:
     cfs = cash_flows_from_events(events)
     assert len(cfs) == 1
     assert cfs[0].amount == pytest.approx(47.0)  # 50 cash − 3 withholding
+
+
+def test_pnl_curve_is_market_gains_flow_neutral() -> None:
+    # Buy 10 @ $100 (cost 1000); price 100→110→120 → holdings 1000/1100/1200,
+    # cumulative flow −1000 → P&L 0/100/200. A same-day deposit must NOT change it
+    # (external flows cancel — that's the whole point).
+    events = [
+        Event(date(2024, 1, 1), "CASH", "deposit", quantity=0.0, price=0.0, cash=1000.0, fee=0.0),
+        Event(date(2024, 1, 1), "A", "buy", quantity=10.0, price=100.0, fee=0.0),
+    ]
+    series = {"A": _price_series([100.0, 110.0, 120.0], "2024-01-01")}
+    curve = pnl_curve(events, series, date(2024, 1, 3))
+    assert list(curve.round(2)) == [0.0, 100.0, 200.0]
+
+
+def test_pnl_curve_empty_without_priced_history() -> None:
+    events = [Event(date(2024, 1, 1), "A", "buy", quantity=1.0, price=100.0, fee=0.0)]
+    assert pnl_curve(events, {}, date(2024, 1, 3)).empty  # no series → empty
+
+
+def test_pnl_curve_excludes_cash_income() -> None:
+    # Broker interest on the CASH pseudo-ticker is a cash earning, not a market
+    # gain — it must NOT enter the P&L curve (consistent with TWR; it still counts
+    # in Net P&L / MWR). Adding it leaves the curve unchanged.
+    series = {"A": _price_series([100.0, 100.0, 100.0], "2024-01-01")}
+    base = [Event(date(2024, 1, 1), "A", "buy", quantity=10.0, price=100.0, fee=0.0)]
+    with_interest = base + [
+        Event(date(2024, 1, 2), "CASH", "interest", quantity=0.0, price=0.0, cash=5.0, fee=0.0)
+    ]
+    assert list(pnl_curve(base, series, date(2024, 1, 3))) == list(
+        pnl_curve(with_interest, series, date(2024, 1, 3))
+    )
+
+
+def test_snap_to_index_snaps_forward_and_clamps() -> None:
+    idx = pd.DatetimeIndex(["2024-01-03", "2024-01-05", "2024-01-10"])
+    assert _snap_to_index(date(2024, 1, 5), idx) == pd.Timestamp("2024-01-05")  # exact day
+    assert _snap_to_index(date(2024, 1, 4), idx) == pd.Timestamp("2024-01-05")  # → next day
+    assert _snap_to_index(date(2024, 1, 1), idx) == pd.Timestamp("2024-01-03")  # before → idx[0]
+    assert _snap_to_index(date(2024, 6, 1), idx) == pd.Timestamp("2024-01-10")  # after → clamp last
+
+
+def test_curves_accept_precomputed_value() -> None:
+    # The cli builds value_curve once and passes it to both consumers; the result
+    # must match recomputing internally (no behavior change, just no double work).
+    series = {"A": _price_series([100.0, 110.0, 120.0], "2024-01-01")}
+    events = [Event(date(2024, 1, 1), "A", "buy", quantity=10.0, price=100.0, fee=0.0)]
+    v = value_curve(events, series, date(2024, 1, 3))
+    assert list(pnl_curve(events, series, date(2024, 1, 3), value=v)) == list(
+        pnl_curve(events, series, date(2024, 1, 3))
+    )
+    assert list(build_daily_returns(events, series, asof_date=date(2024, 1, 3), value=v)) == list(
+        build_daily_returns(events, series, asof_date=date(2024, 1, 3))
+    )
+
+
+def test_summarize_period_starts_at_first_investment_not_deposit() -> None:
+    # A funding deposit precedes the first buy; the return period must start at the
+    # buy, else the idle gap lengthens the annualization window and dilutes the
+    # money-weighted figures (and the displayed period would be wrong).
+    events = [
+        Event(date(2024, 1, 1), "CASH", "deposit", quantity=0.0, price=0.0, cash=5000.0, fee=0.0),
+        Event(date(2024, 4, 1), "VOO", "buy", quantity=10.0, price=100.0, fee=0.0),
+    ]
+    summary = summarize(events, current_value=1100.0, asof_date=date(2025, 4, 1))
+    assert summary.period_start == date(2024, 4, 1)  # the buy, not the 2024-01-01 deposit
 
 
 def test_price_basis_mismatches_flags_split_not_normal_gap() -> None:

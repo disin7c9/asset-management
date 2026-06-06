@@ -65,7 +65,9 @@ Monday brief is just this on cron:
 0 8 * * 1  cd /path/to/asset-management && /path/to/uv run python -m app --send --save
 ```
 
-The CSV is expected to have columns: `Date, Code, DataSource, Currency, Price, Quantity, Action, Fee, Note`. `Action` is one of `buy`, `sell`, `dividend`, `fee`, `interest`. Empty cells in numeric columns are treated as zero. Non-ISO dates are rejected with a clear error. UTF-8 BOM is tolerated.
+The CSV is expected to have columns: `Date, Code, DataSource, Currency, Price, Quantity, Action, Fee, Note`. `Action` is one of `buy`, `sell`, `dividend`, `fee`, `interest`, `deposit`, `withdraw`. Cash flows (`deposit`/`withdraw`) use a `CASH` code and put the amount in the `Price` column. Empty cells in numeric columns are treated as zero. Non-ISO dates are rejected with a clear error. UTF-8 BOM is tolerated.
+
+The drawdown panel also reports **Gains given back** — the largest dollar decline in your cumulative market profit (the felt "how much did I watch evaporate"). It's flow-neutral: deposits, withdrawals, and trades cancel, so funding and broker transfers don't distort it (the raw account balance would dip on every transfer).
 
 Example output (drawdown leads, then risk-adjusted ratios, then returns, then holdings):
 

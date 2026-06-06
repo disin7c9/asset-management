@@ -66,6 +66,10 @@ def derive(events: list[Event]) -> DerivedState:
     state = DerivedState()
 
     for ev in events:
+        if ev.action in ("deposit", "withdraw"):
+            # External cash flows (CASH pseudo-ticker) carry no position and no
+            # realized P&L; they feed the cash balance / account-value curve only.
+            continue
         pos = state.positions.setdefault(ev.ticker, Position(ticker=ev.ticker))
         state.fees[ev.ticker] += ev.fee
 
@@ -103,8 +107,11 @@ def derive(events: list[Event]) -> DerivedState:
             state.realized[ev.ticker] += ev.cash - ev.fee
 
         elif ev.action == "fee":
-            # Tracked in state.fees only; no position change.
-            pass
+            # A standalone fee/tax row (e.g. foreign dividend withholding, exported
+            # as its own line) is a realized cost: net it into realized P&L for the
+            # ticker — consistent with how buy/sell/dividend-row fees reduce P&L.
+            # (Still added to total_fees above, informationally.)
+            state.realized[ev.ticker] -= ev.fee
 
     held_count = len(state.held())
     log.info(
