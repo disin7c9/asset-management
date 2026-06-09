@@ -27,6 +27,7 @@ uv run python -m app --cache-dir /some/dir   # override the default cache locati
 uv run python -m app --save                  # also write reports/<asof>.md (markdown)
 uv run python -m app --send                  # also email the brief as HTML via Resend
 uv run python -m app --dump-target target.csv                   # write current allocation to edit
+uv run python -m app --allocate inverse_vol --allocate-out t.csv  # PROPOSE a target (re-weight holdings)
 uv run python -m app --rebalance to_total --target target.csv   # suggestions toward a target
 uv run python -m app --rebalance cash_flow_only --target target.csv --new-cash 1000
 uv run python -m app --backtest --target target.csv             # rebalance vs buy-and-hold, historically
@@ -34,6 +35,17 @@ uv run python -m app --csv your.csv --rebalance bands --backtest --target target
 ```
 
 The report is **composable panels**, not exclusive modes — combine flags to stack panels (the last example prints both SUGGESTED ACTIONS *and* BACKTEST). Two things to note: `target.csv` is one you create with `--dump-target` (or use `data/sample_data/target.csv`); and **without `--csv` the bundled example portfolio is used** — if you combine that with `--rebalance`/`--backtest`/`--save`/`--send` the run warns, so you never silently mix example holdings with your real target. Always pass `--csv your.csv` for your own book.
+
+## Choose a target — the strategy engine
+
+`--allocate <rule>` builds a target allocation **over your current holdings** and prints it next to your present weights; add `--allocate-out path` to save it (a dedicated flag — `--dump-target` always means your current holdings). It re-weights what you already own (no new tickers — finding new ones is a later, AI-assisted step), so it's *discipline*, not prediction. Rules:
+
+- **`equal_weight`** — 1/N. The robust baseline (it beat optimization out-of-sample in our own studies).
+- **`inverse_vol`** — weight ∝ 1 ÷ volatility, so each holding contributes roughly the *same risk* rather than the same dollars (a calm bond and a wild theme ETF get balanced by how much they move). Cap any single weight with `--allocate-cap 0.30`.
+
+Deliberately **not** included: return-forecasting optimizers (mean-variance / max-Sharpe) — they overfit and lost to equal-weight out-of-sample in our tests, so they stay behind an *edge* gate for a later version.
+
+**Propose, simulate, and act are separate steps**, enforced: `--allocate` only *proposes* (and optionally writes the file), and it **may not be combined** with `--backtest`/`--rebalance` in one command. You review the file, then run `--backtest --target file` to simulate it, or `--rebalance <mode> --target file` to get orders — in a separate command. The strategy never silently becomes trades.
 
 ## Suggestions
 

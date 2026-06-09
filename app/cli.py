@@ -18,7 +18,14 @@ from app.derive import DerivedState, derive
 from app.email import send_report
 from app.events import CASH_TICKER, Event, load_events
 from app.log_config import setup_logging
-from app.prices import PriceRow, PricesResult, fetch_latest, fetch_series, fetch_splits
+from app.prices import (
+    PriceRow,
+    PricesResult,
+    SeriesResult,
+    fetch_latest,
+    fetch_series,
+    fetch_splits,
+)
 from app.report import (
     ReportData,
     build_report_data,
@@ -37,6 +44,7 @@ from app.returns import (
     value_curve,
 )
 from app.risk import DollarDrawdown, RiskSummary, dollar_drawdown, summarize_risk
+from app.allocate import VALID_RULES, allocation_kind, apply_caps, equal_weight, inverse_vol
 from app.backtest import BacktestResult, backtest_compare
 from app.strategy import VALID_MODES, Suggestion, load_target, may_suggest, suggest
 
@@ -151,6 +159,30 @@ def main(argv: list[str] | None = None) -> int:
         default="quarterly",
         help="rebalance schedule for the --backtest rebalanced leg (default: quarterly)",
     )
+    parser.add_argument(
+        "--allocate",
+        choices=sorted(VALID_RULES),
+        default=None,
+        help="propose a target allocation over your CURRENT holdings with this rule "
+        "(equal_weight | inverse_vol): prints the weights, and writes them to --allocate-out "
+        "if given. Propose-only — review the file, then run --backtest / --rebalance against it "
+        "in a SEPARATE command.",
+    )
+    parser.add_argument(
+        "--allocate-out",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="write the --allocate proposal to PATH as a target CSV (distinct from "
+        "--dump-target, which always writes your CURRENT holdings)",
+    )
+    parser.add_argument(
+        "--allocate-cap",
+        type=float,
+        default=None,
+        metavar="FRAC",
+        help="per-asset weight ceiling for --allocate (e.g. 0.30), excess redistributed",
+    )
     args = parser.parse_args(argv)
     if args.new_cash < 0:
         parser.error("--new-cash must be >= 0")
@@ -161,12 +193,26 @@ def main(argv: list[str] | None = None) -> int:
         )
     if args.backtest_start is not None and args.backtest_start > date.today():
         parser.error("--backtest-start must not be in the future")
+    if args.allocate_cap is not None and not 0.0 < args.allocate_cap <= 1.0:
+        # A fraction, not a percent: "30" (meaning 30%) would make the cap never bind
+        # (cap*n ≥ 1 always) and silently do nothing — reject it loudly instead.
+        parser.error("--allocate-cap must be a fraction in (0, 1] (e.g. 0.30 for 30%)")
+    if args.allocate and (args.rebalance or args.backtest):
+        # propose ≠ act/simulate: keep them separate so you never emit orders or a
+        # simulation against a target you haven't reviewed. Do it in two commands.
+        parser.error(
+            "--allocate is propose-only; run it first (optionally with --allocate-out FILE), "
+            "then --backtest / --rebalance --target FILE in a SEPARATE command"
+        )
+    if args.allocate_out is not None and not args.allocate:
+        parser.error("--allocate-out has no effect without --allocate")
     # Footgun guard: a real-intent flag with no --csv (args.csv is None) silently
     # uses the bundled example portfolio, so the HOLDINGS panel would show the
     # sample (not your data) next to your real target/backtest. Warn — keyed on
     # "was --csv supplied?", so an explicit sample path doesn't misfire.
     if args.csv is None and (
-        args.rebalance or args.backtest or args.save or args.send or args.dump_target
+        args.rebalance or args.backtest or args.save or args.send
+        or args.dump_target or args.allocate
     ):
         log.warning(
             "no --csv given: using the bundled EXAMPLE portfolio (%s) — the HOLDINGS "
@@ -191,6 +237,7 @@ def main(argv: list[str] | None = None) -> int:
         "email_detail": None,
         "rebalance": None,
         "backtest": None,
+        "allocate": None,
     }
 
     if not csv_path.exists():
@@ -233,14 +280,18 @@ def main(argv: list[str] | None = None) -> int:
     missing: list[str] = []
     twr_excluded: list[str] = []
     dollar_dd: DollarDrawdown | None = None
+    series: SeriesResult | None = None
 
     if not args.no_prices and state.held():
-        prices, returns, risk, missing, twr_excluded, dollar_dd = (
+        prices, returns, risk, missing, twr_excluded, dollar_dd, series = (
             _compute_prices_returns_risk(events, state, args, run)
         )
 
     if args.dump_target:
         _dump_target(state, prices, args.dump_target)
+    if args.allocate:
+        # Reuse the price history already fetched above (no second round-trip).
+        _compute_allocation(state, prices, series, args, run, today)
 
     suggestions: list[Suggestion] | None = None
     if args.rebalance:
@@ -314,6 +365,7 @@ def _compute_prices_returns_risk(
     list[str],
     list[str],
     DollarDrawdown | None,
+    SeriesResult | None,
 ]:
     """Fetch prices, derive returns + risk. Single price source per mode.
 
@@ -425,7 +477,7 @@ def _compute_prices_returns_risk(
     returns = summarize(
         events, mkt_value, asof_date=today, true_twr=true_twr, fully_priced=not missing
     )
-    return prices, returns, risk, missing, twr_excluded, dollar_dd
+    return prices, returns, risk, missing, twr_excluded, dollar_dd, series
 
 
 def _held_market_value(
@@ -533,6 +585,32 @@ def _compute_suggestions(
     return sugg
 
 
+def _write_target_csv(weights: dict[str, float], path: Path) -> bool:
+    """Write a ``{ticker: weight-fraction}`` map as a Ticker,Weight target CSV.
+
+    Weights serialize as percentages, deterministic order (weight desc, then
+    ticker). A *positive* weight never serializes as 0.00 — on reload a 0 means a
+    deliberate exit, so a no-edit round-trip would sell it; tiny weights widen
+    precision instead. Returns True on success; an unwritable path is logged and
+    returns False (the run survives — a failed sink is reported, not fatal).
+    """
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", newline="", encoding="utf-8") as fh:
+            writer = csv.writer(fh)
+            writer.writerow(["Ticker", "Weight"])
+            for tk, w in sorted(weights.items(), key=lambda kv: (-kv[1], kv[0])):
+                pct = w * 100
+                w_str = f"{pct:.2f}"
+                if float(w_str) == 0.0 and w > 0.0:
+                    w_str = f"{max(pct, 1e-6):.6f}"
+                writer.writerow([tk, w_str])
+    except OSError as exc:
+        log.error("could not write target to %s: %s", path, exc)
+        return False
+    return True
+
+
 def _dump_target(
     state: DerivedState,
     prices: dict[str, PriceRow] | None,
@@ -552,20 +630,8 @@ def _dump_target(
     if total <= 0:
         log.warning("--dump-target: no priced holdings to write")
         return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="", encoding="utf-8") as fh:
-        writer = csv.writer(fh)
-        writer.writerow(["Ticker", "Weight"])
-        # Deterministic order (value desc, then ticker). Critically, a held
-        # position must NEVER serialize as 0 — on reload a 0 means a deliberate
-        # exit, so a no-edit round-trip would sell it. Widen precision for tiny
-        # weights and floor to a strictly-positive value.
-        for tk, val in sorted(values.items(), key=lambda kv: (-kv[1], kv[0])):
-            pct = val / total * 100
-            w_str = f"{pct:.2f}"
-            if float(w_str) == 0.0:
-                w_str = f"{max(pct, 1e-6):.6f}"
-            writer.writerow([tk, w_str])
+    if not _write_target_csv({tk: v / total for tk, v in values.items()}, path):
+        return  # write failed (already logged) — non-fatal
     log.info(
         "wrote current allocation (%d tickers) to %s — edit toward your target",
         len(values), path,
@@ -573,6 +639,120 @@ def _dump_target(
     omitted = sorted(tk for tk in state.held() if tk not in values)
     if omitted:
         log.warning("--dump-target: skipped unpriced holdings: %s", ", ".join(omitted))
+
+
+def _print_proposed_allocation(
+    rule: str,
+    target: dict[str, float],
+    current_values: dict[str, float],
+    omitted: list[str],
+    wrote_to: Path | None,
+) -> None:
+    """Print the proposed allocation beside current weights (a review preview)."""
+    cur_total = sum(current_values.values())
+    lines = [f"=== PROPOSED ALLOCATION: {rule} ({len(target)} holdings) ==="]
+    for tk, w in sorted(target.items(), key=lambda kv: (-kv[1], kv[0])):
+        cur_w = (current_values.get(tk, 0.0) / cur_total) if cur_total > 0 else 0.0
+        lines.append(
+            f"  {tk:<6} {w * 100:6.2f}%   (current {cur_w * 100:5.2f}%, "
+            f"{(w - cur_w) * 100:+5.1f}pp)"
+        )
+    if omitted:
+        # A held ticker absent from a target reloads as 0 = sell. Surface it here (not
+        # just a stderr warning) so the user sees it before acting on the file.
+        lines.append(
+            "  NOT in target (unpriced / no usable history) — a to_total rebalance "
+            f"would SELL these: {', '.join(omitted)}"
+        )
+    if wrote_to is not None:
+        lines.append(f"  wrote -> {wrote_to}")
+    lines.append(
+        "  review these weights, then act separately: "
+        "--backtest --target <file>  or  --rebalance <mode> --target <file>"
+    )
+    sys.stdout.write("\n".join(lines) + "\n\n")
+
+
+def _compute_allocation(
+    state: DerivedState,
+    prices: dict[str, PriceRow] | None,
+    series: SeriesResult | None,
+    args: argparse.Namespace,
+    run: dict[str, Any],
+    today: date,
+) -> None:
+    """Propose a target allocation over the user's CURRENT holdings — a *discipline*
+    re-weighting, not new-ticker selection. Prints the weights for review and writes
+    them to --allocate-out if given. Backtesting / rebalancing against the result is a
+    SEPARATE command the user runs deliberately (propose ≠ simulate ≠ act).
+
+    `series` is the price history already fetched for the brief; inverse_vol reuses it
+    (no second round-trip) and only fetches when it's absent (the --no-risk path)."""
+    rule = args.allocate
+    if allocation_kind(rule) != "discipline":
+        # Dormant guard (every CLI choice is discipline); the chokepoint for any
+        # future edge allocator (e.g. an optimizer) — it must be validated first.
+        log.warning(
+            "%r is an edge allocator and must pass a walk-forward backtest before it "
+            "may produce a target (not implemented in v1)", rule,
+        )
+        run["allocate"] = f"refused: {rule} unvalidated edge"
+        return
+    if not prices:
+        log.warning("--allocate needs prices; remove --no-prices")
+        run["allocate"] = "skipped: --no-prices"
+        return
+    values = _held_market_value(state, prices)
+    priced = sorted(values)
+    if not priced:
+        log.warning("--allocate: no priced holdings to allocate over")
+        run["allocate"] = "skipped: no prices"
+        return
+
+    if rule == "equal_weight":
+        target = equal_weight(priced)
+    else:  # inverse_vol — needs return history to size each holding's volatility
+        src = series  # reuse the history already fetched for the brief (no refetch)
+        if src is None:  # --no-risk path: nothing fetched yet → fetch now AND record it
+            start = today - timedelta(days=400)  # ~13 months → a full year of returns
+            src = fetch_series(
+                priced, start, today, cache_dir=args.cache_dir, online=not args.offline
+            )
+            run["n_series_fetched"] += len(src.rows)
+            run["n_series_missing"] += len(src.missing)
+            run["fallbacks_used"] += src.fallbacks_used
+            if src.missing and run["status"] == "ok":
+                run["status"] = "partial"
+        rows = {
+            tk: s for tk in priced
+            if (s := src.rows.get(tk)) is not None and not s.empty
+        }
+        target = inverse_vol(rows)
+        dropped = [tk for tk in priced if tk not in rows]
+        if dropped:
+            log.warning("--allocate inverse_vol: no price history for %s", ", ".join(dropped))
+
+    if not target:
+        log.warning("--allocate: could not compute weights")
+        run["allocate"] = "skipped: no weights"
+        return
+    if args.allocate_cap is not None:
+        try:
+            target = apply_caps(target, args.allocate_cap)
+        except ValueError as exc:
+            log.error("--allocate-cap: %s", exc)
+            run["allocate"] = "skipped: bad cap"
+            return
+
+    omitted = sorted(set(state.held()) - set(target))  # held but unpriced / no history
+    wrote_to = args.allocate_out
+    if wrote_to is not None:
+        if _write_target_csv(target, wrote_to):
+            log.info("wrote %s target (%d tickers) to %s", rule, len(target), wrote_to)
+        else:
+            wrote_to = None  # write failed (error already logged) — still show the preview
+    _print_proposed_allocation(rule, target, values, omitted, wrote_to)
+    run["allocate"] = rule
 
 
 def _compute_backtest(

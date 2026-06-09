@@ -642,3 +642,169 @@ def test_split_handled_by_adjustment_keeps_ticker_in_twr(
     assert "split-adjusted share counts for: SPLT" in caplog.text  # the adjustment actually ran
     splt_line = next(line for line in out.splitlines() if line.startswith("SPLT"))
     assert "10.000" in splt_line                   # 1 raw share → 10 split-adjusted (not still 1)
+
+
+# ── --allocate (slice 9: the non-AI strategy engine) ────────────────────────
+
+
+def _flat_series(tickers, *_a, **_k):  # type: ignore[no-untyped-def]
+    import pandas as pd
+
+    dates = pd.bdate_range("2024-01-01", periods=300)
+    rows = {
+        tk: pd.Series([100.0 + i * 0.1 for i in range(300)], index=dates, dtype=float)
+        for tk in tickers
+    }
+    prov = {tk: ("cache", datetime.now(timezone.utc)) for tk in tickers}
+    return SeriesResult(rows=rows, missing=[], provenance=prov)
+
+
+def _split_vol_series(tickers, *_a, **_k):  # type: ignore[no-untyped-def]
+    import pandas as pd
+
+    dates = pd.bdate_range("2024-01-01", periods=300)
+    rows = {}
+    for tk in tickers:  # BND/IAU calm, the rest bumpy → different volatilities
+        step = 0.05 if tk in ("BND", "IAU") else 8.0
+        rows[tk] = pd.Series(
+            [100.0 + (i % 2) * step for i in range(300)], index=dates, dtype=float
+        )
+    return SeriesResult(rows=rows, missing=[], provenance={})
+
+
+def _weights_from(path: Path) -> dict[str, float]:
+    rows = [ln.split(",") for ln in path.read_text().splitlines()[1:]]  # skip header
+    return {tk: float(w) for tk, w in rows}
+
+
+def test_allocate_equal_weight_previews_and_dumps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr("app.cli.fetch_series", _flat_series)
+    out_csv = tmp_path / "t.csv"
+    with caplog.at_level(logging.INFO):
+        rc = main(["--allocate", "equal_weight", "--allocate-out", str(out_csv)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "PROPOSED ALLOCATION: equal_weight" in out
+    w = _weights_from(out_csv)
+    assert len(w) == 4 and all(abs(v - 25.0) < 0.01 for v in w.values())  # sample = 4 holdings
+    assert _run_summary(caplog)["allocate"] == "equal_weight"
+
+
+def test_allocate_inverse_vol_overweights_calm_assets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr("app.cli.fetch_series", _split_vol_series)
+    out_csv = tmp_path / "t.csv"
+    rc = main(["--allocate", "inverse_vol", "--allocate-out", str(out_csv)])
+    capsys.readouterr()
+    assert rc == 0
+    w = _weights_from(out_csv)
+    assert min(w["BND"], w["IAU"]) > max(w["VOO"], w["VEA"])  # lower vol → larger weight
+
+
+def test_allocate_cap_limits_concentration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr("app.cli.fetch_series", _split_vol_series)
+    out_csv = tmp_path / "t.csv"
+    rc = main(
+        ["--allocate", "inverse_vol", "--allocate-cap", "0.4", "--allocate-out", str(out_csv)]
+    )
+    capsys.readouterr()
+    assert rc == 0
+    assert max(_weights_from(out_csv).values()) <= 40.0 + 0.01  # capped at 40%
+
+
+def test_allocate_skips_without_prices(
+    caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str],
+) -> None:
+    with caplog.at_level(logging.INFO):
+        rc = main(["--allocate", "equal_weight", "--no-prices"])
+    capsys.readouterr()
+    assert rc == 0
+    assert _run_summary(caplog)["allocate"] == "skipped: --no-prices"
+
+
+def test_allocate_cap_out_of_range_rejected() -> None:
+    # A cap is a fraction in (0, 1]; "30" (meaning 30%) or 0 must be rejected loudly,
+    # not silently no-op.
+    with pytest.raises(SystemExit):
+        main(["--allocate", "inverse_vol", "--allocate-cap", "30"])
+    with pytest.raises(SystemExit):
+        main(["--allocate", "inverse_vol", "--allocate-cap", "0"])
+
+
+def test_allocate_surfaces_omitted_holding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    # A held ticker with no price history is absent from the target → on a to_total
+    # rebalance it would be sold. The preview must surface that before the user acts.
+    import pandas as pd
+
+    dates = pd.bdate_range("2024-01-01", periods=300)
+
+    def drop_voo(tickers, *_a, **_k):  # type: ignore[no-untyped-def]
+        rows = {
+            tk: pd.Series([100.0 + i * 0.1 for i in range(300)], index=dates, dtype=float)
+            for tk in tickers if tk != "VOO"
+        }
+        missing = ["VOO"] if "VOO" in tickers else []
+        return SeriesResult(rows=rows, missing=missing, provenance={})
+
+    monkeypatch.setattr("app.cli.fetch_series", drop_voo)
+    rc = main(["--allocate", "equal_weight", "--allocate-out", str(tmp_path / "t.csv")])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "would SELL these: VOO" in out
+    assert "VOO" not in _weights_from(tmp_path / "t.csv")  # correctly absent from the file
+
+
+def test_allocate_refuses_combination_with_act_or_simulate() -> None:
+    # propose != act/simulate: --allocate may not be combined with --rebalance/--backtest.
+    with pytest.raises(SystemExit):
+        main(["--allocate", "equal_weight", "--rebalance", "to_total", "--target", str(TARGET)])
+    with pytest.raises(SystemExit):
+        main(["--allocate", "equal_weight", "--backtest", "--target", str(TARGET)])
+
+
+def test_allocate_out_requires_allocate() -> None:
+    with pytest.raises(SystemExit):
+        main(["--allocate-out", "/tmp/x.csv"])  # no --allocate → rejected
+
+
+def test_allocate_inverse_vol_reuses_fetched_series(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    # inverse_vol must REUSE the history already fetched for the brief — one fetch, not two.
+    calls: list[list[str]] = []
+
+    def counting(tickers, *_a, **_k):  # type: ignore[no-untyped-def]
+        calls.append(sorted(tickers))
+        return _flat_series(tickers)
+
+    monkeypatch.setattr("app.cli.fetch_series", counting)
+    rc = main(["--allocate", "inverse_vol"])
+    capsys.readouterr()
+    assert rc == 0
+    assert len(calls) == 1, calls  # reused the first fetch, did not refetch
+
+
+def test_allocate_survives_unwritable_out_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str],
+) -> None:
+    # A bad --allocate-out path must be REPORTED, not crash the run: the preview still
+    # prints, the run is logged, exit 0 (a failed sink is non-fatal).
+    monkeypatch.setattr("app.cli.fetch_series", _flat_series)
+    a_file = tmp_path / "afile"
+    a_file.write_text("x")  # a FILE where a parent directory is needed → mkdir fails
+    with caplog.at_level(logging.INFO):
+        rc = main(["--allocate", "equal_weight", "--allocate-out", str(a_file / "t.csv")])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "PROPOSED ALLOCATION: equal_weight" in out   # preview still printed
+    assert "could not write target" in caplog.text       # error reported, not raised
+    assert _run_summary(caplog)["allocate"] == "equal_weight"  # run completed + logged
