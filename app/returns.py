@@ -227,18 +227,37 @@ def summarize(
 
 
 def _snap_to_index(d: date, idx: "pd.DatetimeIndex") -> "pd.Timestamp":
-    """Map an event date onto the trading day its cash should land on: the first
-    index day on/after the date, clamped to the last day so cash is never dropped.
+    """Map an *income* event date (dividend/interest/fee) onto the trading day its
+    cash lands on: the first index day on/after the date, clamped to idx[-1] so a
+    late dividend's cash is never dropped. Income has no share/value counterpart, so
+    clamping it only shifts a constant on the cumulative curve — it cannot fabricate
+    a return the way a clamped *buy* would (the buy's cash would land with no
+    matching shares). A date before idx[0] snaps to idx[0] for the same reason.
 
-    A date before idx[0] (e.g. income predating the first priced day) snaps to
-    idx[0] — on a cumulative curve a constant offset doesn't move drawdowns, and it
-    beats silently discarding the cash. Shared by build_daily_returns + pnl_curve.
+    Share-bearing events (buy/sell) instead use `_share_index_day`, which DROPS a
+    trade past the priced window to stay consistent with value_curve.
     """
     ts = pd.Timestamp(d)
     if ts in idx:
         return ts
     later = idx[idx >= ts]
     return later[0] if len(later) > 0 else idx[-1]
+
+
+def _share_index_day(d: date, idx: "pd.DatetimeIndex") -> "pd.Timestamp | None":
+    """Trading day a *share-bearing* event (buy/sell) dated ``d`` lands on: the
+    first index day on/after ``d`` (a date before idx[0] snaps to idx[0]).
+
+    Returns None when ``d`` is past the last index day — the position can't be
+    valued yet (no price reaches that far), so the trade is dropped from BOTH the
+    value curve and the flow series. This single placement rule is shared by
+    value_curve, build_daily_returns, and pnl_curve, so the share side (shares
+    added) and the flow side (cash subtracted) can never disagree about where a
+    trade lands: a buy whose cost is counted but whose shares are not would
+    fabricate a phantom ~-100% day and poison the whole risk panel.
+    """
+    later = idx[idx >= pd.Timestamp(d)]
+    return later[0] if len(later) > 0 else None
 
 
 def value_curve(
@@ -275,12 +294,12 @@ def value_curve(
     for tk, series in series_by_ticker.items():
         deltas: dict[pd.Timestamp, float] = defaultdict(float)
         for ev in events:
-            if ev.ticker != tk:
+            if ev.ticker != tk or ev.action not in ("buy", "sell"):
                 continue
-            if ev.action == "buy":
-                deltas[pd.Timestamp(ev.date)] += ev.quantity
-            elif ev.action == "sell":
-                deltas[pd.Timestamp(ev.date)] -= ev.quantity
+            day = _share_index_day(ev.date, idx)
+            if day is None:
+                continue  # trade past the priced window → not valuable yet (dropped on the flow side too)
+            deltas[day] += ev.quantity if ev.action == "buy" else -ev.quantity
         if deltas:
             shares = pd.Series(deltas, dtype=float).sort_index().cumsum().reindex(idx, method="ffill").fillna(0.0)
         else:
@@ -337,7 +356,13 @@ def pnl_curve(
             continue  # external cash flow → cancels in P&L (raises balance AND cost base)
         if ev.ticker not in series_by_ticker:
             continue  # priced securities only (matches value_curve / TWR; drops CASH)
-        flows[_snap_to_index(ev.date, idx)] += _cash_delta(ev)
+        if ev.action in ("buy", "sell"):
+            day = _share_index_day(ev.date, idx)
+            if day is None:
+                continue  # trade past the priced window → its shares are dropped from value_curve too
+        else:
+            day = _snap_to_index(ev.date, idx)  # income: clamp a late date onto idx[-1] (keep the cash)
+        flows[day] += _cash_delta(ev)
     return holdings.add(flows.cumsum(), fill_value=0.0)
 
 
@@ -372,15 +397,20 @@ def build_daily_returns(
     sell_proceeds = pd.Series(0.0, index=idx)
     income = pd.Series(0.0, index=idx)
     for ev in priced:
-        d = _snap_to_index(ev.date, idx)
-        if ev.action == "buy":
-            buy_cost[d] += ev.quantity * ev.price + ev.fee
-        elif ev.action == "sell":
-            sell_proceeds[d] += ev.quantity * ev.price - ev.fee
-        elif ev.action in ("dividend", "interest"):
-            income[d] += ev.cash - ev.fee  # net of any withholding fee
-        elif ev.action == "fee":
-            income[d] -= ev.fee
+        if ev.action in ("buy", "sell"):
+            day = _share_index_day(ev.date, idx)
+            if day is None:
+                continue  # trade past the priced window → its shares are dropped from value_curve too
+            if ev.action == "buy":
+                buy_cost[day] += ev.quantity * ev.price + ev.fee
+            else:
+                sell_proceeds[day] += ev.quantity * ev.price - ev.fee
+        else:
+            d = _snap_to_index(ev.date, idx)  # income: clamp a late date onto idx[-1] (keep the cash)
+            if ev.action in ("dividend", "interest"):
+                income[d] += ev.cash - ev.fee  # net of any withholding fee
+            elif ev.action == "fee":
+                income[d] -= ev.fee
 
     prev_value = value.shift(1)
     gain = value - prev_value - buy_cost + sell_proceeds + income

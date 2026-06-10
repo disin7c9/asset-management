@@ -16,7 +16,7 @@ from hypothesis import given
 from hypothesis import strategies as st
 
 from app.derive import DerivedState, derive
-from app.events import Event, load_events
+from app.events import CASH_TICKER, Event, load_events
 
 # --- Golden values: hand-verified from examples/07_derive_from_log.py ---
 GOLDEN_HELD = {
@@ -136,6 +136,48 @@ def test_standalone_fee_event_nets_into_realized() -> None:
     state = derive(events)
     assert isclose(state.realized["SCHP"], 4.70)  # 5.0 dividend − 0.30 tax
     assert isclose(state.total_fees(), 0.30)
+
+
+# --- Known, DEFERRED bugs: pinned so the eventual fix is detectable ---
+# These document CURRENT (acknowledged-wrong) behavior, per the project's
+# reproduce-then-pin discipline. When the "route cash events by kind" fix lands,
+# these assertions should flip and the tests be updated. See the v1.x roadmap memo
+# (slice-8 derive deferred items). Surfaced by the 2026-06-09 whole-program review.
+
+
+def test_unmatched_tax_on_cash_ticker_creates_phantom_realized_known_bug() -> None:
+    """A fee/tax row coded to the CASH pseudo-ticker (e.g. a withholding tax an
+    exporter couldn't attach to a specific holding) lands in realized[CASH] and
+    creates a phantom zero-share CASH position, instead of being treated purely as a
+    cash-balance effect. PINS the current behavior."""
+    state = derive([Event(date(2024, 1, 1), CASH_TICKER, "fee", quantity=0.0, price=0.0, fee=3.50)])
+    # BUG: the tax is netted into realized P&L under the CASH ticker.
+    assert state.realized.get(CASH_TICKER) is not None
+    assert isclose(state.realized[CASH_TICKER], -3.50)
+    # A zero-share CASH position is created, though held() correctly hides it (so it
+    # never reaches holdings sizing or the allocation universe).
+    assert CASH_TICKER in state.positions
+    assert CASH_TICKER not in state.held()
+
+
+def test_fee_listed_on_trade_and_standalone_is_double_counted_known_bug() -> None:
+    """If an importer lists the same cost BOTH embedded in a trade row's Fee column
+    AND as a separate fee line, derive counts it twice — once raising cost basis (via
+    the buy fee) and again subtracted directly from realized (the standalone fee). The
+    correct-once realized here would be +5.0; the double-count drives it to 0.0. PINS
+    the current behavior (the standalone-fee action itself is correct for a genuine
+    separate tax — see test_standalone_fee_event_nets_into_realized; the bug is only
+    the DUPLICATED cost)."""
+    events = [  # the same $5 commission listed twice: on the buy row and as its own line
+        Event(date(2024, 1, 1), "VOO", "buy", quantity=1.0, price=100.0, fee=5.0),
+        Event(date(2024, 1, 1), "VOO", "fee", quantity=0.0, price=0.0, fee=5.0),
+        Event(date(2024, 6, 1), "VOO", "sell", quantity=1.0, price=110.0, fee=0.0),
+    ]
+    state = derive(events)
+    # Sell realizes 110 − 105(basis incl. buy fee) = +5; the standalone fee subtracts
+    # another 5 → 0.0. The $5 has been counted twice (basis AND realized).
+    assert isclose(state.realized["VOO"], 0.0)
+    assert isclose(state.total_fees(), 10.0)  # both fee rows also counted in total_fees
 
 
 @given(

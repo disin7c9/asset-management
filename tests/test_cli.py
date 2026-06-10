@@ -195,7 +195,8 @@ def test_dump_target_never_writes_zero_for_a_holding(tmp_path: Path) -> None:
     # exit), so a no-edit dump → rebalance round-trip never sells it.
     from app.cli import _dump_target
     from app.derive import DerivedState, Position
-    from app.strategy import load_target, suggest
+    from app.events import load_target
+    from app.strategy import suggest
 
     now = datetime.now(timezone.utc)
     state = DerivedState()
@@ -808,3 +809,48 @@ def test_allocate_survives_unwritable_out_path(
     assert "PROPOSED ALLOCATION: equal_weight" in out   # preview still printed
     assert "could not write target" in caplog.text       # error reported, not raised
     assert _run_summary(caplog)["allocate"] == "equal_weight"  # run completed + logged
+
+
+def test_allocate_excludes_cash_pseudo_ticker_from_the_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    # A book with CASH legs (deposit + interest on idle cash) must NOT re-weight the
+    # cash pseudo-ticker: the target is over real holdings only. Exclusion is enforced
+    # at several layers (CASH is dropped from the series fetch, carries no price, and
+    # holds 0 shares) plus an explicit guard in _compute_allocation — this pins the
+    # user-visible contract so none of those can silently regress (e.g. if cash were
+    # ever priced at $1, it must still stay out of the weights).
+    book = tmp_path / "book.csv"
+    book.write_text(
+        "Date,Code,Action,Quantity,Price,Fee\n"
+        "2024-01-02,CASH,deposit,0,10000,0\n"
+        "2024-01-02,VOO,buy,10,100,0\n"
+        "2024-01-02,BND,buy,10,80,0\n"
+        "2024-01-02,IAU,buy,10,40,0\n"
+        "2024-01-02,VEA,buy,10,50,0\n"
+        "2024-03-01,CASH,interest,0,12,0\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("app.cli.fetch_series", _flat_series)
+    out_csv = tmp_path / "t.csv"
+    rc = main(["--csv", str(book), "--allocate", "equal_weight", "--allocate-out", str(out_csv)])
+    capsys.readouterr()
+    assert rc == 0
+    w = _weights_from(out_csv)
+    assert set(w) == {"VOO", "BND", "IAU", "VEA"}      # the 4 real holdings only
+    assert "CASH" not in w                              # the pseudo-ticker is not re-weighted
+    assert all(abs(v - 25.0) < 0.01 for v in w.values())
+
+
+def test_target_writers_refuse_to_overwrite_the_transactions_csv(tmp_path: Path) -> None:
+    # Read-only invariant: --dump-target / --allocate-out must never clobber the input
+    # transaction log. The guard fires during arg validation, before any fetch.
+    book = tmp_path / "book.csv"
+    book.write_text(
+        "Date,Code,Action,Quantity,Price,Fee\n2024-01-02,VOO,buy,10,100,0\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(SystemExit):
+        main(["--csv", str(book), "--dump-target", str(book)])
+    with pytest.raises(SystemExit):
+        main(["--csv", str(book), "--allocate", "equal_weight", "--allocate-out", str(book)])

@@ -1,9 +1,8 @@
-"""Tests for the strategy/suggestion engine. Pure — no I/O except load_target."""
+"""Tests for the strategy/suggestion engine. Pure — no I/O (load_target moved to events.py)."""
 
 from __future__ import annotations
 
 import math
-from pathlib import Path
 
 import pytest
 from hypothesis import assume, given
@@ -11,7 +10,6 @@ from hypothesis import strategies as st
 
 from app.strategy import (
     Suggestion,
-    load_target,
     may_suggest,
     strategy_kind,
     suggest,
@@ -25,51 +23,6 @@ TARGET = {"VOO": 0.50, "BND": 0.25, "IAU": 0.25}
 
 def _by_ticker(sugs: list[Suggestion]) -> dict[str, Suggestion]:
     return {s.ticker: s for s in sugs}
-
-
-# ── load_target ────────────────────────────────────────────────────────────
-
-
-def test_load_target_normalizes_percentages(tmp_path: Path) -> None:
-    p = tmp_path / "t.csv"
-    p.write_text("Ticker,Weight\nVOO,50\nBND,25\nIAU,25\n", encoding="utf-8")
-    assert load_target(p) == {"VOO": 0.5, "BND": 0.25, "IAU": 0.25}
-
-
-def test_load_target_fractions_same_as_percent(tmp_path: Path) -> None:
-    p = tmp_path / "t.csv"
-    p.write_text("Ticker,Weight\nVOO,0.5\nBND,0.25\nIAU,0.25\n", encoding="utf-8")
-    assert load_target(p) == {"VOO": 0.5, "BND": 0.25, "IAU": 0.25}
-
-
-def test_load_target_rejects_empty(tmp_path: Path) -> None:
-    p = tmp_path / "t.csv"
-    p.write_text("Ticker,Weight\n", encoding="utf-8")
-    with pytest.raises(ValueError, match="empty"):
-        load_target(p)
-
-
-def test_load_target_rejects_negative(tmp_path: Path) -> None:
-    p = tmp_path / "t.csv"
-    p.write_text("Ticker,Weight\nVOO,50\nBND,-1\n", encoding="utf-8")
-    with pytest.raises(ValueError, match=">= 0"):
-        load_target(p)
-
-
-def test_load_target_accepts_zero_as_exit(tmp_path: Path) -> None:
-    # 0 is a deliberate close; it's kept (so the CLI can tell it from an omission).
-    p = tmp_path / "t.csv"
-    p.write_text("Ticker,Weight\nVOO,50\nBND,50\nGLDM,0\n", encoding="utf-8")
-    t = load_target(p)
-    assert t["GLDM"] == 0.0
-    assert t["VOO"] == pytest.approx(0.5) and t["BND"] == pytest.approx(0.5)
-
-
-def test_load_target_all_zero_rejected(tmp_path: Path) -> None:
-    p = tmp_path / "t.csv"
-    p.write_text("Ticker,Weight\nVOO,0\nBND,0\n", encoding="utf-8")
-    with pytest.raises(ValueError, match="empty or sums to zero"):
-        load_target(p)
 
 
 # ── to_total ───────────────────────────────────────────────────────────────
@@ -217,13 +170,6 @@ def test_suggest_refuses_edge_mode_at_the_chokepoint() -> None:
     # edge mode (not just the CLI).
     with pytest.raises(ValueError, match="edge strategy"):
         suggest("momentum", HELD, PRICES, TARGET)  # type: ignore[arg-type]
-
-
-def test_load_target_nonnumeric_weight(tmp_path: Path) -> None:
-    p = tmp_path / "t.csv"
-    p.write_text("Ticker,Weight\nVOO,0.5x\n", encoding="utf-8")
-    with pytest.raises(ValueError, match="non-numeric"):
-        load_target(p)
 
 
 # ── property-based invariants (the v1 product) ──────────────────────────────

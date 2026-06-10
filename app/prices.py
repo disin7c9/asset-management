@@ -202,6 +202,30 @@ def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _coerce_fetched_at(value: object) -> datetime | None:
+    """Normalize a cache cell's ``fetched_at`` to a tz-aware UTC datetime, or None
+    if missing / NaT / unparseable (legacy or corrupt rows)."""
+    ts = pd.to_datetime(value, errors="coerce")  # scalar in → Timestamp or NaT
+    if pd.isna(ts):
+        return None
+    dt: datetime = ts.to_pydatetime()
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+
+
+def _fresh(fetched_at: datetime, ttl: timedelta, *, what: str) -> bool:
+    """The one freshness gate for every on-disk cache: reject a future-stamped row
+    (clock skew / tampered file) and anything older than ``ttl``. Centralized so the
+    rule can't drift between the latest-price, series, and splits caches."""
+    now = _now_utc()
+    if fetched_at > now:
+        log.warning(
+            "cache for %s has fetched_at in the future (%s > %s); refusing",
+            what, fetched_at, now,
+        )
+        return False
+    return now - fetched_at <= ttl
+
+
 def _from_cache(ticker: str, asof: date, cache_dir: Path) -> PriceRow | None:
     path = cache_dir / f"{ticker}.parquet"
     if not path.exists():
@@ -215,25 +239,10 @@ def _from_cache(ticker: str, asof: date, cache_dir: Path) -> PriceRow | None:
     if match.empty:
         return None
     row = match.sort_values("fetched_at").iloc[-1]
-    fetched_at_ts = row["fetched_at"]
-    fetched_at: datetime
-    if isinstance(fetched_at_ts, pd.Timestamp):
-        ts = fetched_at_ts.to_pydatetime()
-        fetched_at = ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
-    else:
-        fetched_at = fetched_at_ts
-    if pd.isna(fetched_at):
-        return None  # NaT timestamp (corrupt) — unusable, refetch
-
-    now = _now_utc()
-    # Refuse future-stamped entries (clock skew or tampered file).
-    if fetched_at > now:
-        log.warning(
-            "cache for %s has fetched_at in the future (%s > %s); refusing",
-            ticker, fetched_at, now,
-        )
-        return None
-    if now - fetched_at > _CACHE_TTL:
+    fetched_at = _coerce_fetched_at(row["fetched_at"])
+    if fetched_at is None:
+        return None  # NaT / corrupt — unusable, refetch
+    if not _fresh(fetched_at, _CACHE_TTL, what=ticker):
         return None
     return PriceRow(
         ticker=ticker,
@@ -415,14 +424,10 @@ def _read_fresh_series_cache(
         return None
     if df.empty or not {"date", "close", "fetched_at"} <= set(df.columns):
         return None
-    fetched_ts = pd.to_datetime(df["fetched_at"]).max()
-    if pd.isna(fetched_ts):
-        return None  # NaT timestamp (corrupt/empty) — unusable, refetch
-    fetched = fetched_ts.to_pydatetime()
-    if fetched.tzinfo is None:
-        fetched = fetched.replace(tzinfo=timezone.utc)
-    now = _now_utc()
-    if fetched > now or now - fetched > _CACHE_TTL:
+    fetched = _coerce_fetched_at(pd.to_datetime(df["fetched_at"]).max())
+    if fetched is None:
+        return None  # NaT (corrupt/empty) — unusable, refetch
+    if not _fresh(fetched, _CACHE_TTL, what=ticker):
         return None  # stale or future-stamped → refetch
     idx = pd.to_datetime(df["date"]).dt.normalize()
     series = pd.Series(
@@ -541,14 +546,10 @@ def _splits_from_cache(ticker: str, cache_dir: Path) -> list[tuple[date, float]]
         return None
     if df.empty or not {"date", "ratio", "fetched_at"} <= set(df.columns):
         return None  # malformed (missing a column) → refetch, don't KeyError
-    fetched_ts = pd.to_datetime(df["fetched_at"]).max()
-    if pd.isna(fetched_ts):
+    fetched = _coerce_fetched_at(pd.to_datetime(df["fetched_at"]).max())
+    if fetched is None:
         return None
-    fetched = fetched_ts.to_pydatetime()
-    if fetched.tzinfo is None:
-        fetched = fetched.replace(tzinfo=timezone.utc)
-    now = _now_utc()
-    if fetched > now or now - fetched > _SPLITS_TTL:
+    if not _fresh(fetched, _SPLITS_TTL, what=ticker):
         return None  # stale or future-stamped → refetch
     return _parse_splits(pd.Series(df["ratio"].to_numpy(), index=pd.to_datetime(df["date"])))
 

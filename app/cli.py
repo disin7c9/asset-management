@@ -16,7 +16,7 @@ from dotenv import load_dotenv
 from app.corporate_actions import adjust_for_splits
 from app.derive import DerivedState, derive
 from app.email import send_report
-from app.events import CASH_TICKER, Event, load_events
+from app.events import CASH_TICKER, Event, load_events, load_target
 from app.log_config import setup_logging
 from app.prices import (
     PriceRow,
@@ -46,7 +46,7 @@ from app.returns import (
 from app.risk import DollarDrawdown, RiskSummary, dollar_drawdown, summarize_risk
 from app.allocate import VALID_RULES, allocation_kind, apply_caps, equal_weight, inverse_vol
 from app.backtest import BacktestResult, backtest_compare
-from app.strategy import VALID_MODES, Suggestion, load_target, may_suggest, suggest
+from app.strategy import VALID_MODES, Suggestion, may_suggest, suggest
 
 log = logging.getLogger(__name__)
 
@@ -221,6 +221,16 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     csv_path: Path = args.csv if args.csv is not None else _DEFAULT_CSV
+    # Read-only invariant: a generated target CSV must never overwrite the transaction
+    # log (the irreplaceable source of truth). Both writers take an explicit path, so a
+    # mistyped --dump-target / --allocate-out could otherwise clobber the input.
+    src_resolved = csv_path.resolve()
+    for flag, out in (("--dump-target", args.dump_target), ("--allocate-out", args.allocate_out)):
+        if out is not None and out.resolve() == src_resolved:
+            parser.error(
+                f"{flag} must not point at the transaction CSV ({csv_path}); "
+                "choose a different output path"
+            )
     today = date.today()  # one as-of date for the title, the filename, and the log
     run: dict[str, Any] = {
         "date": today.isoformat(),
@@ -703,7 +713,11 @@ def _compute_allocation(
         run["allocate"] = "skipped: --no-prices"
         return
     values = _held_market_value(state, prices)
-    priced = sorted(values)
+    # Never re-weight the CASH pseudo-ticker: it's a cash balance, not a holding to
+    # allocate. Today it's excluded incidentally (0 shares → not in held(); unpriced),
+    # but make it explicit so a future change (e.g. pricing cash at $1) can't silently
+    # pull it into the weights and dilute every real holding.
+    priced = sorted(tk for tk in values if tk != CASH_TICKER)
     if not priced:
         log.warning("--allocate: no priced holdings to allocate over")
         run["allocate"] = "skipped: no prices"

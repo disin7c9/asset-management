@@ -338,6 +338,30 @@ def test_late_dated_event_is_clamped_not_dropped() -> None:
     assert float(daily.iloc[-1]) == pytest.approx(0.10, abs=1e-9)
 
 
+def test_late_dated_buy_does_not_fabricate_a_crash_day() -> None:
+    """Regression (whole-program review): a buy dated AFTER the last priced day must
+    be dropped from BOTH the value curve and the flow series (its shares aren't priced
+    yet) — NOT have its cash cost clamped onto the last day. The latter fabricated a
+    phantom ~-100% return that silently poisoned the entire risk panel (drawdown / vol
+    / Sharpe) and the dollar P&L. Common trigger: the brief runs before today's close
+    is published, with a trade dated today (or a weekend run with a Monday trade).
+
+    The sibling test above proves a late *dividend* still clamps (income has no share
+    counterpart, so clamping it is correct); this proves a late *buy* does not.
+    """
+    series = {"TST": _price_series([100.0, 101.0, 102.0])}  # priced through 2024-01-03
+    events = [
+        Event(date(2024, 1, 1), "TST", "buy", quantity=1.0, price=100.0, fee=0.0),
+        Event(date(2024, 1, 6), "TST", "buy", quantity=50.0, price=102.0, fee=0.0),  # past last priced day
+    ]
+    daily = build_daily_returns(events, series, asof_date=date(2024, 1, 6))
+    # Every day is the ~+1%/day price move; no fabricated crash from the late buy.
+    assert all(-0.5 < float(r) < 0.5 for r in daily), list(daily)
+    # Dollar P&L is just the 1-share position's gain (102 - 100 = +$2), not a -$5000 phantom.
+    pnl = pnl_curve(events, series, asof_date=date(2024, 1, 6))
+    assert float(pnl.iloc[-1]) == pytest.approx(2.0, abs=1e-6)
+
+
 def test_true_twr_none_on_too_little_data() -> None:
     events = [Event(date(2024, 1, 1), "TST", "buy", quantity=1.0, price=100.0, fee=0.0)]
     series = {"TST": _price_series([100.0, 110.0])}

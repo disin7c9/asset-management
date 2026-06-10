@@ -3,7 +3,7 @@
 Where `strategy.py` decides how to **move** toward a target (the rebalance modes),
 this module decides **what the target should be**: pure functions over a universe
 and its price history. It plugs in one step upstream of the rebalance machinery —
-its output is a target-weight dict, the same shape `strategy.load_target` returns.
+its output is a target-weight dict, the same shape `events.load_target` returns.
 
 All current rules are *discipline*: they make no claim to beat the market (no
 return forecast), so they need no backtest to be honest and may always produce a

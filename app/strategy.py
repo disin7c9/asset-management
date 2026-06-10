@@ -23,10 +23,8 @@ Weights in the target are **relative** — they are normalized to sum to 1, so
 
 from __future__ import annotations
 
-import csv
 import logging
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Literal, get_args
 
 log = logging.getLogger(__name__)
@@ -66,47 +64,6 @@ class Suggestion:
     @property
     def drift(self) -> float:
         return self.current_weight - self.target_weight
-
-
-def load_target(path: Path) -> dict[str, float]:
-    """Load a target-allocation CSV (columns: Ticker, Weight) → normalized weights.
-
-    Weights are relative and normalized to sum to 1.0. A weight of **0 is allowed**
-    and means "close this position" — a deliberate, explicit sell-to-$0. It is kept
-    in the returned dict so the caller can tell an intentional 0 apart from a ticker
-    that was simply omitted (omission is the ambiguous case the CLI warns about).
-    Rejects an empty file, a target that sums to zero, a negative weight, or a
-    non-numeric weight (a clear error beats a silently skewed target).
-    """
-    raw: dict[str, float] = {}
-    with path.open(newline="", encoding="utf-8-sig") as fh:
-        reader = csv.DictReader(fh)
-        fields = {f.strip() for f in (reader.fieldnames or [])}
-        if not {"Ticker", "Weight"} <= fields:
-            msg = f"{path}: target CSV needs columns Ticker, Weight (found {sorted(fields)})"
-            raise ValueError(msg)
-        for row in reader:
-            ticker = (row.get("Ticker") or "").strip().upper()
-            if not ticker:
-                continue
-            raw_w = (row.get("Weight") or "0").strip() or "0"
-            try:
-                weight = float(raw_w)
-            except ValueError:
-                msg = f"{path}: non-numeric weight {raw_w!r} for {ticker}"
-                raise ValueError(msg) from None
-            if weight < 0:
-                msg = (
-                    f"{path}: target weight for {ticker} must be >= 0 "
-                    f"(use 0 to close the position; got {weight})"
-                )
-                raise ValueError(msg)
-            raw[ticker] = raw.get(ticker, 0.0) + weight
-    total = sum(raw.values())
-    if not raw or total <= 0:
-        msg = f"{path}: target allocation is empty or sums to zero"
-        raise ValueError(msg)
-    return {tk: w / total for tk, w in raw.items()}
 
 
 def strategy_kind(mode: str) -> StrategyKind:
