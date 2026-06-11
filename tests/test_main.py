@@ -15,7 +15,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 
 def test_python_m_app_runs_and_prints_holdings() -> None:
     proc = subprocess.run(
-        [sys.executable, "-m", "app", "--no-prices"],
+        [sys.executable, "-m", "app", "--csv", "data/sample_data/transactions.csv", "--no-prices"],
         capture_output=True,
         text=True,
         cwd=_REPO_ROOT,

@@ -50,10 +50,9 @@ from app.strategy import VALID_MODES, Suggestion, may_suggest, suggest
 
 log = logging.getLogger(__name__)
 
-# Default CSV resolved against the repo root (parent of the `app/` package),
-# so the CLI works no matter the current working directory.
+# Paths resolved against the repo root (parent of the `app/` package), so the CLI
+# works no matter the current working directory.
 _REPO_ROOT: Path = Path(__file__).resolve().parents[1]
-_DEFAULT_CSV: Path = _REPO_ROOT / "data" / "sample_data" / "transactions.csv"
 _DEFAULT_CACHE: Path = _REPO_ROOT / "data" / "prices"
 _DEFAULT_REPORTS: Path = _REPO_ROOT / "reports"
 
@@ -65,8 +64,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--csv",
         type=Path,
-        default=None,  # None = not given → fall back to the bundled example (and warn on real intent)
-        help=f"path to the ghostfolio-format transaction CSV (default: the bundled example, {_DEFAULT_CSV.name})",
+        default=None,  # None = not given → print a usage hint (no silent sample); the sample is opt-in
+        help="path to YOUR ghostfolio-format transaction CSV. Required for the brief and for "
+        "--rebalance/--allocate/--dump-target/--save/--send. The bundled example is opt-in: "
+        "pass --csv data/sample_data/transactions.csv. (--backtest --target works without it.)",
     )
     parser.add_argument(
         "--cache-dir",
@@ -139,7 +140,17 @@ def main(argv: list[str] | None = None) -> int:
         "--band",
         type=float,
         default=0.05,
-        help="drift threshold for --rebalance bands, as a fraction (default: 0.05 = 5pp)",
+        help="absolute drift band for --rebalance bands, as a fraction (default: 0.05 = 5pp)",
+    )
+    parser.add_argument(
+        "--band-rel",
+        type=float,
+        default=0.25,
+        metavar="FRAC",
+        help="relative band for --rebalance bands (the 5/25 rule): also act when drift "
+        "exceeds this fraction of a ticker's target weight, so a small sleeve isn't given "
+        "a band many times its size. Effective band = min(--band, --band-rel x target). "
+        "Default 0.25 = 25%%.",
     )
     parser.add_argument(
         "--backtest",
@@ -186,6 +197,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.new_cash < 0:
         parser.error("--new-cash must be >= 0")
+    if args.band_rel <= 0.0:
+        parser.error("--band-rel must be > 0 (a fraction of the target weight, e.g. 0.25 = 25%)")
     if (args.rebalance or args.backtest) and args.target is None:
         parser.error(
             "--rebalance/--backtest require --target (bootstrap one from your holdings "
@@ -206,35 +219,22 @@ def main(argv: list[str] | None = None) -> int:
         )
     if args.allocate_out is not None and not args.allocate:
         parser.error("--allocate-out has no effect without --allocate")
-    # Footgun guard: a real-intent flag with no --csv (args.csv is None) silently
-    # uses the bundled example portfolio, so the HOLDINGS panel would show the
-    # sample (not your data) next to your real target/backtest. Warn — keyed on
-    # "was --csv supplied?", so an explicit sample path doesn't misfire.
-    if args.csv is None and (
-        args.rebalance or args.backtest or args.save or args.send
-        or args.dump_target or args.allocate
-    ):
-        log.warning(
-            "no --csv given: using the bundled EXAMPLE portfolio (%s) — the HOLDINGS "
-            "panel is the example, not your data. Pass --csv your.csv for your own book.",
-            _DEFAULT_CSV.name,
+    # No silent sample fallback: book-dependent actions operate on YOUR holdings, so
+    # they require your transaction log. --backtest is notional (target-only) and is
+    # exempt; the bundled example is opt-in via an explicit --csv path.
+    needs_book = bool(
+        args.rebalance or args.allocate or args.dump_target or args.save or args.send
+    )
+    if args.csv is None and needs_book:
+        parser.error(
+            "this run needs your transaction log — pass --csv PATH "
+            "(or the bundled example: --csv data/sample_data/transactions.csv). "
+            "Only '--backtest --target FILE' runs without --csv."
         )
-
-    csv_path: Path = args.csv if args.csv is not None else _DEFAULT_CSV
-    # Read-only invariant: a generated target CSV must never overwrite the transaction
-    # log (the irreplaceable source of truth). Both writers take an explicit path, so a
-    # mistyped --dump-target / --allocate-out could otherwise clobber the input.
-    src_resolved = csv_path.resolve()
-    for flag, out in (("--dump-target", args.dump_target), ("--allocate-out", args.allocate_out)):
-        if out is not None and out.resolve() == src_resolved:
-            parser.error(
-                f"{flag} must not point at the transaction CSV ({csv_path}); "
-                "choose a different output path"
-            )
     today = date.today()  # one as-of date for the title, the filename, and the log
     run: dict[str, Any] = {
         "date": today.isoformat(),
-        "source": str(csv_path),
+        "source": str(args.csv) if args.csv is not None else "(no book; backtest-only)",
         "n_events_replayed": 0,
         "n_prices_fetched": 0,
         "n_prices_missing": 0,
@@ -250,39 +250,64 @@ def main(argv: list[str] | None = None) -> int:
         "allocate": None,
     }
 
-    if not csv_path.exists():
-        log.error("transaction CSV not found: %s", csv_path)
-        run["status"] = "error"
-        run["error"] = "csv_not_found"
-        _log_run_summary(run)
-        return 2
-
-    try:
-        events = load_events(csv_path)
-        run["n_events_replayed"] = len(events)
-        # Split-adjust raw share counts (yfinance prices are split-adjusted) so
-        # holdings AND the time-weighted series share one basis — the real fix for
-        # the NVDA-style corruption. Cache-only under --offline/--no-prices; the
-        # price-basis-mismatch guard stays the net for any split we couldn't fetch.
-        splits = fetch_splits(
-            sorted({ev.ticker for ev in events}),
-            cache_dir=args.cache_dir,
-            online=not args.offline and not args.no_prices,
+    # Nothing to do: no book and no notional backtest → guide, don't fabricate a brief.
+    if args.csv is None and not args.backtest:
+        sys.stdout.write(
+            "No portfolio given. Pass --csv PATH to see your brief, e.g.\n"
+            "  uv run python -m app --csv your_transactions.csv\n"
+            "or try the bundled example:\n"
+            "  uv run python -m app --csv data/sample_data/transactions.csv\n"
+            "(to backtest a target without a book: --backtest --target FILE; "
+            "see --help for all options)\n"
         )
-        raw_events = events
-        events = adjust_for_splits(raw_events, splits)
-        adjusted_tickers = sorted({
-            a.ticker for a, b in zip(raw_events, events, strict=True) if a != b
-        })
-        if adjusted_tickers:
-            log.info("split-adjusted share counts for: %s", ", ".join(adjusted_tickers))
-        state = derive(events)
-    except (ValueError, KeyError) as exc:
-        log.error("failed to process %s: %s", csv_path, exc)
-        run["status"] = "error"
-        run["error"] = str(exc)
-        _log_run_summary(run)
-        return 2
+        return 0
+
+    state = DerivedState()
+    events: list[Event] = []
+    if args.csv is not None:  # a real book → derive holdings (else: notional backtest only)
+        csv_path = args.csv
+        # Read-only invariant: a generated target CSV must never overwrite the
+        # transaction log. Both writers take an explicit path, so a mistyped
+        # --dump-target / --allocate-out could otherwise clobber the input.
+        src_resolved = csv_path.resolve()
+        for flag, out in (("--dump-target", args.dump_target), ("--allocate-out", args.allocate_out)):
+            if out is not None and out.resolve() == src_resolved:
+                parser.error(
+                    f"{flag} must not point at the transaction CSV ({csv_path}); "
+                    "choose a different output path"
+                )
+        if not csv_path.exists():
+            log.error("transaction CSV not found: %s", csv_path)
+            run["status"] = "error"
+            run["error"] = "csv_not_found"
+            _log_run_summary(run)
+            return 2
+        try:
+            events = load_events(csv_path)
+            run["n_events_replayed"] = len(events)
+            # Split-adjust raw share counts (yfinance prices are split-adjusted) so
+            # holdings AND the time-weighted series share one basis — the real fix for
+            # the NVDA-style corruption. Cache-only under --offline/--no-prices; the
+            # price-basis-mismatch guard stays the net for any split we couldn't fetch.
+            splits = fetch_splits(
+                sorted({ev.ticker for ev in events}),
+                cache_dir=args.cache_dir,
+                online=not args.offline and not args.no_prices,
+            )
+            raw_events = events
+            events = adjust_for_splits(raw_events, splits)
+            adjusted_tickers = sorted({
+                a.ticker for a, b in zip(raw_events, events, strict=True) if a != b
+            })
+            if adjusted_tickers:
+                log.info("split-adjusted share counts for: %s", ", ".join(adjusted_tickers))
+            state = derive(events)
+        except (ValueError, KeyError) as exc:
+            log.error("failed to process %s: %s", csv_path, exc)
+            run["status"] = "error"
+            run["error"] = str(exc)
+            _log_run_summary(run)
+            return 2
 
     prices: dict[str, PriceRow] | None = None
     returns: ReturnsSummary | None = None
@@ -589,7 +614,7 @@ def _compute_suggestions(
     held_value = _held_market_value(state, combined)
     sugg = suggest(
         args.rebalance, held_value, price_per_share, target,
-        new_cash=args.new_cash, band=args.band,
+        new_cash=args.new_cash, band=args.band, band_rel=args.band_rel,
     )
     run["rebalance"] = args.rebalance
     return sugg

@@ -119,6 +119,40 @@ def test_bands_acts_when_drift_exceeds_band() -> None:
     assert "band" in s["VOO"].reason
 
 
+def test_bands_5_25_catches_small_sleeve_but_not_large() -> None:
+    # The 5/25 rule: the band is min(absolute pp, band_rel x target). Same 1.5pp drift
+    # on both sleeves → it ACTS on the small one (4% target → 1pp band) but HOLDS the
+    # large one (96% target → 5pp absolute band). A flat 5pp band would hold both.
+    held = {"BIG": 9450.0, "SML": 550.0}          # 94.5% / 5.5% of $10k
+    prices = {"BIG": 100.0, "SML": 50.0}
+    target = {"BIG": 0.96, "SML": 0.04}           # both off by 1.5pp
+    s = _by_ticker(suggest("bands", held, prices, target, band=0.05))  # band_rel default 0.25
+    assert s["SML"].action == "sell" and "1.00pp band" in s["SML"].reason
+    assert s["BIG"].action == "hold"
+
+
+def test_bands_5_25_zero_target_always_exits() -> None:
+    # A 0% target → 0 band → exit even a small position (above the $1 floor), unlike a
+    # flat band that would leave a sub-band dust position in place.
+    held = {"KEEP": 9900.0, "GONE": 100.0}        # GONE is 1% of the book
+    prices = {"KEEP": 100.0, "GONE": 10.0}
+    target = {"KEEP": 1.0, "GONE": 0.0}
+    s = _by_ticker(suggest("bands", held, prices, target, band=0.05))
+    assert s["GONE"].action == "sell" and "full exit" in s["GONE"].reason
+
+
+def test_bands_rel_band_is_tunable() -> None:
+    # Loosening --band-rel widens the small-sleeve band back toward the absolute:
+    # rel 0.25 → SML band 1pp → a 1.5pp drift acts; rel 1.0 → SML band 4pp → holds.
+    held = {"BIG": 9450.0, "SML": 550.0}
+    prices = {"BIG": 100.0, "SML": 50.0}
+    target = {"BIG": 0.96, "SML": 0.04}
+    tight = _by_ticker(suggest("bands", held, prices, target, band=0.05, band_rel=0.25))
+    loose = _by_ticker(suggest("bands", held, prices, target, band=0.05, band_rel=1.0))
+    assert tight["SML"].action == "sell"
+    assert loose["SML"].action == "hold"
+
+
 # ── edges ──────────────────────────────────────────────────────────────────
 
 

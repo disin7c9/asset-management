@@ -18,6 +18,7 @@ from app import email as E
 from app.cli import main
 from app.prices import PriceRow, PricesResult, SeriesResult
 
+SAMPLE = Path(__file__).resolve().parents[1] / "data" / "sample_data" / "transactions.csv"
 TARGET = Path(__file__).resolve().parents[1] / "data" / "sample_data" / "target.csv"
 
 
@@ -44,7 +45,7 @@ def _today() -> str:
 
 
 def test_save_writes_markdown(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    rc = main(["--no-prices", "--save", "--reports-dir", str(tmp_path)])
+    rc = main(["--csv", str(SAMPLE), "--no-prices", "--save", "--reports-dir", str(tmp_path)])
     assert rc == 0
     out = capsys.readouterr().out
     assert "=== HOLDINGS ===" in out  # stdout still printed
@@ -65,7 +66,7 @@ def test_send_invokes_dispatch(
     monkeypatch.setenv("RESEND_API_KEY", "test_key")
     monkeypatch.setenv("REPORT_TO", "me@example.com")
 
-    rc = main(["--no-prices", "--send"])
+    rc = main(["--csv", str(SAMPLE), "--no-prices", "--send"])
     assert rc == 0
     assert len(calls) == 1
     payload = calls[0]
@@ -84,7 +85,7 @@ def test_send_without_credentials_prints_but_exits_nonzero(
     # load_dotenv in main must not resurrect a key from a real .env for this test.
     monkeypatch.setattr("app.cli.load_dotenv", lambda *a, **k: False)
 
-    rc = main(["--no-prices", "--send"])
+    rc = main(["--csv", str(SAMPLE), "--no-prices", "--send"])
     # Brief still printed, but the requested delivery failed → non-zero so cron alerts.
     assert rc == 1
     assert "=== HOLDINGS ===" in capsys.readouterr().out
@@ -96,7 +97,7 @@ def test_save_to_unwritable_path_prints_but_exits_nonzero(
     # Make reports-dir sit *under a regular file* so mkdir raises NotADirectoryError.
     blocker = tmp_path / "afile"
     blocker.write_text("not a dir", encoding="utf-8")
-    rc = main(["--no-prices", "--save", "--reports-dir", str(blocker / "sub")])
+    rc = main(["--csv", str(SAMPLE), "--no-prices", "--save", "--reports-dir", str(blocker / "sub")])
     assert rc == 1  # save failed, recorded not raised
     assert "=== HOLDINGS ===" in capsys.readouterr().out  # brief still printed
 
@@ -116,7 +117,7 @@ def test_rebalance_emits_suggestions(
         return PricesResult(rows=rows, missing=[tk for tk in tickers if tk not in canned])
 
     monkeypatch.setattr("app.cli.fetch_latest", fake_fetch_latest)
-    rc = main(["--no-risk", "--rebalance", "to_total", "--target", str(TARGET)])
+    rc = main(["--csv", str(SAMPLE), "--no-risk", "--rebalance", "to_total", "--target", str(TARGET)])
     assert rc == 0
     out = capsys.readouterr().out
     assert "SUGGESTED ACTIONS (rebalance to target)" in out
@@ -134,6 +135,11 @@ def test_rebalance_negative_new_cash_rejected() -> None:
         main(["--rebalance", "fixed_dca", "--new-cash", "-100", "--target", str(TARGET)])
 
 
+def test_band_rel_nonpositive_rejected() -> None:
+    with pytest.raises(SystemExit):  # --band-rel must be a positive fraction of target
+        main(["--csv", str(SAMPLE), "--rebalance", "bands", "--target", str(TARGET), "--band-rel", "0"])
+
+
 def test_dump_target_writes_current_allocation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -149,7 +155,7 @@ def test_dump_target_writes_current_allocation(
 
     monkeypatch.setattr("app.cli.fetch_latest", fake_fetch_latest)
     out_csv = tmp_path / "mytarget.csv"
-    rc = main(["--no-risk", "--dump-target", str(out_csv)])
+    rc = main(["--csv", str(SAMPLE), "--no-risk", "--dump-target", str(out_csv)])
     assert rc == 0
     text = out_csv.read_text(encoding="utf-8")
     assert text.startswith("Ticker,Weight")
@@ -168,7 +174,7 @@ def test_rebalance_skips_when_holdings_unpriced(
         return PricesResult(rows={}, missing=list(tickers))
 
     monkeypatch.setattr("app.cli.fetch_latest", empty_fetch)
-    rc = main(["--no-risk", "--rebalance", "to_total", "--target", str(TARGET)])
+    rc = main(["--csv", str(SAMPLE), "--no-risk", "--rebalance", "to_total", "--target", str(TARGET)])
     assert rc == 0
     out = capsys.readouterr().out
     assert "SUGGESTED ACTIONS" not in out  # skipped, not partial/wrong
@@ -223,7 +229,7 @@ def test_rebalance_directory_target_is_nonfatal(
     _canned_sample_prices(monkeypatch)
     d = tmp_path / "adir"
     d.mkdir()
-    rc = main(["--no-risk", "--rebalance", "to_total", "--target", str(d)])
+    rc = main(["--csv", str(SAMPLE), "--no-risk", "--rebalance", "to_total", "--target", str(d)])
     assert rc == 0  # IsADirectoryError caught; the rest of the brief prints
     out = capsys.readouterr().out
     assert "SUGGESTED ACTIONS" not in out
@@ -267,34 +273,54 @@ def test_backtest_start_in_future_rejected() -> None:
         main(["--backtest", "--target", str(TARGET), "--backtest-start", "2999-01-01"])
 
 
-def test_default_csv_with_real_intent_warns(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    # No --csv + a real-intent flag → warn that holdings are the bundled example.
-    monkeypatch.setattr(
-        "app.cli.fetch_series", lambda *a, **k: SeriesResult(rows={}, missing=[])
-    )
-    with caplog.at_level(logging.WARNING):
-        main(["--no-prices", "--backtest", "--target", str(TARGET)])
-    capsys.readouterr()
-    assert "EXAMPLE portfolio" in caplog.text
+def test_book_action_without_csv_errors() -> None:
+    # No silent sample fallback: a book-dependent action with no --csv must error
+    # loudly (exit 2), not quietly run on the bundled example.
+    for argv in (
+        ["--rebalance", "to_total", "--target", str(TARGET)],
+        ["--allocate", "equal_weight"],
+        ["--dump-target", "/tmp/whatever.csv"],
+        ["--save"],
+        ["--send"],
+    ):
+        with pytest.raises(SystemExit):
+            main(argv)
 
 
-def test_explicit_csv_suppresses_footgun_warning(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str],
+def test_bare_run_prints_hint_not_a_brief(capsys: pytest.CaptureFixture[str]) -> None:
+    # No --csv and no action → a usage hint, not a fabricated brief on the sample.
+    rc = main([])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "No portfolio given" in out and "--csv" in out
+    assert "=== HOLDINGS ===" not in out  # nothing fabricated
+
+
+def test_backtest_without_csv_is_simulation_only(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
 ) -> None:
-    csv = tmp_path / "mine.csv"
-    csv.write_text("Date,Code,Action,Quantity,Price,Fee\n2024-01-02,VOO,buy,1,100,0\n",
-                   encoding="utf-8")
+    # --backtest is notional (target-only): with no --csv it prints ONLY the
+    # simulation — no fabricated holdings/status from the bundled sample.
+    import pandas as pd
+
+    dates = pd.bdate_range("2024-01-01", periods=120)
+    rows = {
+        tk: pd.Series([100.0 + i * 0.3 for i in range(120)], index=dates, dtype=float)
+        for tk in ("VOO", "VEA", "BND", "IAU")
+    }
     monkeypatch.setattr(
-        "app.cli.fetch_series", lambda *a, **k: SeriesResult(rows={}, missing=[])
+        "app.cli.fetch_series",
+        lambda tickers, *a, **k: SeriesResult(
+            rows={tk: rows[tk] for tk in tickers if tk in rows},
+            missing=[tk for tk in tickers if tk not in rows],
+        ),
     )
-    with caplog.at_level(logging.WARNING):
-        main(["--csv", str(csv), "--no-prices", "--backtest", "--target", str(TARGET)])
-    capsys.readouterr()
-    assert "EXAMPLE portfolio" not in caplog.text
+    rc = main(["--backtest", "--target", str(TARGET)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "=== BACKTEST" in out          # the simulation prints
+    assert "=== HOLDINGS ===" not in out  # but NO holdings/status (no book given)
+    assert "=== DRAWDOWN" not in out
 
 
 def test_omitting_a_holding_warns(
@@ -305,7 +331,7 @@ def test_omitting_a_holding_warns(
     t = tmp_path / "omit.csv"
     t.write_text("Ticker,Weight\nVOO,45\nVEA,20\nBND,35\n", encoding="utf-8")  # IAU omitted
     with caplog.at_level(logging.WARNING):
-        main(["--no-risk", "--rebalance", "to_total", "--target", str(t)])
+        main(["--csv", str(SAMPLE), "--no-risk", "--rebalance", "to_total", "--target", str(t)])
     capsys.readouterr()
     assert "omits held tickers" in caplog.text and "IAU" in caplog.text
 
@@ -318,7 +344,7 @@ def test_explicit_zero_weight_does_not_warn(
     t = tmp_path / "explicit.csv"
     t.write_text("Ticker,Weight\nVOO,45\nVEA,20\nBND,35\nIAU,0\n", encoding="utf-8")
     with caplog.at_level(logging.WARNING):
-        main(["--no-risk", "--rebalance", "to_total", "--target", str(t)])
+        main(["--csv", str(SAMPLE), "--no-risk", "--rebalance", "to_total", "--target", str(t)])
     out = capsys.readouterr().out
     assert "omits held tickers" not in caplog.text  # explicit 0 → no omission warning
     assert "IAU" in out  # still shown as a full-exit sell
@@ -338,7 +364,7 @@ def test_offline_never_touches_the_network(
     monkeypatch.setattr(
         P, "_fetch_stooq_csv", lambda *a, **k: pytest.fail("network call in --offline")
     )
-    rc = main(["--offline", "--cache-dir", str(tmp_path)])
+    rc = main(["--csv", str(SAMPLE), "--offline", "--cache-dir", str(tmp_path)])
     assert rc == 0
     assert "=== HOLDINGS ===" in capsys.readouterr().out
 
@@ -377,7 +403,7 @@ def test_run_summary_counts_prices_on_series_path(
 
     monkeypatch.setattr("app.cli.fetch_series", fake_series)
     with caplog.at_level(logging.INFO):
-        rc = main([])  # default sample CSV, risk panel ON
+        rc = main(["--csv", str(SAMPLE)])  # default sample CSV, risk panel ON
     capsys.readouterr()
     assert rc == 0
     run = _run_summary(caplog)
@@ -393,7 +419,7 @@ def test_rebalance_missing_target_file_skip_reason(
 ) -> None:
     _canned_sample_prices(monkeypatch)
     with caplog.at_level(logging.INFO):
-        rc = main(["--no-risk", "--rebalance", "to_total", "--target", str(tmp_path / "nope.csv")])
+        rc = main(["--csv", str(SAMPLE), "--no-risk", "--rebalance", "to_total", "--target", str(tmp_path / "nope.csv")])
     capsys.readouterr()
     assert rc == 0
     assert _run_summary(caplog)["rebalance"] == "skipped: no target file"
@@ -404,7 +430,7 @@ def test_rebalance_no_prices_skip_reason(
 ) -> None:
     # --no-prices leaves nothing to size trades against → skip (no network either).
     with caplog.at_level(logging.INFO):
-        rc = main(["--no-prices", "--rebalance", "to_total", "--target", str(TARGET)])
+        rc = main(["--csv", str(SAMPLE), "--no-prices", "--rebalance", "to_total", "--target", str(TARGET)])
     capsys.readouterr()
     assert rc == 0
     assert _run_summary(caplog)["rebalance"] == "skipped: --no-prices"
@@ -431,7 +457,7 @@ def test_email_failure_marks_status_partial(
     monkeypatch.delenv("REPORT_TO", raising=False)
     monkeypatch.setattr("app.cli.load_dotenv", lambda *a, **k: False)
     with caplog.at_level(logging.INFO):
-        rc = main(["--no-prices", "--send"])
+        rc = main(["--csv", str(SAMPLE), "--no-prices", "--send"])
     capsys.readouterr()
     assert rc == 1
     run = _run_summary(caplog)
@@ -448,7 +474,7 @@ def test_cash_mode_without_cash_warns(
     # P1#3: fixed_dca / cash_flow_only with --new-cash 0 deploy nothing → warn.
     _canned_sample_prices(monkeypatch)
     with caplog.at_level(logging.WARNING):
-        main(["--no-risk", "--rebalance", "fixed_dca", "--target", str(TARGET)])
+        main(["--csv", str(SAMPLE), "--no-risk", "--rebalance", "fixed_dca", "--target", str(TARGET)])
     capsys.readouterr()
     assert "nothing to invest" in caplog.text
 
@@ -473,7 +499,7 @@ def test_no_risk_still_runs_explicit_backtest(
             missing=[tk for tk in tickers if tk not in rows],
         ),
     )
-    rc = main(["--no-risk", "--backtest", "--target", str(TARGET)])
+    rc = main(["--csv", str(SAMPLE), "--no-risk", "--backtest", "--target", str(TARGET)])
     assert rc == 0
     out = capsys.readouterr().out
     assert "=== BACKTEST" in out          # backtest panel present despite --no-risk
@@ -506,7 +532,7 @@ def test_nonpositive_priced_holding_suppresses_money_weighted(
 
     monkeypatch.setattr("app.cli.fetch_series", fake_series)
     with caplog.at_level(logging.INFO):
-        rc = main([])  # risk-on (so true TWR is computed and the RETURNS panel renders)
+        rc = main(["--csv", str(SAMPLE)])  # risk-on (so true TWR is computed and the RETURNS panel renders)
     out = capsys.readouterr().out
     assert rc == 0
     twr_line = next(line for line in out.splitlines() if "Time-weighted" in line)
@@ -685,7 +711,7 @@ def test_allocate_equal_weight_previews_and_dumps(
     monkeypatch.setattr("app.cli.fetch_series", _flat_series)
     out_csv = tmp_path / "t.csv"
     with caplog.at_level(logging.INFO):
-        rc = main(["--allocate", "equal_weight", "--allocate-out", str(out_csv)])
+        rc = main(["--csv", str(SAMPLE), "--allocate", "equal_weight", "--allocate-out", str(out_csv)])
     out = capsys.readouterr().out
     assert rc == 0
     assert "PROPOSED ALLOCATION: equal_weight" in out
@@ -699,7 +725,7 @@ def test_allocate_inverse_vol_overweights_calm_assets(
 ) -> None:
     monkeypatch.setattr("app.cli.fetch_series", _split_vol_series)
     out_csv = tmp_path / "t.csv"
-    rc = main(["--allocate", "inverse_vol", "--allocate-out", str(out_csv)])
+    rc = main(["--csv", str(SAMPLE), "--allocate", "inverse_vol", "--allocate-out", str(out_csv)])
     capsys.readouterr()
     assert rc == 0
     w = _weights_from(out_csv)
@@ -712,7 +738,7 @@ def test_allocate_cap_limits_concentration(
     monkeypatch.setattr("app.cli.fetch_series", _split_vol_series)
     out_csv = tmp_path / "t.csv"
     rc = main(
-        ["--allocate", "inverse_vol", "--allocate-cap", "0.4", "--allocate-out", str(out_csv)]
+        ["--csv", str(SAMPLE), "--allocate", "inverse_vol", "--allocate-cap", "0.4", "--allocate-out", str(out_csv)]
     )
     capsys.readouterr()
     assert rc == 0
@@ -723,7 +749,7 @@ def test_allocate_skips_without_prices(
     caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str],
 ) -> None:
     with caplog.at_level(logging.INFO):
-        rc = main(["--allocate", "equal_weight", "--no-prices"])
+        rc = main(["--csv", str(SAMPLE), "--allocate", "equal_weight", "--no-prices"])
     capsys.readouterr()
     assert rc == 0
     assert _run_summary(caplog)["allocate"] == "skipped: --no-prices"
@@ -756,7 +782,7 @@ def test_allocate_surfaces_omitted_holding(
         return SeriesResult(rows=rows, missing=missing, provenance={})
 
     monkeypatch.setattr("app.cli.fetch_series", drop_voo)
-    rc = main(["--allocate", "equal_weight", "--allocate-out", str(tmp_path / "t.csv")])
+    rc = main(["--csv", str(SAMPLE), "--allocate", "equal_weight", "--allocate-out", str(tmp_path / "t.csv")])
     out = capsys.readouterr().out
     assert rc == 0
     assert "would SELL these: VOO" in out
@@ -787,7 +813,7 @@ def test_allocate_inverse_vol_reuses_fetched_series(
         return _flat_series(tickers)
 
     monkeypatch.setattr("app.cli.fetch_series", counting)
-    rc = main(["--allocate", "inverse_vol"])
+    rc = main(["--csv", str(SAMPLE), "--allocate", "inverse_vol"])
     capsys.readouterr()
     assert rc == 0
     assert len(calls) == 1, calls  # reused the first fetch, did not refetch
@@ -803,7 +829,7 @@ def test_allocate_survives_unwritable_out_path(
     a_file = tmp_path / "afile"
     a_file.write_text("x")  # a FILE where a parent directory is needed → mkdir fails
     with caplog.at_level(logging.INFO):
-        rc = main(["--allocate", "equal_weight", "--allocate-out", str(a_file / "t.csv")])
+        rc = main(["--csv", str(SAMPLE), "--allocate", "equal_weight", "--allocate-out", str(a_file / "t.csv")])
     out = capsys.readouterr().out
     assert rc == 0
     assert "PROPOSED ALLOCATION: equal_weight" in out   # preview still printed

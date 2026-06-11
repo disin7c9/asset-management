@@ -9,7 +9,7 @@ resolution-markers = [
 
 [[package]]
 name = "asset-management"
-version = "0.0.2"
+version = "1.4.0"
 source = { editable = "." }
 dependencies = [
     { name = "empyrical-reloaded" },

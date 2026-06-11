@@ -18,23 +18,32 @@ uv sync
 ## Run
 
 ```bash
-uv run python -m app                         # bundled example log; fetches prices + risk panel
-uv run python -m app --csv path/to/your.csv  # your own CSV
-uv run python -m app --no-risk               # skip the holdings drawdown/risk panel (a --backtest still shows its own)
-uv run python -m app --no-prices             # holdings + realized P&L only (no network)
-uv run python -m app --offline               # serve from on-disk cache; no network (latest falls back to the series cache)
-uv run python -m app --cache-dir /some/dir   # override the default cache location
-uv run python -m app --save                  # also write reports/<asof>.md (markdown)
-uv run python -m app --send                  # also email the brief as HTML via Resend
-uv run python -m app --dump-target target.csv                   # write current allocation to edit
-uv run python -m app --allocate inverse_vol --allocate-out t.csv  # PROPOSE a target (re-weight holdings)
-uv run python -m app --rebalance to_total --target target.csv   # suggestions toward a target
-uv run python -m app --rebalance cash_flow_only --target target.csv --new-cash 1000
-uv run python -m app --backtest --target target.csv             # rebalance vs buy-and-hold, historically
+uv run python -m app --csv data/sample_data/transactions.csv  # the bundled example book (opt-in)
+uv run python -m app --csv path/to/your.csv  # your own book: holdings + returns + risk
+uv run python -m app --csv your.csv --no-risk    # skip the holdings drawdown/risk panel (a --backtest still shows its own)
+uv run python -m app --csv your.csv --no-prices  # holdings + realized P&L only (no network)
+uv run python -m app --csv your.csv --offline    # serve from on-disk cache; no network (latest falls back to the series cache)
+uv run python -m app --csv your.csv --cache-dir /some/dir   # override the default cache location
+uv run python -m app --csv your.csv --save       # also write reports/<asof>.md (markdown)
+uv run python -m app --csv your.csv --send       # also email the brief as HTML via Resend
+uv run python -m app --csv your.csv --dump-target target.csv                    # write current allocation to edit
+uv run python -m app --csv your.csv --allocate inverse_vol --allocate-out t.csv  # PROPOSE a target (re-weight holdings)
+uv run python -m app --csv your.csv --rebalance to_total --target target.csv    # suggestions toward a target
+uv run python -m app --csv your.csv --rebalance cash_flow_only --target target.csv --new-cash 1000
+uv run python -m app --backtest --target target.csv             # notional backtest — needs only --target, no --csv
 uv run python -m app --csv your.csv --rebalance bands --backtest --target target.csv  # panels stack
 ```
 
-The report is **composable panels**, not exclusive modes — combine flags to stack panels (the last example prints both SUGGESTED ACTIONS *and* BACKTEST). Two things to note: `target.csv` is one you create with `--dump-target` (or use `data/sample_data/target.csv`); and **without `--csv` the bundled example portfolio is used** — if you combine that with `--rebalance`/`--backtest`/`--save`/`--send` the run warns, so you never silently mix example holdings with your real target. Always pass `--csv your.csv` for your own book.
+The report is **composable panels**, not exclusive modes — combine flags and the panels stack (the last example prints SUGGESTED ACTIONS *and* BACKTEST). What each action needs:
+
+| action | needs | what it does |
+|---|---|---|
+| status brief (default) | `--csv` | your holdings + returns + drawdown/risk |
+| `--rebalance MODE` | `--csv` + `--target` | buy/sell suggestions toward the target (`--new-cash` sizes a deposit) |
+| `--allocate RULE` | `--csv` | propose a target by re-weighting your holdings (write it with `--allocate-out`) |
+| `--backtest` | `--target` | notional rebalance-vs-buy-and-hold — **no `--csv`**; prints the simulation alone |
+
+There is **no silent default**: a book-dependent action without `--csv` errors out, and a bare `python -m app` prints a hint — the bundled example is opt-in (`--csv data/sample_data/transactions.csv`), never assumed. `--allocate` is **propose-only** and cannot be combined with `--rebalance`/`--backtest` (review the written file, then act on it in a separate command). A `target.csv` is one you create with `--dump-target` / `--allocate-out` (or use `data/sample_data/target.csv`).
 
 ## Choose a target — the strategy engine
 
@@ -56,7 +65,7 @@ A **target is a complete spec** (`--target path`, columns `Ticker,Weight`; weigh
 - `to_total` — sell + buy to hit the target exactly (cash-neutral; deploys `--new-cash` too)
 - `cash_flow_only` — invest `--new-cash` into underweights; never sell (tax-friendly)
 - `fixed_dca` — buy the target mix with `--new-cash`, ignoring drift
-- `bands` — like `to_total` but only act when a ticker's drift exceeds `--band` (default 5pp); rebalances existing holdings only (ignores `--new-cash`)
+- `bands` — like `to_total` but only act when a ticker's drift exceeds its band; rebalances existing holdings only (ignores `--new-cash`). The band is the **smaller** of an absolute `--band` (default 5pp) or `--band-rel` × the ticker's target weight (the **"5/25 rule"**, default 25%) — so a small sleeve isn't handed a band many times its own size (a flat 5pp would let a 1% holding vanish or 6× untouched); a 0% target → 0 band → always exits
 
 ## Backtest
 

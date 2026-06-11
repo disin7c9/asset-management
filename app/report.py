@@ -148,7 +148,8 @@ def build_report_data(
         sections.append(_section_risk_adjusted(risk))
     if returns is not None and returns.period_days > 0:
         sections.append(_section_returns(returns, twr_excluded))
-    sections.append(_section_holdings(state, prices))
+    if state.positions or prices:  # skip the empty holdings table on a no-book (backtest-only) run
+        sections.append(_section_holdings(state, prices))
     if backtest is not None and backtest.legs:
         sections.append(_section_backtest(backtest))
 

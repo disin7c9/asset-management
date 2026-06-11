@@ -15,7 +15,11 @@ Modes (v1):
     cash_flow_only  invest new cash into underweights; never sell (tax-friendly)
     fixed_dca       buy the target mix with a fixed cash amount, ignoring drift
     bands           like to_total, but only act on tickers whose drift exceeds a
-                    band (prevents churn); rebalances existing holdings only
+                    band (prevents churn); rebalances existing holdings only. The
+                    band is the SMALLER of an absolute pp (`band`) or a relative
+                    fraction of the target (`band_rel` × target — the "5/25 rule"),
+                    so a small sleeve isn't handed a band many times its own size
+                    (a 1% target with a flat 5pp band could vanish or 6× untouched).
 
 Weights in the target are **relative** — they are normalized to sum to 1, so
 ``25,25,25,25`` and ``0.25,0.25,0.25,0.25`` mean the same thing.
@@ -87,6 +91,7 @@ def suggest(
     *,
     new_cash: float = 0.0,
     band: float = 0.05,
+    band_rel: float = 0.25,
 ) -> list[Suggestion]:
     """Produce per-ticker suggestions for one rebalancing rule.
 
@@ -119,7 +124,7 @@ def suggest(
         base = total_value + (new_cash if mode == "to_total" else 0.0)
         return _to_target(
             universe, held_value, prices, target, total_value, base,
-            rule=mode, band=(band if mode == "bands" else None),
+            rule=mode, band=(band if mode == "bands" else None), band_rel=band_rel,
         )
     msg = f"unhandled rebalance mode: {mode!r}"  # fail loud if a mode is added without a branch
     raise ValueError(msg)
@@ -139,18 +144,25 @@ def _to_target(
     *,
     rule: str,
     band: float | None,
+    band_rel: float,
 ) -> list[Suggestion]:
-    """Trade each ticker toward target_weight × base. If `band` is set, only act
-    on tickers whose |current − target| exceeds it (others → hold)."""
+    """Trade each ticker toward target_weight × base. If `band` is set, only act on
+    tickers whose |current − target| exceeds the effective band — the SMALLER of the
+    absolute `band` (pp) or `band_rel × target_weight` (the 5/25 rule), so a small
+    sleeve isn't given a band many times its size. A target of 0 → band 0 → always
+    exit (above the $ floor). `band=None` is to_total (no band — act on any drift)."""
     out: list[Suggestion] = []
     for tk in universe:
         tgt_w = target.get(tk, 0.0)  # held but not in target → target 0 → sell out
         cur_w = _cur_weight(held_value, tk, total_value)
         trade = tgt_w * base - held_value.get(tk, 0.0)
-        if band is not None and abs(cur_w - tgt_w) <= band + _BAND_EPS:
+        # 5/25 band: the no-trade region is the smaller of the absolute pp band and a
+        # relative fraction of the target (tgt 0 → 0 → always exit). None → to_total.
+        threshold = min(band, band_rel * tgt_w) if band is not None else None
+        if threshold is not None and abs(cur_w - tgt_w) <= threshold + _BAND_EPS:
             out.append(Suggestion(
                 tk, "hold", 0.0, 0.0, cur_w, tgt_w, rule,
-                f"within {band * 100:.1f}pp band",
+                f"within {threshold * 100:.2f}pp band",
             ))
             continue
         if abs(trade) < _MIN_TRADE_USD:
@@ -161,8 +173,8 @@ def _to_target(
         if tgt_w == 0.0:
             # Target 0% (explicitly, or by omission) → a full exit of the position.
             reason = "target 0% → full exit (raise its weight to keep it)"
-        elif band is not None:
-            reason = f"drift {drift_pp:+.1f}pp exceeds {band * 100:.1f}pp band"
+        elif threshold is not None:
+            reason = f"drift {drift_pp:+.1f}pp exceeds {threshold * 100:.2f}pp band"
         else:
             reason = f"{cur_w * 100:.1f}% vs {tgt_w * 100:.1f}% target"
         out.append(Suggestion(
