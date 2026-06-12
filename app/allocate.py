@@ -5,11 +5,14 @@ this module decides **what the target should be**: pure functions over a univers
 and its price history. It plugs in one step upstream of the rebalance machinery —
 its output is a target-weight dict, the same shape `events.load_target` returns.
 
+`allocate(rule, universe, series, cap=…)` is THE entry point: it dispatches to the
+registered rule and enforces the **discipline-vs-edge gate** itself, so no caller
+(CLI, MCP tool, future searcher) can reach an unvalidated edge rule by accident.
 All current rules are *discipline*: they make no claim to beat the market (no
 return forecast), so they need no backtest to be honest and may always produce a
-target — mirroring the `strategy.py` discipline-vs-edge gate. An *edge* allocator
-(e.g. mean-variance optimization, which overfits out-of-sample — see `examples/`
-05–06) would be classified ``edge`` and gated behind a walk-forward backtest.
+target. An *edge* allocator (e.g. mean-variance optimization, which overfits
+out-of-sample — see `examples/` 05–06) registers as ``edge`` and raises
+`UnvalidatedEdgeError` until walk-forward machinery passes ``validated=True``.
 
 Rules:
     equal_weight   1/N over the universe — the robust baseline.
@@ -24,11 +27,22 @@ from __future__ import annotations
 
 import logging
 import math
-from typing import Literal, get_args
+from typing import TYPE_CHECKING, Literal, get_args
 
 import pandas as pd
 
+from app.events import CASH_TICKER
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    _RuleFn = Callable[[list[str], dict[str, pd.Series[float]] | None], dict[str, float]]
+
 log = logging.getLogger(__name__)
+
+
+class UnvalidatedEdgeError(ValueError):
+    """An edge allocation rule was invoked without walk-forward validation."""
 
 AllocationRule = Literal["equal_weight", "inverse_vol"]
 VALID_RULES: frozenset[str] = frozenset(get_args(AllocationRule))
@@ -126,3 +140,73 @@ def apply_caps(weights: dict[str, float], cap: float) -> dict[str, float]:
             if v < cap - 1e-12:
                 w[k] = v + excess * (v / under_total)
     return w
+
+
+# --- The dispatcher: one entry point, gate inside ---
+
+def _run_equal_weight(
+    universe: list[str], series: dict[str, pd.Series[float]] | None
+) -> dict[str, float]:
+    return equal_weight(universe)
+
+
+def _run_inverse_vol(
+    universe: list[str], series: dict[str, pd.Series[float]] | None
+) -> dict[str, float]:
+    if series is None:
+        msg = "inverse_vol needs price history (series_by_ticker)"
+        raise ValueError(msg)
+    rows = {tk: s for tk in universe if (s := series.get(tk)) is not None and not s.empty}
+    dropped = sorted(set(universe) - set(rows))
+    if dropped:
+        log.warning("allocate inverse_vol: no price history for %s", ", ".join(dropped))
+    return inverse_vol(rows)
+
+
+# Runtime registry: adding a rule = one entry here + one in _RULE_KIND (edge rules
+# MUST register their kind, or the unknown→edge default blocks them — fail-safe).
+_RULES: dict[str, _RuleFn] = {
+    "equal_weight": _run_equal_weight,
+    "inverse_vol": _run_inverse_vol,
+}
+
+# Rules that require price history; the CLI uses this to decide whether to fetch.
+NEEDS_SERIES: frozenset[str] = frozenset({"inverse_vol"})
+
+
+def needs_series(rule: str) -> bool:
+    """True if the rule weighs on price history (the caller must supply series)."""
+    return rule in NEEDS_SERIES
+
+
+def allocate(
+    rule: str,
+    universe: list[str],
+    series_by_ticker: dict[str, pd.Series[float]] | None = None,
+    *,
+    cap: float | None = None,
+    validated: bool = False,
+) -> dict[str, float]:
+    """Produce a target allocation: dispatch + gate + universe hygiene + caps.
+
+    The chokepoint for ALL allocation: an unknown rule raises ValueError; an
+    ``edge`` rule raises UnvalidatedEdgeError unless ``validated=True`` (which only
+    walk-forward machinery may pass); the CASH pseudo-ticker is never allocated;
+    ``cap`` applies `apply_caps` (its ValueError on an infeasible cap propagates).
+    Returns {} when no usable weights exist (empty universe, no risk signal).
+    """
+    runner = _RULES.get(rule)
+    if runner is None:
+        msg = f"unknown allocation rule {rule!r}; valid: {sorted(_RULES)}"
+        raise ValueError(msg)
+    if allocation_kind(rule) != "discipline" and not validated:
+        msg = (
+            f"{rule!r} is an edge allocator and may not produce a target until a "
+            "walk-forward backtest validates it"
+        )
+        raise UnvalidatedEdgeError(msg)
+    clean = [tk for tk in universe if tk != CASH_TICKER]
+    target = runner(clean, series_by_ticker)
+    if cap is not None and target:
+        target = apply_caps(target, cap)
+    return target

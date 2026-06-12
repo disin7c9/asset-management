@@ -897,6 +897,24 @@ def test_allocate_inverse_vol_reuses_fetched_series(
     assert len(calls) == 1, calls  # reused the first fetch, did not refetch
 
 
+def test_allocate_edge_rule_refused_before_prices_check(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str],
+) -> None:
+    # Ordering contract: an (hypothetical) edge rule is REFUSED before the prices
+    # check or any series fetch — the run log must say "refused", never
+    # "skipped: --no-prices", and no network work may happen first. The CLI
+    # fast-fail mirrors the dispatcher's authoritative gate.
+    import app.allocate as A
+
+    monkeypatch.setitem(A._RULE_KIND, "equal_weight", "edge")  # make a real choice edge
+    with caplog.at_level(logging.INFO):
+        rc = main(["--csv", str(SAMPLE), "--no-prices", "--allocate", "equal_weight"])
+    capsys.readouterr()
+    assert rc == 0
+    assert _run_summary(caplog)["allocate"] == "refused: equal_weight unvalidated edge"
+
+
 def test_allocate_survives_unwritable_out_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str],

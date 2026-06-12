@@ -1,4 +1,5 @@
-"""Tests for the allocation library (slice 9): equal_weight, inverse_vol, caps."""
+"""Tests for the allocation library: the allocate() dispatcher (gate inside),
+equal_weight, inverse_vol, caps."""
 
 from __future__ import annotations
 
@@ -7,7 +8,18 @@ from math import isclose
 import pandas as pd
 import pytest
 
-from app.allocate import allocation_kind, apply_caps, equal_weight, inverse_vol
+import app.allocate as A
+from app.allocate import (
+    VALID_RULES,
+    UnvalidatedEdgeError,
+    allocate,
+    allocation_kind,
+    apply_caps,
+    equal_weight,
+    inverse_vol,
+    needs_series,
+)
+from app.events import CASH_TICKER
 
 
 def _series(values: list[float], start: str = "2024-01-01") -> "pd.Series[float]":
@@ -77,3 +89,76 @@ def test_allocation_kind() -> None:
     assert allocation_kind("equal_weight") == "discipline"
     assert allocation_kind("inverse_vol") == "discipline"
     assert allocation_kind("mystery_optimizer") == "edge"  # unknown → fail-safe
+
+
+# --- The allocate() dispatcher: one entry point, gate inside ---
+
+
+def test_allocate_dispatches_equal_weight() -> None:
+    w = allocate("equal_weight", ["BND", "VOO"])
+    assert w == equal_weight(["BND", "VOO"])
+    assert isclose(sum(w.values()), 1.0)
+
+
+def test_allocate_dispatches_inverse_vol_restricted_to_universe() -> None:
+    calm = _series([100, 100.1, 100.0, 100.1, 100.0, 100.1])
+    bumpy = _series([100, 110, 92, 115, 88, 112])
+    series = {"CALM": calm, "BUMPY": bumpy, "EXTRA": bumpy}  # EXTRA not in universe
+    w = allocate("inverse_vol", ["CALM", "BUMPY"], series)
+    assert set(w) == {"CALM", "BUMPY"}  # the extra series is ignored
+    assert w == inverse_vol({"CALM": calm, "BUMPY": bumpy})
+
+
+def test_allocate_applies_cap() -> None:
+    calm = _series([100, 100.1, 100.0, 100.1, 100.0, 100.1])
+    bumpy = _series([100, 110, 92, 115, 88, 112])
+    w = allocate("inverse_vol", ["CALM", "BUMPY"], {"CALM": calm, "BUMPY": bumpy}, cap=0.60)
+    assert max(w.values()) <= 0.60 + 1e-9
+    assert isclose(sum(w.values()), 1.0)
+
+
+def test_allocate_infeasible_cap_raises() -> None:
+    with pytest.raises(ValueError, match="too small"):
+        allocate("equal_weight", ["A", "B"], cap=0.30)  # 0.3 * 2 < 1
+
+
+def test_allocate_unknown_rule_raises() -> None:
+    with pytest.raises(ValueError, match="unknown allocation rule"):
+        allocate("mystery_optimizer", ["VOO"])
+
+
+def test_allocate_excludes_cash_pseudo_ticker() -> None:
+    w = allocate("equal_weight", ["VOO", CASH_TICKER, "BND"])
+    assert CASH_TICKER not in w
+    assert set(w) == {"VOO", "BND"}
+
+
+def test_allocate_inverse_vol_without_series_raises() -> None:
+    with pytest.raises(ValueError, match="needs price history"):
+        allocate("inverse_vol", ["VOO"])
+
+
+def test_needs_series() -> None:
+    assert needs_series("inverse_vol")
+    assert not needs_series("equal_weight")
+
+
+def test_allocate_edge_rule_gated_inside_dispatcher(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # THE altitude fix: register a fake edge rule and call the dispatcher directly
+    # (no CLI involved). The gate must fire inside allocate() itself, and only the
+    # walk-forward machinery's validated=True may open it.
+    monkeypatch.setitem(A._RULES, "fake_optimizer", lambda universe, series: {"VOO": 1.0})
+    assert allocation_kind("fake_optimizer") == "edge"  # unregistered kind → fail-safe
+    with pytest.raises(UnvalidatedEdgeError, match="walk-forward"):
+        allocate("fake_optimizer", ["VOO"])
+    assert allocate("fake_optimizer", ["VOO"], validated=True) == {"VOO": 1.0}
+
+
+def test_rule_registries_stay_in_sync() -> None:
+    # argparse offers VALID_RULES (from the Literal); the dispatcher runs _RULES;
+    # _RULE_KIND gates them. A rule added to one but not the others either errors at
+    # runtime ("unknown allocation rule") or is silently blocked as edge — pin them.
+    assert set(A._RULES) == set(VALID_RULES)
+    assert set(A._RULE_KIND) >= set(A._RULES)  # every runnable rule has an explicit kind

@@ -45,7 +45,13 @@ from app.returns import (
     value_curve,
 )
 from app.risk import DollarDrawdown, RiskSummary, dollar_drawdown, summarize_risk
-from app.allocate import VALID_RULES, allocation_kind, apply_caps, equal_weight, inverse_vol
+from app.allocate import (
+    VALID_RULES,
+    UnvalidatedEdgeError,
+    allocate,
+    allocation_kind,
+    needs_series,
+)
 from app.backtest import BacktestResult, backtest_compare
 from app.strategy import VALID_MODES, Suggestion, may_suggest, suggest
 
@@ -754,11 +760,13 @@ def _compute_allocation(
     (no second round-trip) and only fetches when it's absent (the --no-risk path)."""
     rule = args.allocate
     if allocation_kind(rule) != "discipline":
-        # Dormant guard (every CLI choice is discipline); the chokepoint for any
-        # future edge allocator (e.g. an optimizer) — it must be validated first.
+        # Fast-fail courtesy check: refuse an edge rule BEFORE the prices check or
+        # any series fetch, so the run log says "refused" (not "skipped") and no
+        # network round-trip is wasted. The dispatcher's gate inside allocate()
+        # stays the authoritative one for every caller.
         log.warning(
-            "%r is an edge allocator and must pass a walk-forward backtest before it "
-            "may produce a target (not implemented in v1)", rule,
+            "--allocate: %r is an edge allocator and may not produce a target until "
+            "a walk-forward backtest validates it", rule,
         )
         run["allocate"] = f"refused: {rule} unvalidated edge"
         return
@@ -767,19 +775,14 @@ def _compute_allocation(
         run["allocate"] = "skipped: --no-prices"
         return
     values = _held_market_value(state, prices)
-    # Never re-weight the CASH pseudo-ticker: it's a cash balance, not a holding to
-    # allocate. Today it's excluded incidentally (0 shares → not in held(); unpriced),
-    # but make it explicit so a future change (e.g. pricing cash at $1) can't silently
-    # pull it into the weights and dilute every real holding.
-    priced = sorted(tk for tk in values if tk != CASH_TICKER)
+    priced = sorted(values)  # CASH never reaches here (not held); allocate() also guards
     if not priced:
         log.warning("--allocate: no priced holdings to allocate over")
         run["allocate"] = "skipped: no prices"
         return
 
-    if rule == "equal_weight":
-        target = equal_weight(priced)
-    else:  # inverse_vol — needs return history to size each holding's volatility
+    rows = None
+    if needs_series(rule):  # rule weighs on return history (inverse_vol)
         src = series  # reuse the history already fetched for the brief (no refetch)
         if src is None:  # --no-risk path: nothing fetched yet → fetch now AND record it
             start = today - timedelta(days=400)  # ~13 months → a full year of returns
@@ -791,26 +794,26 @@ def _compute_allocation(
             run["fallbacks_used"] += src.fallbacks_used
             if src.missing and run["status"] == "ok":
                 run["status"] = "partial"
-        rows = {
-            tk: s for tk in priced
-            if (s := src.rows.get(tk)) is not None and not s.empty
-        }
-        target = inverse_vol(rows)
-        dropped = [tk for tk in priced if tk not in rows]
-        if dropped:
-            log.warning("--allocate inverse_vol: no price history for %s", ", ".join(dropped))
+        rows = src.rows
+
+    try:
+        # The dispatcher enforces the discipline-vs-edge gate itself — the CLI no
+        # longer pre-checks, so a future edge rule is blocked at the chokepoint
+        # for every caller, not just this one.
+        target = allocate(rule, priced, rows, cap=args.allocate_cap)
+    except UnvalidatedEdgeError as exc:
+        log.warning("--allocate: %s", exc)
+        run["allocate"] = f"refused: {rule} unvalidated edge"
+        return
+    except ValueError as exc:  # infeasible --allocate-cap (cap * n < 1)
+        log.error("--allocate-cap: %s", exc)
+        run["allocate"] = "skipped: bad cap"
+        return
 
     if not target:
         log.warning("--allocate: could not compute weights")
         run["allocate"] = "skipped: no weights"
         return
-    if args.allocate_cap is not None:
-        try:
-            target = apply_caps(target, args.allocate_cap)
-        except ValueError as exc:
-            log.error("--allocate-cap: %s", exc)
-            run["allocate"] = "skipped: bad cap"
-            return
 
     omitted = sorted(set(state.held()) - set(target))  # held but unpriced / no history
     wrote_to = args.allocate_out
