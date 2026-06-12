@@ -10,7 +10,10 @@ import os
 import sys
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    import pandas as pd
 
 from dotenv import load_dotenv
 
@@ -20,6 +23,7 @@ from app.email import send_report
 from app.events import CASH_TICKER, Event, load_events, load_target
 from app.log_config import setup_logging
 from app.metadata import MetadataResult, fetch_metadata
+from app.screen import CandidateScreen, screen_candidates
 from app.prices import (
     PriceRow,
     PricesResult,
@@ -122,6 +126,16 @@ def main(argv: list[str] | None = None) -> int:
         help="add a SECURITIES panel: expense ratio, AUM, liquidity, age, category per "
         "holding (published fund facts via yfinance, cached for 7 days; works with "
         "--offline from cache)",
+    )
+    parser.add_argument(
+        "--screen",
+        metavar="TICKERS",
+        default=None,
+        help="judge NEW candidate tickers against your book (comma-separated, e.g. "
+        "QQQM,SCHD): diversifier/cost/liquidity/age/concentration/structure/overlap "
+        "checks, each with a named reason. Needs the price pipeline (not compatible "
+        "with --no-prices/--no-risk) and is propose-only (no --rebalance/--backtest/"
+        "--allocate in the same run).",
     )
     parser.add_argument(
         "--save",
@@ -244,6 +258,12 @@ def main(argv: list[str] | None = None) -> int:
             "--allocate is propose-only; run it first (optionally with --allocate-out FILE), "
             "then --backtest / --rebalance --target FILE in a SEPARATE command"
         )
+    if args.screen and (args.rebalance or args.backtest or args.allocate):
+        # Same discipline: judge candidates first, decide/simulate in a separate run.
+        parser.error(
+            "--screen is propose-only; review the verdicts, then act "
+            "(--allocate / --rebalance / --backtest) in a SEPARATE command"
+        )
     if args.allocate_out is not None and not args.allocate:
         parser.error("--allocate-out has no effect without --allocate")
     # No silent sample fallback: book-dependent actions operate on YOUR holdings, so
@@ -251,7 +271,7 @@ def main(argv: list[str] | None = None) -> int:
     # exempt; the bundled example is opt-in via an explicit --csv path.
     needs_book = bool(
         args.rebalance or args.allocate or args.dump_target or args.save or args.send
-        or args.metadata
+        or args.metadata or args.screen
     )
     # Personal defaults from .env (gitignored; loaded above). ASSET_CSV fills --csv
     # for runs that want a book; a pure `--backtest --target` run stays notional
@@ -292,6 +312,7 @@ def main(argv: list[str] | None = None) -> int:
         "backtest": None,
         "allocate": None,
         "metadata": None,
+        "screen": None,
     }
 
     # Nothing to do: no book and no notional backtest → guide, don't fabricate a brief.
@@ -361,9 +382,10 @@ def main(argv: list[str] | None = None) -> int:
     twr_excluded: list[str] = []
     dollar_dd: DollarDrawdown | None = None
     series: SeriesResult | None = None
+    daily: pd.Series[float] | None = None
 
     if not args.no_prices and state.held():
-        prices, returns, risk, missing, twr_excluded, dollar_dd, series = (
+        prices, returns, risk, missing, twr_excluded, dollar_dd, series, daily = (
             _compute_prices_returns_risk(events, state, args, run)
         )
 
@@ -393,11 +415,15 @@ def main(argv: list[str] | None = None) -> int:
         if meta.missing and run["status"] == "ok":
             run["status"] = "partial"
 
+    cands: list[CandidateScreen] | None = None
+    if args.screen:
+        cands = _compute_screen(state, args, run, today, daily)
+
     data = build_report_data(
         state, prices=prices, returns=returns, risk=risk,
         suggestions=suggestions, backtest=backtest, missing_tickers=missing,
         asof=today, generated_at=datetime.now(timezone.utc), twr_excluded=twr_excluded,
-        dollar_dd=dollar_dd, metadata=meta,
+        dollar_dd=dollar_dd, metadata=meta, candidates=cands,
     )
 
     sys.stdout.write(render_text(data) + "\n")
@@ -458,6 +484,7 @@ def _compute_prices_returns_risk(
     list[str],
     DollarDrawdown | None,
     SeriesResult | None,
+    "pd.Series[float] | None",
 ]:
     """Fetch prices, derive returns + risk. Single price source per mode.
 
@@ -475,6 +502,7 @@ def _compute_prices_returns_risk(
     true_twr: float | None = None
     twr_excluded: list[str] = []
     dollar_dd: DollarDrawdown | None = None
+    daily: pd.Series[float] | None = None
 
     series = None
     if not args.no_risk and events:
@@ -484,10 +512,7 @@ def _compute_prices_returns_risk(
         traded = sorted({ev.ticker for ev in events} - {CASH_TICKER})
         start = min(ev.date for ev in events) - timedelta(days=5)
         series = fetch_series(traded, start, today, cache_dir=args.cache_dir, online=online)
-        run["n_series_fetched"] = len(series.rows)
-        run["n_series_missing"] = len(series.missing)
-        if series.missing and run["status"] == "ok":
-            run["status"] = "partial"
+        _record_series_fetch(run, series)
         if series.rows:
             # Guard against unhandled stock splits: the log holds raw share counts
             # but yfinance prices are split-adjusted, so a ticker that split during
@@ -535,7 +560,7 @@ def _compute_prices_returns_risk(
                     source=source,
                     fetched_at=fetched_at,
                 )
-        run["fallbacks_used"] = series.fallbacks_used
+        # (fallbacks already tallied by _record_series_fetch at fetch time)
     else:
         # No risk panel (or series unavailable): fetch latest prices for held.
         result: PricesResult = fetch_latest(
@@ -569,7 +594,7 @@ def _compute_prices_returns_risk(
     returns = summarize(
         events, mkt_value, asof_date=today, true_twr=true_twr, fully_priced=not missing
     )
-    return prices, returns, risk, missing, twr_excluded, dollar_dd, series
+    return prices, returns, risk, missing, twr_excluded, dollar_dd, series, daily
 
 
 def _held_market_value(
@@ -811,11 +836,7 @@ def _compute_allocation(
             src = fetch_series(
                 priced, start, today, cache_dir=args.cache_dir, online=not args.offline
             )
-            run["n_series_fetched"] += len(src.rows)
-            run["n_series_missing"] += len(src.missing)
-            run["fallbacks_used"] += src.fallbacks_used
-            if src.missing and run["status"] == "ok":
-                run["status"] = "partial"
+            _record_series_fetch(run, src)
         rows = src.rows
 
     try:
@@ -846,6 +867,65 @@ def _compute_allocation(
             wrote_to = None  # write failed (error already logged) — still show the preview
     _print_proposed_allocation(rule, target, values, omitted, wrote_to)
     run["allocate"] = rule
+
+
+def _record_series_fetch(run: dict[str, Any], series: SeriesResult) -> None:
+    """Tally one fetch_series result into the run summary — counts, fallbacks, and
+    the partial flip — so every fetching handler reports identically (the one
+    bookkeeping gate; copies had already drifted on which keys they touched)."""
+    run["n_series_fetched"] += len(series.rows)
+    run["n_series_missing"] += len(series.missing)
+    run["fallbacks_used"] += series.fallbacks_used
+    if series.missing and run["status"] == "ok":
+        run["status"] = "partial"
+
+
+def _compute_screen(
+    state: DerivedState,
+    args: argparse.Namespace,
+    run: dict[str, Any],
+    today: date,
+    daily: "pd.Series[float] | None",
+) -> list[CandidateScreen] | None:
+    """Judge NEW candidate tickers against the book (propose-only).
+
+    Fetches the candidates' price history + metadata, and the held tickers'
+    metadata (the overlap test compares look-through holdings), then hands
+    everything to the pure screen. Non-fatal: a missing pipeline or candidate
+    degrades with a logged reason — the rest of the brief still prints.
+    """
+    tickers = sorted({t.strip().upper() for t in args.screen.split(",") if t.strip()})
+    if CASH_TICKER in tickers:
+        # The pseudo-ticker is not a screenable security; dropping it here keeps
+        # fetch_series from a doomed network round-trip (metadata already skips it).
+        log.warning("--screen: %s is the cash pseudo-ticker, not a security; dropped", CASH_TICKER)
+        tickers = [t for t in tickers if t != CASH_TICKER]
+    if not tickers:
+        log.error("--screen: no tickers given")
+        run["screen"] = "skipped: no tickers"
+        return None
+    if daily is None or daily.empty:
+        # The diversifier test correlates against YOUR portfolio's return series,
+        # which only the full price pipeline produces.
+        log.warning("--screen needs the portfolio return series; remove --no-prices/--no-risk")
+        run["screen"] = "skipped: needs the price pipeline"
+        return None
+    online = not args.offline
+    start: date = daily.index[0].date()
+    cand_series = fetch_series(tickers, start, today, cache_dir=args.cache_dir, online=online)
+    _record_series_fetch(run, cand_series)
+    held = set(state.held())
+    tickers_set = set(tickers)
+    meta = fetch_metadata(sorted(tickers_set | held), cache_dir=args.cache_dir, online=online)
+    if meta.missing and run["status"] == "ok":
+        run["status"] = "partial"
+    held_meta = {tk: m for tk, m in meta.rows.items() if tk in held}
+    cand_meta = {tk: m for tk, m in meta.rows.items() if tk in tickers_set}
+    results = screen_candidates(
+        tickers, cand_series.rows, daily, cand_meta, held_meta, held, asof=today
+    )
+    run["screen"] = " ".join(f"{r.ticker}:{r.verdict}" for r in results)
+    return results
 
 
 def _compute_backtest(

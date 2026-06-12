@@ -31,6 +31,7 @@ from app.metadata import MetadataResult
 from app.prices import PriceRow
 from app.returns import ReturnsSummary
 from app.risk import NOISY_THRESHOLD_DAYS, DollarDrawdown, DrawdownInfo, MetricCI, RiskSummary
+from app.screen import CandidateScreen
 from app.strategy import Suggestion
 
 _NA = "n/a"
@@ -124,6 +125,7 @@ def build_report_data(
     twr_excluded: list[str] | None = None,
     dollar_dd: DollarDrawdown | None = None,
     metadata: MetadataResult | None = None,
+    candidates: list[CandidateScreen] | None = None,
 ) -> ReportData:
     """Assemble the deterministic brief as ordered sections.
 
@@ -159,6 +161,8 @@ def build_report_data(
         sections.append(_section_holdings(state, prices))
     if metadata is not None and (metadata.rows or metadata.missing):
         sections.append(_section_securities(metadata, asof))
+    if candidates:
+        sections.append(_section_candidates(candidates))
     if backtest is not None and backtest.legs:
         sections.append(_section_backtest(backtest))
 
@@ -393,6 +397,23 @@ def _section_securities(meta: MetadataResult, asof: date) -> Section:
     if meta.missing:
         lines.append(f"⚠ no metadata for: {', '.join(meta.missing)}")
     return Section("SECURITIES (know your holdings)", tuple(lines))
+
+
+def _section_candidates(results: list[CandidateScreen]) -> Section:
+    """The deterministic screen's verdicts — one block per candidate, every check
+    named with its reason. Honest framing is structural: a pass is "sane, cheap,
+    liquid, genuinely different", never a prediction."""
+    lines: list[str] = []
+    for r in results:
+        lines.append(f"{r.ticker} — {r.verdict.upper()}  ({r.counts()})")
+        for c in r.checks:
+            lines.append(f"  [{c.status:>4}] {c.name}: {c.reason}")
+        lines.append("")
+    lines.append(
+        "screen = published facts + price history; PASS is necessary, not sufficient "
+        "(no return prediction; the walk-forward role check is a separate step)"
+    )
+    return Section("CANDIDATES (deterministic screen)", tuple(lines))
 
 
 def _section_backtest(bt: BacktestResult) -> Section:

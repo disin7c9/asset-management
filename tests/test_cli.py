@@ -292,6 +292,8 @@ def test_book_action_without_csv_errors() -> None:
         ["--dump-target", "/tmp/whatever.csv"],
         ["--save"],
         ["--send"],
+        ["--metadata"],
+        ["--screen", "QQQM"],
     ):
         with pytest.raises(SystemExit):
             main(argv)
@@ -336,6 +338,83 @@ def test_backtest_without_csv_is_simulation_only(
     assert "=== BACKTEST" in out          # the simulation prints
     assert "=== HOLDINGS ===" not in out  # but NO holdings/status (no book given)
     assert "=== DRAWDOWN" not in out
+
+
+def test_screen_refuses_act_or_simulate_combos() -> None:
+    # Propose-only: judge candidates first, act in a separate command.
+    for extra in (
+        ["--rebalance", "to_total", "--target", str(TARGET)],
+        ["--backtest", "--target", str(TARGET)],
+        ["--allocate", "equal_weight"],
+    ):
+        with pytest.raises(SystemExit):
+            main(["--csv", str(SAMPLE), "--screen", "QQQM", *extra])
+
+
+def test_screen_panel_renders_with_verdicts(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str],
+) -> None:
+    # Plumbing test (the screen MATH is golden-tested in test_screen.py): the
+    # panel renders, every check ran, and the run summary records the verdict.
+    # With this fixture the deterministic outcome is WARN — the synthetic flat
+    # series gives a low ρ (the sample book's dividend/sell days spike the
+    # flow-neutralized returns), and the canned metadata has no look-through
+    # holdings, so overlap falls back to "same category as held" → warn.
+    # (The split guard would exclude tickers whose synthetic series disagrees
+    # with the sample book's execution prices — irrelevant here; neutralize it.)
+    from app.metadata import MetadataResult, SecurityMeta
+
+    monkeypatch.setattr("app.cli.fetch_series", _flat_series)
+    monkeypatch.setattr("app.cli.price_basis_mismatches", lambda *a, **k: [])
+
+    def fake_meta(tickers, **k):  # type: ignore[no-untyped-def]
+        rows = {
+            tk: SecurityMeta(
+                ticker=tk, expense_ratio=0.0003, aum=5e9, avg_volume=2e6,
+                category="Large Blend", family="Vanguard", legal_type="Exchange Traded Fund",
+                quote_type="ETF", inception=date(2015, 1, 1),
+            )
+            for tk in tickers
+        }
+        return MetadataResult(rows=rows)
+
+    monkeypatch.setattr("app.cli.fetch_metadata", fake_meta)
+    with caplog.at_level(logging.INFO):
+        rc = main(["--csv", str(SAMPLE), "--screen", "QQQM"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "CANDIDATES (deterministic screen)" in out
+    assert "QQQM — WARN" in out
+    assert "ρ=" in out                       # the diversifier test ran against the book
+    assert "same category" in out            # overlap fell back to category (no holdings)
+    assert "[pass] cost: 0.03%" in out       # metadata checks ran
+    assert _run_summary(caplog)["screen"] == "QQQM:warn"
+
+
+def test_screen_drops_cash_pseudo_ticker(
+    caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str],
+) -> None:
+    # Regression (review 2026-06-12): CASH in the candidate list must be dropped
+    # before any fetch (it's not a screenable security) — a CASH-only screen
+    # degrades to "no tickers" instead of a doomed network fetch + partial status.
+    with caplog.at_level(logging.INFO):
+        rc = main(["--csv", str(SAMPLE), "--no-prices", "--screen", "CASH"])
+    capsys.readouterr()
+    assert rc == 0
+    assert _run_summary(caplog)["screen"] == "skipped: no tickers"
+    assert "cash pseudo-ticker" in caplog.text
+
+
+def test_screen_skipped_without_price_pipeline(
+    caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str],
+) -> None:
+    # The diversifier needs the portfolio return series; --no-prices can't supply it.
+    with caplog.at_level(logging.INFO):
+        rc = main(["--csv", str(SAMPLE), "--no-prices", "--screen", "QQQM"])
+    capsys.readouterr()
+    assert rc == 0
+    assert _run_summary(caplog)["screen"] == "skipped: needs the price pipeline"
 
 
 def _canned_meta() -> object:
