@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import date
 from math import isclose
 from pathlib import Path
@@ -138,46 +139,87 @@ def test_standalone_fee_event_nets_into_realized() -> None:
     assert isclose(state.total_fees(), 0.30)
 
 
-# --- Known, DEFERRED bugs: pinned so the eventual fix is detectable ---
-# These document CURRENT (acknowledged-wrong) behavior, per the project's
-# reproduce-then-pin discipline. When the "route cash events by kind" fix lands,
-# these assertions should flip and the tests be updated. See the v1.x roadmap memo
-# (slice-8 derive deferred items). Surfaced by the 2026-06-09 whole-program review.
+# --- Cash routed by kind (the slice-8 deferred fix, landed v1.5.0) ---
+# Rows on the CASH pseudo-ticker are cash-account effects: they net into
+# cash_realized (counted in total_realized) but never create a Position or a
+# per-security realized entry. Surfaced by the 2026-06-09 whole-program review.
 
 
-def test_unmatched_tax_on_cash_ticker_creates_phantom_realized_known_bug() -> None:
+def test_unmatched_tax_on_cash_ticker_is_a_cash_account_cost() -> None:
     """A fee/tax row coded to the CASH pseudo-ticker (e.g. a withholding tax an
-    exporter couldn't attach to a specific holding) lands in realized[CASH] and
-    creates a phantom zero-share CASH position, instead of being treated purely as a
-    cash-balance effect. PINS the current behavior."""
+    exporter couldn't attach to a specific holding) nets into cash_realized — it
+    still reduces total realized P&L, but no phantom CASH position or per-security
+    realized entry is created."""
     state = derive([Event(date(2024, 1, 1), CASH_TICKER, "fee", quantity=0.0, price=0.0, fee=3.50)])
-    # BUG: the tax is netted into realized P&L under the CASH ticker.
-    assert state.realized.get(CASH_TICKER) is not None
-    assert isclose(state.realized[CASH_TICKER], -3.50)
-    # A zero-share CASH position is created, though held() correctly hides it (so it
-    # never reaches holdings sizing or the allocation universe).
-    assert CASH_TICKER in state.positions
-    assert CASH_TICKER not in state.held()
+    assert isclose(state.cash_realized, -3.50)
+    assert isclose(state.total_realized(), -3.50)  # the cost still counts in the total
+    assert CASH_TICKER not in state.realized  # no per-security attribution
+    assert CASH_TICKER not in state.positions  # no phantom position
+    assert isclose(state.total_fees(), 3.50)  # still tracked informationally
 
 
-def test_fee_listed_on_trade_and_standalone_is_double_counted_known_bug() -> None:
+def test_interest_on_cash_is_cash_account_income() -> None:
+    # Broker interest on idle cash (the Shinhan 외화예탁금이용료 row) is real income:
+    # it counts in total_realized via cash_realized, without fabricating a CASH
+    # position or a realized["CASH"] entry.
+    state = derive(
+        [Event(date(2024, 3, 1), CASH_TICKER, "interest", quantity=0.0, price=0.0,
+               fee=0.0, cash=12.0)]
+    )
+    assert isclose(state.cash_realized, 12.0)
+    assert isclose(state.total_realized(), 12.0)
+    assert CASH_TICKER not in state.realized
+    assert CASH_TICKER not in state.positions
+
+
+def test_trade_of_cash_pseudo_ticker_is_rejected() -> None:
+    # CASH is not a security; a buy/sell row on it is an importer error, not a
+    # position to be silently created.
+    with pytest.raises(ValueError, match="CASH pseudo-ticker"):
+        derive([Event(date(2024, 1, 1), CASH_TICKER, "buy", quantity=1.0, price=1.0, fee=0.0)])
+
+
+def test_deposit_on_security_ticker_is_rejected() -> None:
+    # The symmetric guard: an external cash flow mis-tickered to a security would
+    # otherwise vanish silently from all accounting.
+    with pytest.raises(ValueError, match="must use the CASH pseudo-ticker"):
+        derive([Event(date(2024, 1, 1), "VOO", "deposit", quantity=0.0, price=0.0,
+                      fee=0.0, cash=500.0)])
+
+
+def test_fee_listed_on_trade_and_standalone_double_counts_but_warns(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """If an importer lists the same cost BOTH embedded in a trade row's Fee column
     AND as a separate fee line, derive counts it twice — once raising cost basis (via
-    the buy fee) and again subtracted directly from realized (the standalone fee). The
-    correct-once realized here would be +5.0; the double-count drives it to 0.0. PINS
-    the current behavior (the standalone-fee action itself is correct for a genuine
-    separate tax — see test_standalone_fee_event_nets_into_realized; the bug is only
-    the DUPLICATED cost)."""
+    the buy fee) and again subtracted from realized (the standalone fee). Derive
+    cannot tell a duplicate from two genuine same-amount fees, so the importer
+    contract is "a cost appears exactly once" and derive WARNS on the suspicious
+    pattern (same-day, same-ticker, same amount) instead of silently double-counting."""
     events = [  # the same $5 commission listed twice: on the buy row and as its own line
         Event(date(2024, 1, 1), "VOO", "buy", quantity=1.0, price=100.0, fee=5.0),
         Event(date(2024, 1, 1), "VOO", "fee", quantity=0.0, price=0.0, fee=5.0),
         Event(date(2024, 6, 1), "VOO", "sell", quantity=1.0, price=110.0, fee=0.0),
     ]
-    state = derive(events)
-    # Sell realizes 110 − 105(basis incl. buy fee) = +5; the standalone fee subtracts
-    # another 5 → 0.0. The $5 has been counted twice (basis AND realized).
+    with caplog.at_level(logging.WARNING, logger="app.derive"):
+        state = derive(events)
+    # The double-count itself is unchanged (derive can't know it's the same $5)…
     assert isclose(state.realized["VOO"], 0.0)
-    assert isclose(state.total_fees(), 10.0)  # both fee rows also counted in total_fees
+    assert isclose(state.total_fees(), 10.0)
+    # …but it is no longer silent.
+    assert any("matches a same-day trade-row fee" in r.message for r in caplog.records)
+
+
+def test_distinct_standalone_fee_does_not_warn(caplog: pytest.LogCaptureFixture) -> None:
+    # A standalone fee that does NOT match any same-day trade-row fee (different
+    # amount) is the legitimate case (e.g. a separate tax) — no warning.
+    events = [
+        Event(date(2024, 1, 1), "VOO", "buy", quantity=1.0, price=100.0, fee=5.0),
+        Event(date(2024, 1, 1), "VOO", "fee", quantity=0.0, price=0.0, fee=0.30),
+    ]
+    with caplog.at_level(logging.WARNING, logger="app.derive"):
+        derive(events)
+    assert not any("matches a same-day trade-row fee" in r.message for r in caplog.records)
 
 
 @given(
