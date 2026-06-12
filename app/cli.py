@@ -6,6 +6,7 @@ import argparse
 import csv
 import json
 import logging
+import os
 import sys
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -57,6 +58,21 @@ _DEFAULT_CACHE: Path = _REPO_ROOT / "data" / "prices"
 _DEFAULT_REPORTS: Path = _REPO_ROOT / "reports"
 
 
+def _env_path(var: str) -> Path | None:
+    """Read a path from an env var (the .env personal defaults), or None if unset.
+
+    `~` is expanded; a relative path is repo-relative (that's where .env lives),
+    so the default works from any working directory.
+    """
+    raw = os.environ.get(var, "").strip()
+    if not raw:
+        return None
+    p = Path(raw).expanduser()
+    resolved = p if p.is_absolute() else _REPO_ROOT / p
+    log.info("using %s from .env: %s", var, resolved)
+    return resolved
+
+
 def main(argv: list[str] | None = None) -> int:
     setup_logging()
     load_dotenv(_REPO_ROOT / ".env")  # RESEND_API_KEY / REPORT_TO for --send
@@ -67,7 +83,8 @@ def main(argv: list[str] | None = None) -> int:
         default=None,  # None = not given → print a usage hint (no silent sample); the sample is opt-in
         help="path to YOUR ghostfolio-format transaction CSV. Required for the brief and for "
         "--rebalance/--allocate/--dump-target/--save/--send. The bundled example is opt-in: "
-        "pass --csv data/sample_data/transactions.csv. (--backtest --target works without it.)",
+        "pass --csv data/sample_data/transactions.csv. (--backtest --target works without it.) "
+        "Set ASSET_CSV in .env to make your book the default for book runs.",
     )
     parser.add_argument(
         "--cache-dir",
@@ -120,7 +137,8 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="target-allocation CSV (Ticker,Weight); REQUIRED with --rebalance. A target "
         "is a COMPLETE spec: held tickers not listed are sold to $0. Bootstrap one with "
-        "--dump-target, or use data/sample_data/target.csv for the bundled example.",
+        "--dump-target, or use data/sample_data/target.csv for the bundled example. "
+        "Set ASSET_TARGET in .env to make it the default.",
     )
     parser.add_argument(
         "--dump-target",
@@ -199,11 +217,6 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--new-cash must be >= 0")
     if args.band_rel <= 0.0:
         parser.error("--band-rel must be > 0 (a fraction of the target weight, e.g. 0.25 = 25%)")
-    if (args.rebalance or args.backtest) and args.target is None:
-        parser.error(
-            "--rebalance/--backtest require --target (bootstrap one from your holdings "
-            "with --dump-target PATH, or pass data/sample_data/target.csv for the example)"
-        )
     if args.backtest_start is not None and args.backtest_start > date.today():
         parser.error("--backtest-start must not be in the future")
     if args.allocate_cap is not None and not 0.0 < args.allocate_cap <= 1.0:
@@ -225,10 +238,25 @@ def main(argv: list[str] | None = None) -> int:
     needs_book = bool(
         args.rebalance or args.allocate or args.dump_target or args.save or args.send
     )
+    # Personal defaults from .env (gitignored; loaded above). ASSET_CSV fills --csv
+    # for runs that want a book; a pure `--backtest --target` run stays notional
+    # (book-free) by contract — pass --csv explicitly to include your book there.
+    # ASSET_TARGET fills --target only when a rule needs one. Explicit flags win.
+    if args.csv is None and (needs_book or not args.backtest):
+        args.csv = _env_path("ASSET_CSV")
+    if args.target is None and (args.rebalance or args.backtest):
+        args.target = _env_path("ASSET_TARGET")
+    if (args.rebalance or args.backtest) and args.target is None:
+        parser.error(
+            "--rebalance/--backtest require --target (bootstrap one from your holdings "
+            "with --dump-target PATH, or pass data/sample_data/target.csv for the example; "
+            "or set ASSET_TARGET in .env)"
+        )
     if args.csv is None and needs_book:
         parser.error(
             "this run needs your transaction log — pass --csv PATH "
-            "(or the bundled example: --csv data/sample_data/transactions.csv). "
+            "(or the bundled example: --csv data/sample_data/transactions.csv; "
+            "or set ASSET_CSV in .env). "
             "Only '--backtest --target FILE' runs without --csv."
         )
     today = date.today()  # one as-of date for the title, the filename, and the log
@@ -257,6 +285,7 @@ def main(argv: list[str] | None = None) -> int:
             "  uv run python -m app --csv your_transactions.csv\n"
             "or try the bundled example:\n"
             "  uv run python -m app --csv data/sample_data/transactions.csv\n"
+            "or set ASSET_CSV=path/to/your.csv in .env to make it the default.\n"
             "(to backtest a target without a book: --backtest --target FILE; "
             "see --help for all options)\n"
         )

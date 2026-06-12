@@ -43,7 +43,9 @@ The report is **composable panels**, not exclusive modes — combine flags and t
 | `--allocate RULE` | `--csv` | propose a target by re-weighting your holdings (write it with `--allocate-out`) |
 | `--backtest` | `--target` | notional rebalance-vs-buy-and-hold — **no `--csv`**; prints the simulation alone |
 
-There is **no silent default**: a book-dependent action without `--csv` errors out, and a bare `python -m app` prints a hint — the bundled example is opt-in (`--csv data/sample_data/transactions.csv`), never assumed. `--allocate` is **propose-only** and cannot be combined with `--rebalance`/`--backtest` (review the written file, then act on it in a separate command). A `target.csv` is one you create with `--dump-target` / `--allocate-out` (or use `data/sample_data/target.csv`).
+There is **no silent built-in default**: a book-dependent action without `--csv` errors out, and a bare `python -m app` prints a hint — the bundled example is opt-in (`--csv data/sample_data/transactions.csv`), never assumed. `--allocate` is **propose-only** and cannot be combined with `--rebalance`/`--backtest` (review the written file, then act on it in a separate command). A `target.csv` is one you create with `--dump-target` / `--allocate-out` (or use `data/sample_data/target.csv`).
+
+**Your own default** lives in a gitignored `.env` at the repo root: set `ASSET_CSV=path/to/your.csv` (and optionally `ASSET_TARGET=path/to/target.csv`; `~` is expanded, relative paths resolve against the repo root) and a bare `python -m app` becomes your brief, `--rebalance MODE` alone works, etc. Explicit flags always win, and the pure `--backtest --target` run stays book-free by contract — pass `--csv` explicitly to stack your status panel onto a backtest.
 
 ## Choose a target — the strategy engine
 

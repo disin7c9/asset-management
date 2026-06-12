@@ -39,6 +39,16 @@ def _no_network_splits(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("app.cli.fetch_splits", lambda *a, **k: {})
 
 
+@pytest.fixture(autouse=True)
+def _hermetic_env_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    # cli reads ASSET_CSV / ASSET_TARGET as personal .env fallbacks. Pin them to ""
+    # (treated as unset; load_dotenv never overrides an existing var) so the
+    # contract tests keep working once the developer's real .env sets them. The
+    # env-fallback tests below setenv real values over this.
+    monkeypatch.setenv("ASSET_CSV", "")
+    monkeypatch.setenv("ASSET_TARGET", "")
+
+
 def _today() -> str:
     # Must match cli.main's `today = date.today()` (local), which dates the file.
     return date.today().isoformat()
@@ -296,11 +306,8 @@ def test_bare_run_prints_hint_not_a_brief(capsys: pytest.CaptureFixture[str]) ->
     assert "=== HOLDINGS ===" not in out  # nothing fabricated
 
 
-def test_backtest_without_csv_is_simulation_only(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
-) -> None:
-    # --backtest is notional (target-only): with no --csv it prints ONLY the
-    # simulation — no fabricated holdings/status from the bundled sample.
+def _mock_backtest_series(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Patch fetch_series with 120 business days of gently rising sample-ticker prices."""
     import pandas as pd
 
     dates = pd.bdate_range("2024-01-01", periods=120)
@@ -315,12 +322,83 @@ def test_backtest_without_csv_is_simulation_only(
             missing=[tk for tk in tickers if tk not in rows],
         ),
     )
+
+
+def test_backtest_without_csv_is_simulation_only(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    # --backtest is notional (target-only): with no --csv it prints ONLY the
+    # simulation — no fabricated holdings/status from the bundled sample.
+    _mock_backtest_series(monkeypatch)
     rc = main(["--backtest", "--target", str(TARGET)])
     out = capsys.readouterr().out
     assert rc == 0
     assert "=== BACKTEST" in out          # the simulation prints
     assert "=== HOLDINGS ===" not in out  # but NO holdings/status (no book given)
     assert "=== DRAWDOWN" not in out
+
+
+def test_env_asset_csv_makes_bare_run_a_brief(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    # ASSET_CSV in .env is the personal default: a run with no --csv uses it
+    # instead of printing the usage hint.
+    monkeypatch.setenv("ASSET_CSV", str(SAMPLE))
+    rc = main(["--no-prices"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "=== HOLDINGS ===" in out
+    assert "No portfolio given" not in out
+
+
+def test_env_asset_csv_does_not_reach_pure_backtest(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    # The pure `--backtest --target` run is notional by contract: it stays
+    # book-free even when ASSET_CSV is set (pass --csv explicitly to include it).
+    _mock_backtest_series(monkeypatch)
+    monkeypatch.setenv("ASSET_CSV", str(SAMPLE))
+    rc = main(["--backtest", "--target", str(TARGET)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "=== BACKTEST" in out
+    assert "=== HOLDINGS ===" not in out
+
+
+def test_explicit_csv_wins_over_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    # An explicit --csv always beats the .env default (which here points nowhere).
+    monkeypatch.setenv("ASSET_CSV", str(tmp_path / "does_not_exist.csv"))
+    rc = main(["--csv", str(SAMPLE), "--no-prices"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "=== HOLDINGS ===" in out
+
+
+def test_env_asset_csv_expands_tilde(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    # ~ in an .env path means the home directory, not a repo-relative "~" folder.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    (tmp_path / "book.csv").write_text(SAMPLE.read_text(encoding="utf-8"), encoding="utf-8")
+    monkeypatch.setenv("ASSET_CSV", "~/book.csv")
+    rc = main(["--no-prices"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "=== HOLDINGS ===" in out
+
+
+def test_env_asset_target_fills_rebalance(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    # ASSET_TARGET in .env fills --target when --rebalance/--backtest need one.
+    _canned_sample_prices(monkeypatch)
+    monkeypatch.setenv("ASSET_TARGET", str(TARGET))
+    rc = main(["--csv", str(SAMPLE), "--no-risk", "--rebalance", "to_total"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "SUGGESTED ACTIONS" in out
 
 
 def test_omitting_a_holding_warns(
