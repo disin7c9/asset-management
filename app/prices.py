@@ -119,12 +119,7 @@ def fetch_latest(
     failure — those tickers appear in the returned `missing` list.
     """
     asof = asof_date or date.today()
-    cache = cache_dir if cache_dir is not None else _CACHE_DIR_DEFAULT
-    try:
-        cache.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        log.warning("cache dir unwritable (%s) — proceeding without cache", exc)
-        cache = None  # type: ignore[assignment]
+    cache = ensure_cache_dir(cache_dir)
 
     rows: dict[str, PriceRow] = {}
     missing: list[str] = []
@@ -202,6 +197,22 @@ def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def ensure_cache_dir(cache_dir: Path | None) -> Path | None:
+    """Resolve and create the cache dir; None means "run without cache".
+
+    The one mkdir-or-degrade gate for every on-disk cache (latest / series /
+    splits / metadata — public: `metadata.py` imports it), so the unwritable-dir
+    fallback can't drift between them.
+    """
+    cache = cache_dir if cache_dir is not None else _CACHE_DIR_DEFAULT
+    try:
+        cache.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        log.warning("cache dir unwritable (%s) — proceeding without cache", exc)
+        return None
+    return cache
+
+
 def _coerce_fetched_at(value: object) -> datetime | None:
     """Normalize a cache cell's ``fetched_at`` to a tz-aware UTC datetime, or None
     if missing / NaT / unparseable (legacy or corrupt rows)."""
@@ -212,10 +223,11 @@ def _coerce_fetched_at(value: object) -> datetime | None:
     return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
 
 
-def _fresh(fetched_at: datetime, ttl: timedelta, *, what: str) -> bool:
+def fresh(fetched_at: datetime, ttl: timedelta, *, what: str) -> bool:
     """The one freshness gate for every on-disk cache: reject a future-stamped row
     (clock skew / tampered file) and anything older than ``ttl``. Centralized so the
-    rule can't drift between the latest-price, series, and splits caches."""
+    rule can't drift between the latest-price, series, splits, and metadata caches
+    (public: `metadata.py` imports it)."""
     now = _now_utc()
     if fetched_at > now:
         log.warning(
@@ -242,7 +254,7 @@ def _from_cache(ticker: str, asof: date, cache_dir: Path) -> PriceRow | None:
     fetched_at = _coerce_fetched_at(row["fetched_at"])
     if fetched_at is None:
         return None  # NaT / corrupt — unusable, refetch
-    if not _fresh(fetched_at, _CACHE_TTL, what=ticker):
+    if not fresh(fetched_at, _CACHE_TTL, what=ticker):
         return None
     return PriceRow(
         ticker=ticker,
@@ -322,12 +334,7 @@ def fetch_series(
     fetched_at) and reused if fresh within TTL and covering `end`. Never
     raises on a per-ticker miss — those appear in `missing`.
     """
-    cache = cache_dir if cache_dir is not None else _CACHE_DIR_DEFAULT
-    try:
-        cache.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        log.warning("cache dir unwritable (%s) — proceeding without cache", exc)
-        cache = None  # type: ignore[assignment]
+    cache = ensure_cache_dir(cache_dir)
 
     rows: dict[str, pd.Series[float]] = {}
     missing: list[str] = []
@@ -427,7 +434,7 @@ def _read_fresh_series_cache(
     fetched = _coerce_fetched_at(pd.to_datetime(df["fetched_at"]).max())
     if fetched is None:
         return None  # NaT (corrupt/empty) — unusable, refetch
-    if not _fresh(fetched, _CACHE_TTL, what=ticker):
+    if not fresh(fetched, _CACHE_TTL, what=ticker):
         return None  # stale or future-stamped → refetch
     idx = pd.to_datetime(df["date"]).dt.normalize()
     series = pd.Series(
@@ -549,7 +556,7 @@ def _splits_from_cache(ticker: str, cache_dir: Path) -> list[tuple[date, float]]
     fetched = _coerce_fetched_at(pd.to_datetime(df["fetched_at"]).max())
     if fetched is None:
         return None
-    if not _fresh(fetched, _SPLITS_TTL, what=ticker):
+    if not fresh(fetched, _SPLITS_TTL, what=ticker):
         return None  # stale or future-stamped → refetch
     return _parse_splits(pd.Series(df["ratio"].to_numpy(), index=pd.to_datetime(df["date"])))
 
@@ -590,12 +597,7 @@ def fetch_splits(
     unknown offline) maps to `[]` (no adjustment), and the price-basis-mismatch
     guard remains the safety net for any split we couldn't fetch.
     """
-    cache = cache_dir if cache_dir is not None else _CACHE_DIR_DEFAULT
-    try:
-        cache.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        log.warning("cache dir unwritable (%s) — proceeding without cache", exc)
-        cache = None  # type: ignore[assignment]
+    cache = ensure_cache_dir(cache_dir)
 
     out: dict[str, list[tuple[date, float]]] = {}
     for ticker in dict.fromkeys(tickers):

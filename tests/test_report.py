@@ -249,3 +249,25 @@ def test_noisy_note_appears_when_short_history(state, prices, returns) -> None:
     out = render_text(build_report_data(state, prices, returns, noisy))
     assert "treat these figures as noisy." in out
     assert "not yet recovered" in out  # recovery_date None
+
+
+def test_securities_section_uses_one_consistent_asof(state) -> None:
+    # Regression (review 2026-06-12): with asof=None the fund-age date must come
+    # from the SAME input-derived default the title uses (generated_at's date) —
+    # not a second hidden clock read that can disagree across midnight.
+    from app.metadata import MetadataResult, SecurityMeta
+
+    gen = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+    meta = MetadataResult(
+        rows={
+            "VOO": SecurityMeta(
+                ticker="VOO", expense_ratio=0.0003, aum=1.7e12, avg_volume=8.8e6,
+                category="Large Blend", family="Vanguard", legal_type=None,
+                quote_type="ETF", inception=date(2016, 1, 1),
+            )
+        }
+    )
+    data = build_report_data(state, metadata=meta, asof=None, generated_at=gen)
+    assert data.asof_date == "2026-01-01"  # title asof = gen.date()
+    sec = next(s for s in data.sections if s.title.startswith("SECURITIES"))
+    assert any("10.0y" in line for line in sec.lines)  # age computed from the SAME date

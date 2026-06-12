@@ -19,6 +19,7 @@ from app.derive import DerivedState, derive
 from app.email import send_report
 from app.events import CASH_TICKER, Event, load_events, load_target
 from app.log_config import setup_logging
+from app.metadata import MetadataResult, fetch_metadata
 from app.prices import (
     PriceRow,
     PricesResult,
@@ -114,6 +115,13 @@ def main(argv: list[str] | None = None) -> int:
         help="skip the HOLDINGS drawdown/risk panel (needs price history; slower than "
         "--no-prices). Scope is the holdings panel only: an explicitly-requested "
         "--backtest still reports its own risk metrics.",
+    )
+    parser.add_argument(
+        "--metadata",
+        action="store_true",
+        help="add a SECURITIES panel: expense ratio, AUM, liquidity, age, category per "
+        "holding (published fund facts via yfinance, cached for 7 days; works with "
+        "--offline from cache)",
     )
     parser.add_argument(
         "--save",
@@ -243,6 +251,7 @@ def main(argv: list[str] | None = None) -> int:
     # exempt; the bundled example is opt-in via an explicit --csv path.
     needs_book = bool(
         args.rebalance or args.allocate or args.dump_target or args.save or args.send
+        or args.metadata
     )
     # Personal defaults from .env (gitignored; loaded above). ASSET_CSV fills --csv
     # for runs that want a book; a pure `--backtest --target` run stays notional
@@ -282,6 +291,7 @@ def main(argv: list[str] | None = None) -> int:
         "rebalance": None,
         "backtest": None,
         "allocate": None,
+        "metadata": None,
     }
 
     # Nothing to do: no book and no notional backtest → guide, don't fabricate a brief.
@@ -371,11 +381,23 @@ def main(argv: list[str] | None = None) -> int:
     if args.backtest:
         backtest = _compute_backtest(args, run)
 
+    meta: MetadataResult | None = None
+    if args.metadata:
+        # Published fund facts for the held tickers (cost/size/liquidity/age).
+        # Independent of prices: works under --no-prices, and --offline serves
+        # from the 7-day cache. A per-ticker miss degrades the run to partial.
+        meta = fetch_metadata(
+            sorted(state.held()), cache_dir=args.cache_dir, online=not args.offline
+        )
+        run["metadata"] = f"{len(meta.rows)} fetched, {len(meta.missing)} missing"
+        if meta.missing and run["status"] == "ok":
+            run["status"] = "partial"
+
     data = build_report_data(
         state, prices=prices, returns=returns, risk=risk,
         suggestions=suggestions, backtest=backtest, missing_tickers=missing,
         asof=today, generated_at=datetime.now(timezone.utc), twr_excluded=twr_excluded,
-        dollar_dd=dollar_dd,
+        dollar_dd=dollar_dd, metadata=meta,
     )
 
     sys.stdout.write(render_text(data) + "\n")

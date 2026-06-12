@@ -26,6 +26,7 @@ uv run python -m app --csv your.csv --offline    # serve from on-disk cache; no 
 uv run python -m app --csv your.csv --cache-dir /some/dir   # override the default cache location
 uv run python -m app --csv your.csv --save       # also write reports/<asof>.md (markdown)
 uv run python -m app --csv your.csv --send       # also email the brief as HTML via Resend
+uv run python -m app --csv your.csv --metadata   # + SECURITIES panel: expense ratio, AUM, liquidity, age per holding
 uv run python -m app --csv your.csv --dump-target target.csv                    # write current allocation to edit
 uv run python -m app --csv your.csv --allocate inverse_vol --allocate-out t.csv  # PROPOSE a target (re-weight holdings)
 uv run python -m app --csv your.csv --rebalance to_total --target target.csv    # suggestions toward a target
@@ -41,6 +42,7 @@ The report is **composable panels**, not exclusive modes — combine flags and t
 | status brief (default) | `--csv` | your holdings + returns + drawdown/risk |
 | `--rebalance MODE` | `--csv` + `--target` | buy/sell suggestions toward the target (`--new-cash` sizes a deposit) |
 | `--allocate RULE` | `--csv` | propose a target by re-weighting your holdings (write it with `--allocate-out`) |
+| `--metadata` | `--csv` | published fund facts per holding (expense ratio, AUM, volume, age, category), cached 7 days |
 | `--backtest` | `--target` | notional rebalance-vs-buy-and-hold — **no `--csv`**; prints the simulation alone |
 
 There is **no silent built-in default**: a book-dependent action without `--csv` errors out, and a bare `python -m app` prints a hint — the bundled example is opt-in (`--csv data/sample_data/transactions.csv`), never assumed. `--allocate` is **propose-only** and cannot be combined with `--rebalance`/`--backtest` (review the written file, then act on it in a separate command). A `target.csv` is one you create with `--dump-target` / `--allocate-out` (or use `data/sample_data/target.csv`).

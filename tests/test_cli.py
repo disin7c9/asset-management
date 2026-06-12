@@ -338,6 +338,57 @@ def test_backtest_without_csv_is_simulation_only(
     assert "=== DRAWDOWN" not in out
 
 
+def _canned_meta() -> object:
+    from app.metadata import MetadataResult, SecurityMeta
+
+    row = SecurityMeta(
+        ticker="VOO", expense_ratio=0.0003, aum=1.7e12, avg_volume=8.8e6,
+        category="Large Blend", family="Vanguard", legal_type="Exchange Traded Fund",
+        quote_type="ETF", inception=date(2010, 9, 16),
+    )
+    return MetadataResult(rows={"VOO": row}, missing=["IAU"])
+
+
+def test_metadata_requires_csv() -> None:
+    # --metadata reads YOUR holdings → it's a book action (exit 2 without --csv).
+    with pytest.raises(SystemExit):
+        main(["--metadata"])
+
+
+def test_metadata_panel_renders_and_flips_partial(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr("app.cli.fetch_metadata", lambda tickers, **k: _canned_meta())
+    with caplog.at_level(logging.INFO):
+        rc = main(["--csv", str(SAMPLE), "--no-prices", "--metadata"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "SECURITIES (know your holdings)" in out
+    assert "0.03%" in out and "$1.70T" in out and "Large Blend — Vanguard" in out
+    assert "no metadata for: IAU" in out
+    summary = _run_summary(caplog)
+    assert summary["metadata"] == "1 fetched, 1 missing"
+    assert summary["status"] == "partial"  # a missing ticker degrades honestly
+
+
+def test_metadata_asks_only_held_tickers(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    asked: list[list[str]] = []
+
+    def spy(tickers: list[str], **k: object) -> object:
+        asked.append(list(tickers))
+        from app.metadata import MetadataResult
+        return MetadataResult()
+
+    monkeypatch.setattr("app.cli.fetch_metadata", spy)
+    rc = main(["--csv", str(SAMPLE), "--no-prices", "--metadata"])
+    capsys.readouterr()
+    assert rc == 0
+    assert asked == [["BND", "IAU", "VEA", "VOO"]]  # held tickers, sorted, no CASH
+
+
 def test_env_asset_csv_makes_bare_run_a_brief(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
 ) -> None:

@@ -27,6 +27,7 @@ from datetime import date, datetime, timedelta, timezone
 
 from app.backtest import BacktestResult
 from app.derive import DerivedState
+from app.metadata import MetadataResult
 from app.prices import PriceRow
 from app.returns import ReturnsSummary
 from app.risk import NOISY_THRESHOLD_DAYS, DollarDrawdown, DrawdownInfo, MetricCI, RiskSummary
@@ -122,6 +123,7 @@ def build_report_data(
     generated_at: datetime | None = None,
     twr_excluded: list[str] | None = None,
     dollar_dd: DollarDrawdown | None = None,
+    metadata: MetadataResult | None = None,
 ) -> ReportData:
     """Assemble the deterministic brief as ordered sections.
 
@@ -139,6 +141,11 @@ def build_report_data(
     missing_tickers = missing_tickers or []
     twr_excluded = twr_excluded or []
     gen = generated_at if generated_at is not None else datetime.now(timezone.utc)
+    if asof is None:
+        # Derived from the inputs, not a fresh clock read (the function stays pure):
+        # the returns window's end, else the run instant's date. Resolved up front so
+        # every consumer (the SECURITIES ages, the title) uses the SAME date.
+        asof = returns.asof_date if returns is not None else gen.date()
     sections: list[Section] = []
 
     if suggestions:
@@ -150,6 +157,8 @@ def build_report_data(
         sections.append(_section_returns(returns, twr_excluded))
     if state.positions or prices:  # skip the empty holdings table on a no-book (backtest-only) run
         sections.append(_section_holdings(state, prices))
+    if metadata is not None and (metadata.rows or metadata.missing):
+        sections.append(_section_securities(metadata, asof))
     if backtest is not None and backtest.legs:
         sections.append(_section_backtest(backtest))
 
@@ -157,8 +166,6 @@ def build_report_data(
     if footer is not None:
         sections.append(footer)
 
-    if asof is None:
-        asof = returns.asof_date if returns is not None else gen.date()
     asof_str = asof.isoformat()
     return ReportData(
         title=f"Portfolio brief — {asof_str}",
@@ -340,6 +347,52 @@ def _section_holdings(state: DerivedState, prices: dict[str, PriceRow]) -> Secti
         # the bottom line must NOT subtract them again.
         lines.append(f"Net P&L (unrealized + realized): ${total_unreal + real:+,.2f}")
     return Section("HOLDINGS", tuple(lines))
+
+
+def _human_dollars(value: float) -> str:
+    """Compact money: 1.70T / 30.9B / 31.7M / 950K / 12 (magnitudes a human scans)."""
+    for cut, suffix in ((1e12, "T"), (1e9, "B"), (1e6, "M"), (1e3, "K")):
+        if abs(value) >= cut:
+            scaled = value / cut
+            return f"${scaled:.2f}{suffix}" if abs(scaled) < 10 else f"${scaled:.1f}{suffix}"
+    return f"${value:,.0f}"
+
+
+def _human_count(value: float) -> str:
+    for cut, suffix in ((1e9, "B"), (1e6, "M"), (1e3, "K")):
+        if abs(value) >= cut:
+            return f"{value / cut:.1f}{suffix}"
+    return f"{value:,.0f}"
+
+
+def _section_securities(meta: MetadataResult, asof: date) -> Section:
+    """Per-holding fund facts (cost, size, liquidity, age) with provenance.
+
+    n/a is honest absence: an equity or physical-commodity trust legitimately
+    lacks some fields — never substitute a guess for a missing published fact.
+    """
+    lines = [
+        f"{'ticker':7}{'exp ratio':>10}{'AUM':>10}{'avg vol':>10}{'age':>7}   category — family",
+        "-" * 78,
+    ]
+    for tk in sorted(meta.rows):
+        m = meta.rows[tk]
+        exp = f"{m.expense_ratio * 100:.2f}%" if m.expense_ratio is not None else _NA
+        aum = _human_dollars(m.aum) if m.aum is not None else _NA
+        vol = _human_count(m.avg_volume) if m.avg_volume is not None else _NA
+        age = m.age_years(asof)
+        age_s = f"{age:.1f}y" if age is not None else _NA
+        desc = " — ".join(p for p in (m.category, m.family) if p) or _NA
+        lines.append(f"{tk:7}{exp:>10}{aum:>10}{vol:>10}{age_s:>7}   {desc}")
+    lines.append("-" * 78)
+    n_cache = meta.n_cache
+    lines.append(
+        f"metadata: yfinance ({n_cache}/{len(meta.rows)} from cache, ≤7d old); "
+        "values are published fund facts, not advice"
+    )
+    if meta.missing:
+        lines.append(f"⚠ no metadata for: {', '.join(meta.missing)}")
+    return Section("SECURITIES (know your holdings)", tuple(lines))
 
 
 def _section_backtest(bt: BacktestResult) -> Section:
