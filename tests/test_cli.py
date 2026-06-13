@@ -392,6 +392,27 @@ def test_screen_panel_renders_with_verdicts(
     assert _run_summary(caplog)["screen"] == "QQQM:warn"
 
 
+def test_screen_with_target_adds_role_row(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str],
+) -> None:
+    # --screen + --target runs the walk-forward role check per candidate. With the
+    # flat synthetic series both portfolios have ~zero drawdown → deterministic
+    # "inconclusive" → a [warn] role row with the OOS window in its reason.
+    from app.metadata import MetadataResult
+
+    monkeypatch.setattr("app.cli.fetch_series", _flat_series)
+    monkeypatch.setattr("app.cli.price_basis_mismatches", lambda *a, **k: [])
+    monkeypatch.setattr("app.cli.fetch_metadata", lambda tickers, **k: MetadataResult())
+    with caplog.at_level(logging.INFO):
+        rc = main(["--csv", str(SAMPLE), "--screen", "QQQM", "--target", str(TARGET)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "] role:" in out and "OOS" in out
+    assert "held-out simulation, not a prediction" in out  # footer switched
+    assert _run_summary(caplog)["screen"] == "QQQM:warn"
+
+
 def test_screen_drops_cash_pseudo_ticker(
     caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str],
 ) -> None:

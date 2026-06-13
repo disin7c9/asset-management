@@ -168,3 +168,102 @@ def test_prop_compare_legs_are_finite_and_well_formed(
         dd = leg.risk.max_drawdown_ci
         assert dd.low <= dd.high <= 1e-9
         assert dd.point <= 1e-9
+
+
+# --- walk-forward role check (v1.9.0) ---
+
+
+def _close_path(rets: list[float], start: str = "2024-01-02") -> "pd.Series[float]":
+    idx = pd.bdate_range(start, periods=len(rets))
+    return (1.0 + pd.Series(rets, index=idx, dtype=float)).cumprod() * 100.0
+
+
+def test_role_check_hedge_improves_oos() -> None:
+    # Target asset rises in-sample then crashes in the held-out window; the
+    # candidate rises through the crash. A big sleeve → decisively shallower
+    # OOS drawdown → "improved" (seeded bootstrap keeps the verdict stable).
+    from app.backtest import role_check
+
+    aaa = _close_path([0.001] * 210 + [-0.005] * 60 + [0.001] * 30)
+    hedge = _close_path([0.0002] * 210 + [0.004] * 90)
+    rc = role_check({"AAA": aaa, "HEDGE": hedge}, {"AAA": 1.0}, "HEDGE", sleeve=0.5)
+    assert rc.verdict == "improved"
+    oos = rc.oos
+    assert oos is not None and oos.dd_with > oos.dd_without  # shallower drawdown
+    assert "OOS" in rc.reason and "overfitting gap" in rc.reason
+
+
+def test_role_check_amplifier_worsens_oos() -> None:
+    # The candidate is a 3x clone of the target asset: the OOS crash gets
+    # deeper with the sleeve → "worsened".
+    from app.backtest import role_check
+
+    rets = [0.001] * 210 + [-0.005] * 60 + [0.001] * 30
+    aaa = _close_path(rets)
+    lev = _close_path([3 * r for r in rets])
+    rc = role_check({"AAA": aaa, "LEV": lev}, {"AAA": 1.0}, "LEV", sleeve=0.5)
+    assert rc.verdict == "worsened"
+    oos = rc.oos
+    assert oos is not None and oos.dd_with < oos.dd_without  # deeper drawdown
+
+
+def test_role_check_clone_is_inconclusive() -> None:
+    # A candidate identical to the target changes nothing → differences are
+    # inside the noise margins → "inconclusive", honestly.
+    from app.backtest import role_check
+
+    rets = [0.002, -0.001] * 150
+    aaa = _close_path(rets)
+    clone = _close_path(rets)
+    rc = role_check({"AAA": aaa, "CLONE": clone}, {"AAA": 1.0}, "CLONE", sleeve=0.5)
+    assert rc.verdict == "inconclusive"
+    assert "no clear out-of-sample improvement" in rc.reason
+
+
+def test_role_check_insufficient_data_paths() -> None:
+    from app.backtest import role_check
+
+    short = _close_path([0.001] * 80)  # 80 common days → OOS window below the floor
+    aaa = _close_path([0.001] * 80)
+    rc = role_check({"AAA": aaa, "NEW": short}, {"AAA": 1.0}, "NEW")
+    assert rc.verdict == "insufficient" and "common days" in rc.reason
+
+    rc2 = role_check({"AAA": aaa}, {"AAA": 1.0}, "GHOST")
+    assert rc2.verdict == "insufficient" and "no usable price history" in rc2.reason
+
+    rc3 = role_check({"AAA": aaa}, {"AAA": 1.0}, "AAA")
+    assert rc3.verdict == "insufficient" and "already in the target" in rc3.reason
+
+    rc4 = role_check({"AAA": aaa, "NEW": short}, {"AAA": 1.0}, "NEW", sleeve=1.5)
+    assert rc4.verdict == "insufficient" and "sleeve" in rc4.reason
+
+
+def test_role_check_refuses_renormalized_target() -> None:
+    # Regression (review 2026-06-12): a target ticker with no usable history must
+    # make the verdict "insufficient" — simulate would silently renormalize the
+    # rest and the verdict would be about a DIFFERENT target than the user's.
+    from app.backtest import role_check
+
+    aaa = _close_path([0.001] * 300)
+    cand = _close_path([0.002] * 300)
+    rc = role_check({"AAA": aaa, "NEW": cand}, {"AAA": 0.6, "GONE": 0.4}, "NEW")
+    assert rc.verdict == "insufficient"
+    assert "GONE" in rc.reason and "renormalized" in rc.reason
+
+
+def test_role_check_aligns_mismatched_calendars() -> None:
+    # The candidate trades on a sparser calendar (different exchange): the legs'
+    # daily returns are inner-joined BY DATE, so the paired comparison never
+    # pairs different days. Must run end-to-end without crashing and report a
+    # coherent OOS window.
+    from app.backtest import role_check
+
+    rets = [0.002, -0.001] * 150
+    aaa = _close_path(rets)
+    cand_full = _close_path([0.001] * 300)
+    cand_sparse = cand_full[::2]  # every other trading day only
+    rc = role_check({"AAA": aaa, "SPARSE": cand_sparse}, {"AAA": 1.0}, "SPARSE", sleeve=0.5)
+    assert rc.verdict in ("improved", "worsened", "inconclusive", "insufficient")
+    oos = rc.oos
+    if oos is not None:
+        assert oos.n_days > 0  # aligned length, one number for both legs

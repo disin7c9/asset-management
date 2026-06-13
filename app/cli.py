@@ -57,7 +57,7 @@ from app.allocate import (
     allocation_kind,
     needs_series,
 )
-from app.backtest import BacktestResult, backtest_compare
+from app.backtest import BacktestResult, RoleCheck, backtest_compare, role_check
 from app.strategy import VALID_MODES, Suggestion, may_suggest, suggest
 
 log = logging.getLogger(__name__)
@@ -133,9 +133,11 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="judge NEW candidate tickers against your book (comma-separated, e.g. "
         "QQQM,SCHD): diversifier/cost/liquidity/age/concentration/structure/overlap "
-        "checks, each with a named reason. Needs the price pipeline (not compatible "
-        "with --no-prices/--no-risk) and is propose-only (no --rebalance/--backtest/"
-        "--allocate in the same run).",
+        "checks, each with a named reason. Add --target (or ASSET_TARGET in .env) for "
+        "the walk-forward ROLE check — did a 5%% sleeve improve drawdown/vol on a "
+        "held-out window? Needs the price pipeline (not compatible with --no-prices/"
+        "--no-risk) and is propose-only (no --rebalance/--backtest/--allocate in the "
+        "same run).",
     )
     parser.add_argument(
         "--save",
@@ -279,8 +281,8 @@ def main(argv: list[str] | None = None) -> int:
     # ASSET_TARGET fills --target only when a rule needs one. Explicit flags win.
     if args.csv is None and (needs_book or not args.backtest):
         args.csv = _env_path("ASSET_CSV")
-    if args.target is None and (args.rebalance or args.backtest):
-        args.target = _env_path("ASSET_TARGET")
+    if args.target is None and (args.rebalance or args.backtest or args.screen):
+        args.target = _env_path("ASSET_TARGET")  # screen: enables the role check row
     if (args.rebalance or args.backtest) and args.target is None:
         parser.error(
             "--rebalance/--backtest require --target (bootstrap one from your holdings "
@@ -921,8 +923,26 @@ def _compute_screen(
         run["status"] = "partial"
     held_meta = {tk: m for tk, m in meta.rows.items() if tk in held}
     cand_meta = {tk: m for tk, m in meta.rows.items() if tk in tickers_set}
+
+    role: dict[str, RoleCheck] | None = None
+    if args.target is not None:
+        # The walk-forward role check (the edge gate's evidence): simulate the
+        # target vs target+sleeve per candidate, judged on the held-out window.
+        try:
+            target = load_target(args.target)
+        except (ValueError, OSError) as exc:
+            log.error("--screen role check: %s", exc)
+        else:
+            tgt_series = fetch_series(
+                sorted(set(target) - set(cand_series.rows)), start, today,
+                cache_dir=args.cache_dir, online=online,
+            )
+            _record_series_fetch(run, tgt_series)
+            sim_series = {**tgt_series.rows, **cand_series.rows}
+            role = {tk: role_check(sim_series, target, tk) for tk in tickers}
+
     results = screen_candidates(
-        tickers, cand_series.rows, daily, cand_meta, held_meta, held, asof=today
+        tickers, cand_series.rows, daily, cand_meta, held_meta, held, asof=today, role=role
     )
     run["screen"] = " ".join(f"{r.ticker}:{r.verdict}" for r in results)
     return results

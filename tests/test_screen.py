@@ -50,6 +50,7 @@ def _screen_one(
     meta: SecurityMeta | None = None,
     held_meta: dict[str, SecurityMeta] | None = None,
     held: set[str] | None = None,
+    role: "dict[str, object] | None" = None,
 ) -> CandidateScreen:
     port = port if port is not None else _returns([0.001, -0.002, 0.003] * 30)
     return screen_candidates(
@@ -60,6 +61,7 @@ def _screen_one(
         held_meta or {},
         held or set(),
         asof=_ASOF,
+        role=role,  # type: ignore[arg-type]
     )[0]
 
 
@@ -249,3 +251,44 @@ def test_threshold_boundaries_are_inclusive() -> None:
     assert _check(_screen_one(meta=at_floor), "liquidity").status == "pass"
     half = _meta(top_holdings={"A": 0.25, "B": 0.25})  # exactly 50% → not above
     assert _check(_screen_one(meta=half), "concentration").status == "pass"
+
+
+# --- the walk-forward role row (v1.9.0) ---
+
+
+def test_role_row_maps_verdicts_and_carries_values() -> None:
+    from app.backtest import RoleCheck, RoleWindow
+
+    oos = RoleWindow(
+        label="out-of-sample", start=date(2025, 1, 1), end=date(2025, 6, 1), n_days=100,
+        dd_without=-0.20, dd_with=-0.12, vol_without=0.15, vol_with=0.11,
+        ret_without=0.05, ret_with=0.06,
+    )
+    rc = RoleCheck("CAND", 0.05, "quarterly", (oos,), "improved", "OOS …")
+    r = _screen_one(role={"CAND": rc})
+    c = _check(r, "role")
+    assert c.status == "pass"
+    assert c.values["oos_dd_with"] == -0.12 and c.values["oos_dd_without"] == -0.20
+    assert c.values["sleeve"] == 0.05
+
+    for verdict, status in (("worsened", "fail"), ("inconclusive", "warn"),
+                            ("insufficient", "n/a")):
+        rc2 = RoleCheck("CAND", 0.05, "quarterly", (), verdict, "…")  # type: ignore[arg-type]
+        assert _check(_screen_one(role={"CAND": rc2}), "role").status == status
+
+    missing = _screen_one(role={})  # target given but this candidate's check failed
+    assert _check(missing, "role").status == "n/a"
+
+
+def test_no_role_row_without_target() -> None:
+    r = _screen_one()  # role=None → no target supplied → no role row at all
+    assert all(c.name != "role" for c in r.checks)
+
+
+def test_diversifier_values_are_typed() -> None:
+    # The 1.9.0 trigger: evidence as values, not parsed prose.
+    port = _returns([0.004, -0.003, 0.002, -0.001] * 40)
+    clone = _close_from_returns(list(port.values))
+    c = _check(_screen_one(close=clone, port=port), "diversifier")
+    assert abs(c.values["rho"] - 1.0) < 1e-9
+    assert "downside_rho" in c.values

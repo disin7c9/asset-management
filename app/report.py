@@ -409,9 +409,14 @@ def _section_candidates(results: list[CandidateScreen]) -> Section:
         for c in r.checks:
             lines.append(f"  [{c.status:>4}] {c.name}: {c.reason}")
         lines.append("")
+    has_role = any(c.name == "role" for r in results for c in r.checks)
     lines.append(
         "screen = published facts + price history; PASS is necessary, not sufficient "
-        "(no return prediction; the walk-forward role check is a separate step)"
+        + (
+            "(the role row is a held-out simulation, not a prediction)"
+            if has_role
+            else "(no return prediction; add --target for the walk-forward role check)"
+        )
     )
     return Section("CANDIDATES (deterministic screen)", tuple(lines))
 

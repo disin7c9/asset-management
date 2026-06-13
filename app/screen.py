@@ -23,20 +23,22 @@ Per-field degradation carries through: a missing fact makes that ONE check
 
 A "pass" here is necessary, not sufficient: it means the candidate is a sane,
 cheap, liquid, genuinely-different instrument — NOT a prediction. The
-walk-forward role check (did adding it actually improve drawdown/vol out of
-sample?) is the edge gate's evidence and lands as its own slice.
+walk-forward **role check** (did adding it actually improve drawdown/vol on a
+held-out window?) is the edge gate's evidence: `backtest.role_check` computes
+it, and when the caller supplies its results a `role` row joins the checks.
 """
 
 from __future__ import annotations
 
 import logging
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date
 from typing import Literal
 
 import pandas as pd
 
+from app.backtest import RoleCheck
 from app.metadata import SecurityMeta
 from app.returns import twr_index
 from app.risk import DrawdownInfo, max_drawdown
@@ -68,6 +70,11 @@ class CheckResult:
     name: str
     status: CheckStatus
     reason: str
+    # Machine-readable evidence behind the prose (the v1.9.0 trigger): the role
+    # check / edge gate / future MCP tool read these, never parse the reason.
+    # Keys are per-check (diversifier: rho, downside_rho, dd_window_return;
+    # role: oos_dd_with, oos_dd_without, oos_vol_with, oos_vol_without, ...).
+    values: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -211,6 +218,7 @@ def _check_diversifier(
     rho = float(c.corr(p))
     if math.isnan(rho):
         return CheckResult("diversifier", "n/a", "correlation undefined for this history")
+    values: dict[str, float] = {"rho": rho}
     parts = [f"ρ={rho:+.2f} vs your book"]
 
     red = joined[p < 0]
@@ -219,6 +227,7 @@ def _check_diversifier(
         red_rho = float(red.iloc[:, 0].corr(red.iloc[:, 1]))
         if not math.isnan(red_rho):  # red-day returns can be degenerate; skip, don't print nan
             downside = red_rho
+            values["downside_rho"] = downside
             parts.append(f"red-day ρ={downside:+.2f}")
 
     if portfolio_dd is not None and portfolio_dd.depth < 0:
@@ -228,6 +237,7 @@ def _check_diversifier(
         ]
         if not window.empty:
             through = float((1.0 + window).prod() - 1.0)
+            values["dd_window_return"] = through
             parts.append(
                 f"during your worst drawdown ({portfolio_dd.peak_date}→"
                 f"{portfolio_dd.trough_date}, {portfolio_dd.depth * 100:.1f}%) "
@@ -244,7 +254,7 @@ def _check_diversifier(
     if status == "pass" and downside is not None and downside - rho > _DOWNSIDE_ESCALATE:
         status = "warn"
         parts.append("diversification weakens exactly on your red days")
-    return CheckResult("diversifier", status, "; ".join(parts))
+    return CheckResult("diversifier", status, "; ".join(parts), values)
 
 
 def _check_overlap(
@@ -289,6 +299,29 @@ def _check_overlap(
     return CheckResult("overlap", "n/a", "no look-through holdings to compare")
 
 
+_ROLE_STATUS: dict[str, CheckStatus] = {
+    "improved": "pass",
+    "worsened": "fail",
+    "inconclusive": "warn",
+    "insufficient": "n/a",
+}
+
+
+def _check_role(rc: RoleCheck | None) -> CheckResult:
+    """The walk-forward role check's verdict as a screen row (evidence behind
+    the edge gate: judged on the held-out window only)."""
+    if rc is None:
+        return CheckResult("role", "n/a", "role check unavailable for this candidate")
+    values: dict[str, float] = {"sleeve": rc.sleeve}
+    oos = rc.oos
+    if oos is not None:
+        values.update(
+            oos_dd_with=oos.dd_with, oos_dd_without=oos.dd_without,
+            oos_vol_with=oos.vol_with, oos_vol_without=oos.vol_without,
+        )
+    return CheckResult("role", _ROLE_STATUS[rc.verdict], rc.reason, values)
+
+
 def screen_candidates(
     candidates: list[str],
     candidate_close: dict[str, "pd.Series[float]"],
@@ -298,6 +331,7 @@ def screen_candidates(
     held: set[str],
     *,
     asof: date,
+    role: dict[str, RoleCheck] | None = None,
 ) -> list[CandidateScreen]:
     """Run every check per candidate. Pure; degrades per-check, never raises."""
     # The portfolio's worst drawdown window is candidate-independent: compute once.
@@ -321,6 +355,8 @@ def screen_candidates(
         checks.append(_check_concentration(m))
         checks.append(_check_diversifier(candidate_close.get(tk), portfolio_returns, portfolio_dd))
         checks.append(_check_overlap(m, held_meta))
+        if role is not None:  # a target was supplied → the walk-forward evidence row
+            checks.append(_check_role(role.get(tk)))
         out.append(CandidateScreen(ticker=tk, checks=tuple(checks)))
         log.info("screened %s: %s", tk, out[-1].verdict)
     return out

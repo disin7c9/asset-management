@@ -218,8 +218,11 @@ def _cdar_from_returns(returns: "pd.Series[float]") -> float:
 # ── bootstrap confidence intervals ────────────────────────────────────────
 
 
-def _moving_block_indices(n: int, block: int, rng: np.random.Generator) -> np.ndarray:
-    """Indices for one moving-block resample of length `n` (blocks of size `block`)."""
+def moving_block_indices(n: int, block: int, rng: np.random.Generator) -> np.ndarray:
+    """Indices for one moving-block resample of length `n` (blocks of size `block`).
+
+    Public: the ONE block resampler — `bootstrap_ci` here and `backtest`'s paired
+    drawdown-difference CI both use it, so the resampling rule can't drift."""
     n_blocks = (n + block - 1) // block
     max_start = max(1, n - block + 1)
     starts = rng.integers(0, max_start, size=n_blocks)
@@ -256,7 +259,7 @@ def bootstrap_ci(
     idx = returns.index
     samples: list[float] = []
     for _ in range(n):
-        bidx = _moving_block_indices(arr.size, blk, rng)
+        bidx = moving_block_indices(arr.size, blk, rng)
         resampled = pd.Series(arr[bidx], index=idx[: len(bidx)])
         try:
             val = float(metric_fn(resampled))
