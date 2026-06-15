@@ -271,12 +271,12 @@ def _meta_from_cache(ticker: str, cache_dir: Path) -> SecurityMeta | None:
         return None  # stale or future-stamped → refetch
     inception = payload.get("inception")
     try:
-        # Inside the try: a valid-JSON cache with one malformed value (a non-numeric
-        # holding weight, a bad date) must degrade to "refetch", never raise — the
-        # never-raises contract covers corrupt caches too.
+        # Inside the try: never raise on a corrupt cache. A bad holding weight
+        # (non-numeric, NaN, ±inf) degrades per-field via _opt_float — same as the
+        # live path — and is dropped; a bad inception date below refetches the row.
         holdings_raw = payload.get("top_holdings")
         holdings = (
-            {str(k): float(v) for k, v in holdings_raw.items()}
+            {str(k): w for k, v in holdings_raw.items() if (w := _opt_float(v)) is not None}
             if isinstance(holdings_raw, dict)
             else {}
         )

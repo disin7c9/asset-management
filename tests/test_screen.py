@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import warnings
 from datetime import date, datetime, timezone
 
 import pandas as pd
@@ -241,6 +242,31 @@ def test_diversifier_flat_portfolio_is_na() -> None:
     cand = _close_from_returns([0.002, -0.001] * 50)
     c = _check(_screen_one(close=cand, port=port), "diversifier")
     assert c.status == "n/a" and "nan" not in c.reason
+
+
+def test_diversifier_red_day_flat_candidate_no_warning() -> None:
+    # Regression: the red-day subset corr lacked the zero-variance pre-check the
+    # full-period corr has, so a candidate flat on the portfolio's red days made
+    # numpy emit "invalid value encountered in divide". The result was already
+    # right (the isnan below caught it) — the stray warning is what's fixed.
+    port = _returns([0.01 if i % 2 == 0 else -0.01 for i in range(100)])
+    closes = [100.0]
+    for i in range(1, 100):
+        # flat on the portfolio's red days (odd i), moves on green days → overall
+        # variance survives the full-period guard but the red-day subset is flat.
+        closes.append(closes[-1] if i % 2 == 1 else closes[-1] * 1.005)
+    cand = pd.Series(closes, index=pd.bdate_range("2024-01-02", periods=100), dtype=float)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        c = _check(_screen_one(close=cand, port=port), "diversifier")
+
+    assert not any(
+        issubclass(w.category, RuntimeWarning) and "invalid value" in str(w.message)
+        for w in caught
+    )
+    assert "rho" in c.values  # full-period correlation still computed
+    assert "downside_rho" not in c.values  # red-day subset skipped (flat → no signal)
 
 
 def test_threshold_boundaries_are_inclusive() -> None:

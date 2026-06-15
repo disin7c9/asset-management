@@ -388,7 +388,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if not args.no_prices and state.held():
         prices, returns, risk, missing, twr_excluded, dollar_dd, series, daily = (
-            _compute_prices_returns_risk(events, state, args, run)
+            _compute_prices_returns_risk(events, state, args, run, today)
         )
 
     if args.dump_target:
@@ -403,7 +403,7 @@ def main(argv: list[str] | None = None) -> int:
 
     backtest: BacktestResult | None = None
     if args.backtest:
-        backtest = _compute_backtest(args, run)
+        backtest = _compute_backtest(args, run, today)
 
     meta: MetadataResult | None = None
     if args.metadata:
@@ -478,6 +478,7 @@ def _compute_prices_returns_risk(
     state: DerivedState,
     args: argparse.Namespace,
     run: dict[str, Any],
+    today: date,
 ) -> tuple[
     dict[str, PriceRow] | None,
     ReturnsSummary | None,
@@ -497,7 +498,6 @@ def _compute_prices_returns_risk(
     the latest prices.
     """
     held = state.held()
-    today = date.today()
     online = not args.offline
     prices: dict[str, PriceRow] = {}
     risk: RiskSummary | None = None
@@ -949,7 +949,7 @@ def _compute_screen(
 
 
 def _compute_backtest(
-    args: argparse.Namespace, run: dict[str, Any]
+    args: argparse.Namespace, run: dict[str, Any], today: date
 ) -> BacktestResult | None:
     """Notional backtest of the target: fetch its price history and simulate the
     rebalanced leg vs buy-and-hold. Independent of the user's holdings (notional);
@@ -960,7 +960,6 @@ def _compute_backtest(
         log.error("--backtest: %s", exc)
         run["backtest"] = "skipped: bad target"
         return None
-    today = date.today()
     lookback = args.backtest_start or (today - timedelta(days=3653))  # ~10y of history
     series = fetch_series(
         sorted(target), lookback, today, cache_dir=args.cache_dir, online=not args.offline

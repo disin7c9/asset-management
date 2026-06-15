@@ -224,11 +224,16 @@ def _check_diversifier(
     red = joined[p < 0]
     downside: float | None = None
     if len(red) >= _MIN_RED_DAYS:
-        red_rho = float(red.iloc[:, 0].corr(red.iloc[:, 1]))
-        if not math.isnan(red_rho):  # red-day returns can be degenerate; skip, don't print nan
-            downside = red_rho
-            values["downside_rho"] = downside
-            parts.append(f"red-day ρ={downside:+.2f}")
+        rc, rp = red.iloc[:, 0], red.iloc[:, 1]
+        # Variance pre-check like the full-period guard above: a candidate flat on
+        # your red days has no red-day correlation to measure — skip it before corr
+        # so numpy never warns (the isnan below stays as a belt).
+        if float(rc.std()) > 0.0 and float(rp.std()) > 0.0:
+            red_rho = float(rc.corr(rp))
+            if not math.isnan(red_rho):
+                downside = red_rho
+                values["downside_rho"] = downside
+                parts.append(f"red-day ρ={downside:+.2f}")
 
     if portfolio_dd is not None and portfolio_dd.depth < 0:
         window = c[

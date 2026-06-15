@@ -164,22 +164,24 @@ def test_corrupt_cache_refetches(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     assert result.rows["VOO"].source == "yfinance"  # corrupt file ignored, refetched
 
 
-def test_valid_json_with_corrupt_field_refetches_not_raises(
+def test_valid_json_with_corrupt_field_degrades_not_raises(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Regression (review 2026-06-12): a FRESH, valid-JSON cache with one malformed
-    # value (non-numeric holding weight) must degrade to a refetch — never raise.
-    # Before the fix this crashed fetch_metadata with an uncaught ValueError.
+    # holding weight must NEVER raise (before the v1.7.0 fix it crashed with an
+    # uncaught ValueError). Degradation strategy updated 2026-06-15: cache holdings
+    # now coerce via _opt_float like the live path, so a bad weight is DROPPED
+    # per-field and the row is still served from cache (no whole-row refetch).
     payload = {
         "fetched_at": datetime.now(timezone.utc).isoformat(),
         "top_holdings": {"NVDA": "corrupt"},
     }
     (tmp_path / "VOO_meta.json").write_text(json.dumps(payload), encoding="utf-8")
     monkeypatch.setattr("app.metadata._fetch_yf_meta", lambda tk: _canned_raw())
-    result = fetch_metadata(["VOO"], cache_dir=tmp_path)
-    assert result.rows["VOO"].source == "yfinance"  # malformed cache → live refetch
+    m = fetch_metadata(["VOO"], cache_dir=tmp_path).rows["VOO"]
+    assert m.source == "cache" and m.top_holdings == {}  # bad weight dropped, served
     offline = fetch_metadata(["GHOST"], cache_dir=tmp_path, online=False)
-    assert offline.missing == ["GHOST"]  # and offline it's just missing, no crash
+    assert offline.missing == ["GHOST"]  # and a truly-missing ticker is just missing
 
 
 def test_infinite_values_become_none(
@@ -192,6 +194,27 @@ def test_infinite_values_become_none(
     monkeypatch.setattr("app.metadata._fetch_yf_meta", lambda tk: raw)
     m = fetch_metadata(["VOO"], cache_dir=tmp_path).rows["VOO"]
     assert m.aum is None and m.avg_volume is None
+
+
+def test_cache_holdings_drop_nonfinite_weights(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Regression: the cache-read path coerced holdings with bare float(v), so a
+    # corrupt "Infinity"/"NaN" weight round-tripped to inf/nan and leaked into the
+    # brief ("top 10 = inf%") and silently passed the concentration check. It now
+    # degrades per-field via _opt_float (same as the live path): bad weights are
+    # dropped, the finite ones kept, and the row is still served from cache.
+    payload = {
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "top_holdings": {"AAA": "Infinity", "BBB": "NaN", "CCC": 0.5},
+    }
+    (tmp_path / "VOO_meta.json").write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setattr(
+        "app.metadata._fetch_yf_meta", lambda tk: pytest.fail("must serve cache, not refetch")
+    )
+    m = fetch_metadata(["VOO"], cache_dir=tmp_path).rows["VOO"]
+    assert m.source == "cache"
+    assert m.top_holdings == {"CCC": 0.5}  # inf/nan dropped, only the finite weight kept
 
 
 def test_metadata_result_shapes() -> None:

@@ -62,6 +62,27 @@ def test_fetch_returns_provenance(
     assert p.fetched_at.tzinfo is not None  # tz-aware
 
 
+def test_latest_missing_close_column_degrades_not_crashes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Regression: a yfinance frame without a "Close" column (only "Adj Close", a
+    # renamed/partial frame) must degrade the ticker to .missing — never raise
+    # KeyError and kill the whole batch. The series path already guarded this via
+    # _normalize_close; the latest path now shares that one extractor.
+    def _yf(t, s, e):  # type: ignore[no-untyped-def]
+        if t == "BAD":
+            return pd.DataFrame(
+                {"Adj Close": [1.0]}, index=pd.DatetimeIndex([pd.Timestamp("2024-01-05")])
+            )
+        return _fake_yf_df(100.0, date(2024, 1, 5))
+
+    monkeypatch.setattr(P, "_fetch_yf", _yf)
+    monkeypatch.setattr(P, "_fetch_stooq_csv", lambda t: None)
+    result = fetch_latest(["GOOD", "BAD"], asof_date=date(2024, 1, 6), cache_dir=tmp_path)
+    assert result.rows["GOOD"].close == 100.0  # the bad ticker didn't poison the batch
+    assert result.missing == ["BAD"]
+
+
 def test_fetch_writes_cache_after_live(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

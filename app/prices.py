@@ -271,10 +271,8 @@ def _from_yfinance(ticker: str, asof: date) -> PriceRow | None:
     df = _fetch_yf(ticker, start, end)
     if df is None or df.empty:
         return None
-    if isinstance(df.columns, pd.MultiIndex):
-        df = df.droplevel(1, axis=1)
-    close = df["Close"].dropna()
-    if close.empty:
+    close = _normalize_close(df)  # shared extractor: one MultiIndex/"Close"/empty guard
+    if close is None:
         return None
     last_idx = close.index[-1]
     last_date: date = last_idx.date() if hasattr(last_idx, "date") else asof

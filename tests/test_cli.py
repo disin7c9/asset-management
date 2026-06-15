@@ -736,6 +736,35 @@ def test_no_risk_still_runs_explicit_backtest(
     assert "=== DRAWDOWN" not in out
 
 
+def test_main_resolves_today_once(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # Regression (v1.7.0 bug-class): cli.main must read the clock ONCE and thread
+    # it, so the title, the returns-window end, and the --backtest end can never
+    # straddle local midnight. _compute_prices_returns_risk and _compute_backtest
+    # used to re-read date.today(); now they receive it. A full run exercising both
+    # must make exactly one cli-side clock read. (Line 250's validation read only
+    # fires with --backtest-start, which this run omits.)
+    class _ClockSpy(date):
+        calls = 0
+
+        @classmethod
+        def today(cls) -> date:
+            _ClockSpy.calls += 1
+            return date(2026, 6, 13)
+
+    monkeypatch.setattr("app.cli.date", _ClockSpy)
+    monkeypatch.setattr("app.cli.fetch_series", _flat_series)
+    monkeypatch.setattr("app.cli.price_basis_mismatches", lambda *a, **k: [])
+    with caplog.at_level(logging.INFO):
+        rc = main(["--csv", str(SAMPLE), "--backtest", "--target", str(TARGET)])
+    capsys.readouterr()
+    assert rc == 0
+    assert _ClockSpy.calls == 1
+    assert _run_summary(caplog)["date"] == "2026-06-13"
+
+
 def test_nonpositive_priced_holding_suppresses_money_weighted(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
     capsys: pytest.CaptureFixture[str],
