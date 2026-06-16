@@ -37,12 +37,19 @@ Mode = Literal["to_total", "cash_flow_only", "fixed_dca", "bands"]
 VALID_MODES: frozenset[str] = frozenset(get_args(Mode))  # tracks the type
 
 StrategyKind = Literal["discipline", "edge"]
-# Every v1 mode is *discipline*: rebalancing makes no claim to beat the market, so
-# it needs no backtest to be honest and may always suggest. An *edge* strategy
-# (timing/momentum, post-v1) MUST pass a walk-forward backtest before it may
-# surface a suggestion — enforced by `may_suggest`. The map is the single source
-# of truth; an unknown mode is treated as edge (fail-safe → must be validated).
-_MODE_KIND: dict[str, StrategyKind] = {m: "discipline" for m in VALID_MODES}
+# EXPLICIT per-mode classification. The v1 rebalance modes are all *discipline*:
+# rebalancing makes no claim to beat the market, so it needs no backtest to be
+# honest and may always suggest. Deliberately NOT {m: "discipline" for m in
+# VALID_MODES} — that would blanket-mark a future *edge* mode (timing/momentum)
+# discipline the instant it joins the Mode Literal, slipping it past `may_suggest`.
+# A mode absent here falls through to the unknown→edge fail-safe in strategy_kind();
+# an edge mode MUST be listed explicitly as "edge".
+_MODE_KIND: dict[str, StrategyKind] = {
+    "to_total": "discipline",
+    "cash_flow_only": "discipline",
+    "fixed_dca": "discipline",
+    "bands": "discipline",
+}
 
 # Trades below this dollar magnitude are treated as "hold" (avoids micro-orders
 # and floating-point residue after an exact rebalance).

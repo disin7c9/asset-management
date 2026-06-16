@@ -446,3 +446,20 @@ def role_check(
         parts.append("no clear out-of-sample improvement (inside the noise/CI band)")
     windows = tuple(w for w in (is_win, oos_win) if w is not None)
     return RoleCheck(candidate, sleeve, schedule, windows, verdict, "; ".join(parts))
+
+
+def validate_from_role(rc: RoleCheck) -> bool:
+    """The walk-forward evidence → the edge gate's ``validated`` flag.
+
+    Returns True ONLY when the held-out role check came back ``improved`` — which
+    already requires the out-of-sample drawdown to be shallower beyond the noise
+    margin AND the paired moving-block bootstrap CI of the difference to exclude
+    zero (see ``role_check``). ``worsened`` / ``inconclusive`` / ``insufficient``
+    all → False: the gate stays shut unless the evidence is unambiguous.
+
+    This is the ONLY sanctioned producer of ``validated=True`` for
+    ``allocate(..., validated=)`` and ``strategy.may_suggest(..., backtest_validated=)``
+    — an edge rule or AI-surfaced suggestion opens the gate by passing a real
+    walk-forward role check, never by a caller asserting it.
+    """
+    return rc.verdict == "improved"

@@ -267,3 +267,37 @@ def test_role_check_aligns_mismatched_calendars() -> None:
     oos = rc.oos
     if oos is not None:
         assert oos.n_days > 0  # aligned length, one number for both legs
+
+
+# --- validate_from_role: the verdict → edge-gate bridge (v2.0.0 Phase 0) ---
+
+
+def test_validate_from_role_only_improved_opens_the_gate() -> None:
+    # The verdict→bool bridge to the edge gate. ONLY a held-out "improved" (which
+    # already required the paired-bootstrap CI to exclude zero) opens the gate;
+    # every other verdict keeps it shut.
+    from app.backtest import RoleCheck, RoleVerdict, validate_from_role
+
+    def rc(verdict: RoleVerdict) -> RoleCheck:
+        return RoleCheck("C", 0.05, "quarterly", (), verdict, "t")
+
+    assert validate_from_role(rc("improved")) is True
+    assert validate_from_role(rc("worsened")) is False
+    assert validate_from_role(rc("inconclusive")) is False
+    assert validate_from_role(rc("insufficient")) is False
+
+
+def test_validate_from_role_end_to_end() -> None:
+    # The real bridge: a decisive OOS hedge → role_check "improved" → gate opens;
+    # a clone → "inconclusive" → gate stays shut.
+    from app.backtest import role_check, validate_from_role
+
+    aaa = _close_path([0.001] * 210 + [-0.005] * 60 + [0.001] * 30)
+    hedge = _close_path([0.0002] * 210 + [0.004] * 90)
+    rc = role_check({"AAA": aaa, "HEDGE": hedge}, {"AAA": 1.0}, "HEDGE", sleeve=0.5)
+    assert validate_from_role(rc) is True
+
+    rets = [0.002, -0.001] * 150
+    clone_book = {"AAA": _close_path(rets), "CLONE": _close_path(rets)}
+    rc2 = role_check(clone_book, {"AAA": 1.0}, "CLONE", sleeve=0.5)
+    assert validate_from_role(rc2) is False

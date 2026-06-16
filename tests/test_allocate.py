@@ -162,3 +162,32 @@ def test_rule_registries_stay_in_sync() -> None:
     # runtime ("unknown allocation rule") or is silently blocked as edge — pin them.
     assert set(A._RULES) == set(VALID_RULES)
     assert set(A._RULE_KIND) >= set(A._RULES)  # every runnable rule has an explicit kind
+
+
+def test_rule_kind_is_explicit_classification_not_blanket() -> None:
+    # Regression for the fail-safe inversion (v2.0.0 Phase 0). _RULE_KIND is an
+    # explicit per-rule map (NOT {r: "discipline" for r in VALID_RULES}), so a future
+    # edge rule added to the AllocationRule Literal is not silently waved through as
+    # discipline: a name absent from the map reads edge.
+    assert A._RULE_KIND["equal_weight"] == "discipline"
+    assert A._RULE_KIND["inverse_vol"] == "discipline"
+    assert allocation_kind("max_sharpe") == "edge"  # absent → fail-safe edge
+
+
+def test_allocate_edge_rule_opens_only_on_validated_role(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The Phase-0 bridge, end to end: an edge allocator opens ONLY when a real role
+    # check validates it. validate_from_role(improved) → True opens the gate; any
+    # other verdict → False keeps UnvalidatedEdgeError.
+    from app.backtest import RoleCheck, validate_from_role
+
+    monkeypatch.setitem(A._RULES, "fake_optimizer", lambda universe, series: {"VOO": 1.0})
+    improved = RoleCheck("X", 0.05, "quarterly", (), "improved", "")
+    inconclusive = RoleCheck("X", 0.05, "quarterly", (), "inconclusive", "")
+
+    assert allocate(
+        "fake_optimizer", ["VOO"], validated=validate_from_role(improved)
+    ) == {"VOO": 1.0}
+    with pytest.raises(UnvalidatedEdgeError, match="walk-forward"):
+        allocate("fake_optimizer", ["VOO"], validated=validate_from_role(inconclusive))

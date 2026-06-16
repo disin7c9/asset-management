@@ -51,7 +51,15 @@ VALID_RULES: frozenset[str] = frozenset(get_args(AllocationRule))
 # (fail-safe: must be validated). Same axis as `strategy.StrategyKind`, kept local
 # so the two L2 modules stay independent.
 AllocationKind = Literal["discipline", "edge"]
-_RULE_KIND: dict[str, AllocationKind] = {r: "discipline" for r in VALID_RULES}
+# EXPLICIT per-rule classification — deliberately NOT {r: "discipline" for r in
+# VALID_RULES}, which would blanket-mark every rule discipline the moment it joins
+# the AllocationRule Literal, silently waving a coming edge allocator (mean-variance
+# / max-Sharpe) past the gate. A rule absent here falls through to the unknown→edge
+# fail-safe in allocation_kind(); an edge rule MUST be listed explicitly as "edge".
+_RULE_KIND: dict[str, AllocationKind] = {
+    "equal_weight": "discipline",
+    "inverse_vol": "discipline",
+}
 
 _TRADING_DAYS = 252
 

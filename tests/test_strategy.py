@@ -206,6 +206,33 @@ def test_suggest_refuses_edge_mode_at_the_chokepoint() -> None:
         suggest("momentum", HELD, PRICES, TARGET)  # type: ignore[arg-type]
 
 
+def test_mode_kind_is_explicit_classification_not_blanket() -> None:
+    # Regression for the fail-safe inversion (v2.0.0 Phase 0). _MODE_KIND is an
+    # explicit per-mode map (NOT {m: "discipline" for m in VALID_MODES}), so a future
+    # edge mode added to the Mode Literal is not silently classified discipline: a
+    # mode absent from the map reads edge.
+    import app.strategy as S
+
+    assert S._MODE_KIND["to_total"] == "discipline"
+    assert S._MODE_KIND["bands"] == "discipline"
+    assert strategy_kind("momentum") == "edge"  # absent → fail-safe edge
+    # Every mode in the Literal MUST be classified, or a discipline mode added later
+    # but forgotten here would be silently gated as edge (the guarantee the old
+    # comprehension gave by construction). Mirror of allocate's registry-sync test.
+    assert set(S.VALID_MODES) <= set(S._MODE_KIND)
+
+
+def test_may_suggest_opens_edge_mode_only_on_validated_role() -> None:
+    # The Phase-0 bridge: an edge mode may suggest ONLY when a role check validates
+    # it. validate_from_role(improved) → True; any other verdict → False.
+    from app.backtest import RoleCheck, validate_from_role
+
+    improved = RoleCheck("X", 0.05, "quarterly", (), "improved", "")
+    worsened = RoleCheck("X", 0.05, "quarterly", (), "worsened", "")
+    assert may_suggest("momentum", backtest_validated=validate_from_role(improved)) is True
+    assert may_suggest("momentum", backtest_validated=validate_from_role(worsened)) is False
+
+
 # ── property-based invariants (the v1 product) ──────────────────────────────
 
 _TICKERS = ["A", "B", "C", "D", "E"]
