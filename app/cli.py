@@ -34,11 +34,14 @@ from app.prices import (
 )
 from app.report import (
     ReportData,
+    Section,
     build_report_data,
     render_html,
     render_markdown,
     render_text,
 )
+from app.llm import complete, load_config
+from app.narrate import build_claim_set, build_prompt, render_narration
 from app.returns import (
     ReturnsSummary,
     build_daily_returns,
@@ -242,6 +245,14 @@ def main(argv: list[str] | None = None) -> int:
         metavar="FRAC",
         help="per-asset weight ceiling for --allocate (e.g. 0.30), excess redistributed",
     )
+    parser.add_argument(
+        "--narrate",
+        action="store_true",
+        help="add a plain-language SUMMARY block (opt-in; needs an LLM backend in "
+        ".env: ASSET_NARRATE_PROVIDER/MODEL/KEY). The model writes only prose with "
+        "{{tokens}}; every number is substituted and verified from the validated "
+        "core (SymGen/PCN) — wording is the model's, the figures are the tool's.",
+    )
     args = parser.parse_args(argv)
     if args.new_cash < 0:
         parser.error("--new-cash must be >= 0")
@@ -273,7 +284,7 @@ def main(argv: list[str] | None = None) -> int:
     # exempt; the bundled example is opt-in via an explicit --csv path.
     needs_book = bool(
         args.rebalance or args.allocate or args.dump_target or args.save or args.send
-        or args.metadata or args.screen
+        or args.metadata or args.screen or args.narrate
     )
     # Personal defaults from .env (gitignored; loaded above). ASSET_CSV fills --csv
     # for runs that want a book; a pure `--backtest --target` run stays notional
@@ -315,6 +326,7 @@ def main(argv: list[str] | None = None) -> int:
         "allocate": None,
         "metadata": None,
         "screen": None,
+        "narrate": None,
     }
 
     # Nothing to do: no book and no notional backtest → guide, don't fabricate a brief.
@@ -421,11 +433,15 @@ def main(argv: list[str] | None = None) -> int:
     if args.screen:
         cands = _compute_screen(state, args, run, today, daily)
 
+    summary_section: Section | None = None
+    if args.narrate:
+        summary_section = _compute_narration(state, prices, returns, risk, dollar_dd, run)
+
     data = build_report_data(
         state, prices=prices, returns=returns, risk=risk,
         suggestions=suggestions, backtest=backtest, missing_tickers=missing,
         asof=today, generated_at=datetime.now(timezone.utc), twr_excluded=twr_excluded,
-        dollar_dd=dollar_dd, metadata=meta, candidates=cands,
+        dollar_dd=dollar_dd, metadata=meta, candidates=cands, summary=summary_section,
     )
 
     sys.stdout.write(render_text(data) + "\n")
@@ -1005,12 +1021,52 @@ def _compute_backtest(
     return result
 
 
+def _compute_narration(
+    state: DerivedState,
+    prices: dict[str, PriceRow] | None,
+    returns: ReturnsSummary | None,
+    risk: RiskSummary | None,
+    dollar_dd: DollarDrawdown | None,
+    run: dict[str, Any],
+) -> Section | None:
+    """Build the opt-in SUMMARY narration: claim set → LLM prose → SymGen/PCN fence
+    → a source-labeled Section. Fail-closed at every step (no backend, no figures, a
+    model failure, or a fence rejection) → None, and the plain brief still prints.
+    The numbers are the tool's; only the wording is the model's."""
+    config = load_config()
+    if config is None:
+        log.warning("--narrate: no LLM backend configured (set ASSET_NARRATE_* in .env)")
+        run["narrate"] = "skipped: not configured"
+        return None
+    claim_set = build_claim_set(state, prices, returns, risk, dollar_dd=dollar_dd)
+    if not claim_set:
+        run["narrate"] = "skipped: no figures to narrate"
+        return None
+    system, user = build_prompt(claim_set, tier=config.tier)
+    prose = complete(config, system, user)
+    fenced = render_narration(prose, claim_set) if prose else None
+    if fenced is None:
+        log.warning(
+            "--narrate: narration withheld — the model returned nothing, or its output "
+            "failed the number fence (a stray digit / unknown token)"
+        )
+        run["narrate"] = "withheld: empty or failed the fence"
+        return None
+    provenance = (
+        f"— wording by {config.model} ({config.tier} tier); the figures are computed "
+        "and verified by the tool, not the model. Not financial advice."
+    )
+    run["narrate"] = f"{config.model} ({config.tier})"
+    return Section("SUMMARY", (fenced, "", provenance), prose=True)
+
+
 def _log_run_summary(run: dict[str, Any]) -> None:
     """Emit one structured JSON line summarizing the run.
 
     Schema: {date, source, n_events_replayed, n_prices_fetched, n_prices_missing,
     n_series_fetched, n_series_missing, fallbacks_used, status, report_saved,
-    email_sent, email_detail?, rebalance, backtest, error?}.
+    email_sent, email_detail?, rebalance, backtest, allocate, metadata, screen,
+    narrate, error?}.
     """
     log.info("run_summary %s", json.dumps(run, separators=(",", ":")))
 

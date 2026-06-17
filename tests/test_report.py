@@ -14,6 +14,7 @@ from app.derive import DerivedState, Position
 from app.prices import PriceRow
 from app.report import (
     ReportData,
+    Section,
     build_report_data,
     format_summary,
     render_html,
@@ -130,6 +131,25 @@ def test_markdown_has_headings_and_fences(state, prices, returns, risk) -> None:
     assert "## DRAWDOWN (investment, time-weighted)" in md
     assert "```" in md  # bodies are fenced to preserve alignment
     assert md.endswith("\n")
+
+
+def test_narration_summary_renders_as_prose_not_monospace(state, prices, returns, risk) -> None:
+    # A prose Section (the narration SUMMARY) must lead the brief and render as wrapped
+    # paragraphs — NOT a ``` code fence (markdown) or a white-space:pre box (HTML), which
+    # would show flowing prose as monospace and horizontally scroll in an email client.
+    prose = "Your portfolio fell from its February peak and has since recovered."
+    prov = "— wording by claude-haiku-4-5 (paid tier); figures verified by the tool."
+    summary = Section("SUMMARY", (prose, "", prov), prose=True)
+    data = build_report_data(state, prices, returns, risk, summary=summary)
+    assert data.sections[0].title == "SUMMARY"  # leads the brief
+    assert prose in render_text(data)
+
+    md = render_markdown(data)
+    assert f"## SUMMARY\n\n{prose}" in md   # heading then prose paragraph
+    assert f"```\n{prose}" not in md        # NOT inside a code fence
+
+    html = render_html(data)
+    assert f'margin:0 0 16px">{prose}<br>' in html  # in a wrapping <p>, not a <pre>
 
 
 def test_html_escapes_and_wraps(state, prices, returns, risk) -> None:

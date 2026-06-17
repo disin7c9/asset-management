@@ -46,10 +46,14 @@ _DISCLAIMER = (
 
 @dataclass(frozen=True)
 class Section:
-    """One report section. ``title`` empty → rendered without a heading."""
+    """One report section. ``title`` empty → rendered without a heading. ``prose``
+    True → the body is flowing prose (the narration SUMMARY), rendered as wrapped
+    paragraphs rather than a monospace code/``<pre>`` block (those are for the
+    column-aligned grids, where prose would horizontally scroll and not wrap)."""
 
     title: str
     lines: tuple[str, ...]
+    prose: bool = False
 
 
 @dataclass(frozen=True)
@@ -126,6 +130,7 @@ def build_report_data(
     dollar_dd: DollarDrawdown | None = None,
     metadata: MetadataResult | None = None,
     candidates: list[CandidateScreen] | None = None,
+    summary: Section | None = None,
 ) -> ReportData:
     """Assemble the deterministic brief as ordered sections.
 
@@ -149,6 +154,8 @@ def build_report_data(
         # every consumer (the SECURITIES ages, the title) uses the SAME date.
         asof = returns.asof_date if returns is not None else gen.date()
     sections: list[Section] = []
+    if summary is not None:  # narration (P2) leads the brief when present
+        sections.append(summary)
 
     if suggestions:
         sections.append(_section_suggestions(suggestions))
@@ -540,7 +547,10 @@ def render_markdown(data: ReportData) -> str:
     """
     blocks: list[str] = [f"# {data.title}"]
     for sec in data.sections:
-        if sec.title:
+        if sec.prose:  # narration: wrapped paragraphs, not a monospace fence
+            heading = f"## {sec.title}\n\n" if sec.title else ""
+            blocks.append(heading + "\n\n".join(line for line in sec.lines if line))
+        elif sec.title:
             body = "\n".join(sec.lines)
             blocks.append(f"## {sec.title}\n\n```\n{body}\n```")
         else:
@@ -562,6 +572,17 @@ def render_html(data: ReportData) -> str:
         f'<h2 style="font-family:system-ui,sans-serif">{html.escape(data.title)}</h2>'
     ]
     for sec in data.sections:
+        if sec.prose:  # narration: wrapping <p> paragraphs, not a monospace <pre>
+            if sec.title:
+                parts.append(
+                    f'<h3 style="font-family:system-ui,sans-serif;margin:20px 0 6px">'
+                    f"{html.escape(sec.title)}</h3>"
+                )
+            para = "<br>".join(html.escape(line) for line in sec.lines)
+            parts.append(
+                f'<p style="font:14px/1.5 system-ui,sans-serif;margin:0 0 16px">{para}</p>'
+            )
+            continue
         body = html.escape("\n".join(sec.lines))
         if sec.title:
             parts.append(
