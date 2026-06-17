@@ -473,12 +473,15 @@ def _deliver(
     return ok
 
 
-def _compute_prices_returns_risk(
+def compute_prices_returns_risk(
     events: list[Event],
     state: DerivedState,
-    args: argparse.Namespace,
-    run: dict[str, Any],
+    *,
+    no_risk: bool,
+    offline: bool,
+    cache_dir: Path,
     today: date,
+    run: dict[str, Any],
 ) -> tuple[
     dict[str, PriceRow] | None,
     ReturnsSummary | None,
@@ -498,7 +501,7 @@ def _compute_prices_returns_risk(
     the latest prices.
     """
     held = state.held()
-    online = not args.offline
+    online = not offline
     prices: dict[str, PriceRow] = {}
     risk: RiskSummary | None = None
     true_twr: float | None = None
@@ -507,13 +510,13 @@ def _compute_prices_returns_risk(
     daily: pd.Series[float] | None = None
 
     series = None
-    if not args.no_risk and events:
+    if not no_risk and events:
         # Real securities only — the CASH pseudo-ticker (deposit/withdraw legs) has
         # no price history; fetching it would land in series.missing and falsely
         # flip the run status to "partial" on every book that holds cash flows.
         traded = sorted({ev.ticker for ev in events} - {CASH_TICKER})
         start = min(ev.date for ev in events) - timedelta(days=5)
-        series = fetch_series(traded, start, today, cache_dir=args.cache_dir, online=online)
+        series = fetch_series(traded, start, today, cache_dir=cache_dir, online=online)
         _record_series_fetch(run, series)
         if series.rows:
             # Guard against unhandled stock splits: the log holds raw share counts
@@ -566,7 +569,7 @@ def _compute_prices_returns_risk(
     else:
         # No risk panel (or series unavailable): fetch latest prices for held.
         result: PricesResult = fetch_latest(
-            list(held), cache_dir=args.cache_dir, online=online
+            list(held), cache_dir=cache_dir, online=online
         )
         prices = result.rows
         run["fallbacks_used"] = result.fallbacks_used
@@ -597,6 +600,29 @@ def _compute_prices_returns_risk(
         events, mkt_value, asof_date=today, true_twr=true_twr, fully_priced=not missing
     )
     return prices, returns, risk, missing, twr_excluded, dollar_dd, series, daily
+
+
+def _compute_prices_returns_risk(
+    events: list[Event],
+    state: DerivedState,
+    args: argparse.Namespace,
+    run: dict[str, Any],
+    today: date,
+) -> tuple[
+    dict[str, PriceRow] | None,
+    ReturnsSummary | None,
+    RiskSummary | None,
+    list[str],
+    list[str],
+    DollarDrawdown | None,
+    SeriesResult | None,
+    "pd.Series[float] | None",
+]:
+    """CLI adapter over `compute_prices_returns_risk` (unpacks the argparse fields)."""
+    return compute_prices_returns_risk(
+        events, state, no_risk=args.no_risk, offline=args.offline,
+        cache_dir=args.cache_dir, today=today, run=run,
+    )
 
 
 def _held_market_value(
