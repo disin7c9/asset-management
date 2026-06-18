@@ -222,6 +222,43 @@ def test_build_prompt_free_sends_buckets_not_values(
     assert "solid" in user       # sharpe +1.75 → solid band
 
 
+def test_band_lives_on_the_claim(
+    core: tuple[DerivedState, dict[str, PriceRow], ReturnsSummary, RiskSummary],
+) -> None:
+    # #9: the FREE-tier band is computed with the claim (not re-dispatched on token
+    # name in build_prompt). Banded metrics carry one; dates/counts/$ amounts don't.
+    state, prices, returns, risk = core
+    c = build_claim_set(state, prices, returns, risk)
+    assert c["max_drawdown"].band == "moderate"   # |-9.84%| ∈ [5%, 15%)
+    assert c["sharpe"].band == "solid"            # +1.75 ∈ [1.0, 2.0)
+    assert c["twr_annual"].band == "healthy"      # +19.37% ∈ [10%, 20%)
+    assert c["ulcer"].band == "moderate"          # 2.38% ∈ [2%, 5%)
+    assert c["cdar"].band == "moderate"           # 6.73% ∈ [5%, 15%)
+    assert c["total_market_value"].band is None   # $ amount → no band
+    assert c["drawdown_peak_date"].band is None   # date → no band
+
+
+def test_band_for_fails_closed_on_non_finite() -> None:
+    # #4: a band must never assert "severe"/"strong" for a non-finite (n/a) figure; an
+    # unknown token has no spec → None.
+    from app.narrate import _band_for
+
+    assert _band_for("sharpe", float("nan")) is None
+    assert _band_for("max_drawdown", float("inf")) is None
+    assert _band_for("unknown_token", 1.0) is None
+
+
+def test_build_prompt_local_sends_exact_values(
+    core: tuple[DerivedState, dict[str, PriceRow], ReturnsSummary, RiskSummary],
+) -> None:
+    # tier=local (a model on your own machine) sends exact values like paid — nothing
+    # leaves the machine, so there's no reason to withhold them.
+    state, prices, returns, risk = core
+    c = build_claim_set(state, prices, returns, risk)
+    _system, user = build_prompt(c, tier="local")
+    assert "-9.84%" in user and "+1.75" in user  # exact, like paid
+
+
 def test_fence_over_a_fake_model(
     core: tuple[DerivedState, dict[str, PriceRow], ReturnsSummary, RiskSummary],
 ) -> None:
@@ -232,6 +269,49 @@ def test_fence_over_a_fake_model(
     build_prompt(c, tier="paid")  # would be sent to the LLM
     model_output = "You fell {{max_drawdown}} from your {{drawdown_peak_date}} peak; Sharpe {{sharpe}}."
     assert render_narration(model_output, c) == "You fell -9.84% from your 2025-02-19 peak; Sharpe +1.75."
+
+
+# A golden battery pinning the fence's behavior on realistic model prose (P2c). Every
+# number in an accepted output arrives by substitution; anything else fails closed.
+_GOLDEN: tuple[tuple[str, str | None], ...] = (
+    # accepted — figures substituted from the validated core
+    ("You fell {{max_drawdown}} from your {{drawdown_peak_date}} peak; Sharpe {{sharpe}}.",
+     "You fell -9.84% from your 2025-02-19 peak; Sharpe +1.75."),
+    ("Risk-adjusted, the run looks {{sharpe}} on a Sharpe basis and {{sortino}} on Sortino.",
+     "Risk-adjusted, the run looks +1.75 on a Sharpe basis and +2.66 on Sortino."),
+    ("A calm, steady stretch — nothing dramatic to report.",
+     "A calm, steady stretch — nothing dramatic to report."),
+    # rejected (→ None) — fail closed
+    ("Your portfolio fell about 10% this year.", None),                  # bare digit
+    ("Drawdown {{max_drawdown}}, and roughly 12% more besides.", None),  # digit beside a token
+    ("Your fund tracks the S&P 500 index.", None),                       # incidental index number
+    ("Your {{made_up_metric}} looks great.", None),                      # unknown token
+    ("Returns were {{twr_annual} strong.", None),                        # malformed (one brace)
+    ("", None),                                                          # empty
+)
+
+
+@pytest.mark.parametrize("prose, expected", _GOLDEN)
+def test_fence_golden_set(
+    core: tuple[DerivedState, dict[str, PriceRow], ReturnsSummary, RiskSummary],
+    prose: str,
+    expected: str | None,
+) -> None:
+    state, prices, returns, risk = core
+    c = build_claim_set(state, prices, returns, risk)
+    assert render_narration(prose, c) == expected
+
+
+def test_verbal_magnitude_passes_the_fence_is_a_known_residual(
+    core: tuple[DerivedState, dict[str, PriceRow], ReturnsSummary, RiskSummary],
+) -> None:
+    # KNOWN residual: PCN blocks model-typed DIGITS, not words. A magnitude stated in
+    # words has no digit, so the fence passes it through — the system prompt is what
+    # discourages it (#7), not the fence. Pinned so the boundary stays explicit.
+    state, prices, returns, risk = core
+    c = build_claim_set(state, prices, returns, risk)
+    txt = "Your portfolio nearly doubled over the period."
+    assert render_narration(txt, c) == txt
 
 
 def test_compute_narration_builds_summary_section(

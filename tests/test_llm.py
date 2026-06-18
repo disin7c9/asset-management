@@ -5,6 +5,8 @@ providers' wire-format parsing, and the fail-closed paths (refusal, empty, error
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 
 from app import llm
@@ -75,6 +77,75 @@ def test_load_config_rejects_insecure_base_url(monkeypatch: pytest.MonkeyPatch) 
     assert load_config() is None  # insecure scheme → narration off
     monkeypatch.setenv("ASSET_NARRATE_BASE_URL", "http://localhost:11434/v1")
     assert load_config() is not None  # localhost proxy (Ollama/llama.cpp) is allowed
+
+
+def test_load_config_tier_local_honored_for_localhost(monkeypatch: pytest.MonkeyPatch) -> None:
+    # tier=local on a localhost model is honored — nothing leaves the machine, so it
+    # may send exact figures (build_prompt treats local like paid).
+    _clear_env(monkeypatch)
+    monkeypatch.setenv("ASSET_NARRATE_PROVIDER", "openai")
+    monkeypatch.setenv("ASSET_NARRATE_KEY", "k")
+    monkeypatch.setenv("ASSET_NARRATE_MODEL", "m")
+    monkeypatch.setenv("ASSET_NARRATE_BASE_URL", "http://localhost:11434/v1")
+    monkeypatch.setenv("ASSET_NARRATE_TIER", "local")
+    c = load_config()
+    assert c is not None and c.tier == "local"
+
+
+def test_load_config_local_hosts_recognized(monkeypatch: pytest.MonkeyPatch) -> None:
+    # IPv6 loopback (::1) and the Docker host are local too — they must be accepted
+    # (not rejected as non-https, which would turn narration off) and honor tier=local.
+    for base in ("http://[::1]:11434/v1", "http://host.docker.internal:11434/v1"):
+        _clear_env(monkeypatch)
+        monkeypatch.setenv("ASSET_NARRATE_PROVIDER", "openai")
+        monkeypatch.setenv("ASSET_NARRATE_KEY", "k")
+        monkeypatch.setenv("ASSET_NARRATE_MODEL", "m")
+        monkeypatch.setenv("ASSET_NARRATE_BASE_URL", base)
+        monkeypatch.setenv("ASSET_NARRATE_TIER", "local")
+        c = load_config()
+        assert c is not None and c.tier == "local", base
+
+
+def test_load_config_tier_local_downgrades_on_remote(monkeypatch: pytest.MonkeyPatch) -> None:
+    # tier=local against a REMOTE endpoint must NOT send exact values to the cloud under
+    # a "local" label → falls back to free. Anthropic (cloud-only) can't be local either.
+    _clear_env(monkeypatch)
+    monkeypatch.setenv("ASSET_NARRATE_PROVIDER", "openai")
+    monkeypatch.setenv("ASSET_NARRATE_KEY", "k")
+    monkeypatch.setenv("ASSET_NARRATE_MODEL", "m")
+    monkeypatch.setenv("ASSET_NARRATE_BASE_URL", "https://api.groq.com/openai/v1")
+    monkeypatch.setenv("ASSET_NARRATE_TIER", "local")
+    c = load_config()
+    assert c is not None and c.tier == "free"
+    monkeypatch.setenv("ASSET_NARRATE_PROVIDER", "anthropic")
+    monkeypatch.delenv("ASSET_NARRATE_BASE_URL", raising=False)
+    a = load_config()
+    assert a is not None and a.tier == "free"
+
+
+def test_free_cloud_emits_enrollment_warning_local_does_not(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Structural trust warning: free-tier on a CLOUD provider warns (training + rougher
+    # wording). A localhost endpoint does NOT — nothing leaves the machine.
+    _clear_env(monkeypatch)
+    monkeypatch.setenv("ASSET_NARRATE_PROVIDER", "anthropic")
+    monkeypatch.setenv("ASSET_NARRATE_KEY", "k")
+    monkeypatch.setenv("ASSET_NARRATE_MODEL", "m")  # tier unset → free, anthropic = cloud
+    with caplog.at_level(logging.WARNING, logger="app.llm"):
+        load_config()
+    assert "free-tier narration" in caplog.text and "train" in caplog.text
+
+    caplog.clear()
+    _clear_env(monkeypatch)
+    monkeypatch.setenv("ASSET_NARRATE_PROVIDER", "openai")
+    monkeypatch.setenv("ASSET_NARRATE_KEY", "k")
+    monkeypatch.setenv("ASSET_NARRATE_MODEL", "m")
+    monkeypatch.setenv("ASSET_NARRATE_BASE_URL", "http://localhost:11434/v1")  # local, tier unset → free
+    with caplog.at_level(logging.WARNING, logger="app.llm"):
+        c = load_config()
+    assert c is not None and c.tier == "free"
+    assert "free-tier narration" not in caplog.text
 
 
 _ANTHRO = NarratorConfig("anthropic", "claude-haiku-4-5", "k", "", "paid", None)

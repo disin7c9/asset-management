@@ -169,10 +169,10 @@ ASSET_NARRATE_MODEL=claude-haiku-4-5
 ASSET_NARRATE_KEY=sk-...
 # for provider=openai, also set the endpoint (https required; http only for localhost):
 ASSET_NARRATE_BASE_URL=https://api.groq.com/openai/v1
-ASSET_NARRATE_TIER=paid                  # privacy dial (see below) — default: free
+ASSET_NARRATE_TIER=paid                  # free | paid | local — privacy dial (see below); default: free
 ```
 
-**Privacy dial.** The `tier` controls what leaves your machine. On **`free`** (the default — for keys from providers whose free tiers may train on your inputs) only *coarse qualitative bands* ("moderate", "solid") are sent; your exact dollar amounts, returns, and dates stay home and are filled in locally. On **`paid`** (providers that contractually don't train on your data) the exact figures are sent for richer wording. The dial **fails safe**: only an explicit `ASSET_NARRATE_TIER=paid` ever sends exact values — a blank or misspelled tier stays on `free`. If narration isn't configured, or the model call fails, the brief simply prints without the SUMMARY.
+**Privacy dial.** The `tier` controls what leaves your machine. On **`free`** (the default — for keys from providers whose free tiers may train on your inputs) only *coarse qualitative bands* ("moderate", "solid") are sent; your exact dollar amounts, returns, and dates stay home and are filled in locally. On **`paid`** (providers that contractually don't train on your data) the exact figures are sent for richer wording. A third tier, **`local`**, is for a model running on your own machine (Ollama / llama.cpp at `http://localhost` — also `::1` or `host.docker.internal`): it sends exact figures too, since nothing leaves the machine, and it's honored only against a genuine local endpoint (otherwise it falls back to `free`). The dial **fails safe**: only an explicit `paid` or `local` ever sends exact values — a blank or misspelled tier stays on `free`, and on `free` the tool logs a one-line reminder that the provider may train on what it is sent. If narration isn't configured, or the model call fails, the brief simply prints without the SUMMARY.
 
 ## Develop
 

@@ -37,13 +37,16 @@ from app.risk import DollarDrawdown, RiskSummary
 class Claim:
     """One referenceable figure: the LLM cites it as ``{{token}}`` and the renderer
     substitutes ``rendered`` (the validated display string). ``value`` is the raw
-    typed number kept for the later privacy dial (bucketing); the fence only uses
-    ``rendered``."""
+    typed number; the fence only uses ``rendered``. ``band`` is the coarse
+    qualitative label (e.g. "moderate") the FREE tier sends instead of the value —
+    computed once here, *with* the claim, so the prompt builder never re-dispatches on
+    token name and a new metric can't silently lose its band."""
 
     token: str
-    value: float | int | str | date
+    value: float | int | str | date  # raw figure behind the claim; its FREE-tier band derives from it
     rendered: str
-    label: str           # human description (for the LLM prompt in P2b)
+    label: str               # human description (for the LLM prompt)
+    band: str | None = None  # FREE-tier qualitative band; None for dates/counts/$ amounts
 
 
 # ── display formatting (mirrors report.py's conventions; numbers are the core's) ──
@@ -63,6 +66,57 @@ def _mag(x: float) -> str:
 
 def _ratio(x: float) -> str:
     return f"{x:+.2f}"             # Sharpe / Sortino / Calmar
+
+
+# ── free-tier qualitative bands (the privacy dial) ────────────────────────────
+
+
+@dataclass(frozen=True)
+class _BandSpec:
+    """A coarse band table for one metric kind. ``use_abs`` bands by magnitude
+    (drawdown depth is negative)."""
+
+    cuts: tuple[tuple[float, str], ...]
+    top: str
+    use_abs: bool = False
+
+    def label_for(self, value: float) -> str:
+        v = abs(value) if self.use_abs else value
+        for cut, label in self.cuts:
+            if v < cut:
+                return label
+        return self.top
+
+
+_RATIO_BAND = _BandSpec(((0.0, "negative"), (1.0, "weak"), (2.0, "solid")), "strong")
+_RETURN_BAND = _BandSpec(((0.0, "negative"), (0.10, "modest"), (0.20, "healthy")), "strong")
+# Drawdown-magnitude cuts (5/15/30%), shared by max-drawdown depth (negative → use_abs)
+# and CDaR (already a positive magnitude). All band thresholds here are ROUGH, coarse
+# tone buckets — tunable; they only nudge the FREE-tier model's wording, never a figure.
+_DD_CUTS = ((0.05, "mild"), (0.15, "moderate"), (0.30, "significant"))
+
+# token → band spec. ONE table (was a per-token if-ladder in build_prompt): each
+# metric's band is computed *with* its Claim, so adding a metric can't silently drop
+# its FREE-tier band, and the privacy dial just reads ``c.band`` — it never
+# re-dispatches on token name. (Dates/counts/$ amounts have no band → not listed.)
+_BAND_SPECS: dict[str, _BandSpec] = {
+    "max_drawdown": _BandSpec(_DD_CUTS, "severe", use_abs=True),  # depth is negative
+    "cdar": _BandSpec(_DD_CUTS, "severe"),                        # already a positive magnitude
+    "ulcer": _BandSpec(((0.02, "mild"), (0.05, "moderate"), (0.10, "significant")), "severe"),
+    "sharpe": _RATIO_BAND, "sortino": _RATIO_BAND, "calmar": _RATIO_BAND,
+    "twr_annual": _RETURN_BAND, "mwr_annual": _RETURN_BAND, "dietz_annual": _RETURN_BAND,
+}
+
+
+def _band_for(token: str, value: float | int | str | date) -> str | None:
+    """The FREE-tier band for a claim, or None for a token without one. Computed once
+    at claim construction and stored on ``Claim.band``. Fails closed (None) on a
+    non-finite value too — a band must never assert "severe" for a figure that is
+    actually n/a (matches the fence's ethos; today add() already pre-filters these)."""
+    spec = _BAND_SPECS.get(token)
+    if spec is None or isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return None if not math.isfinite(value) else spec.label_for(float(value))
 
 
 # ── claim set: the validated figures the LLM may reference ────────────────────
@@ -89,7 +143,8 @@ def build_claim_set(
         # can never reach the fence as "nan%"/"$inf" (which PCN's \d would not catch).
         if isinstance(value, float) and not math.isfinite(value):
             return
-        claims[token] = Claim(token=token, value=value, rendered=rendered, label=label)
+        claims[token] = Claim(token=token, value=value, rendered=rendered, label=label,
+                              band=_band_for(token, value))
 
     prices = prices or {}
     held = state.held()
@@ -219,40 +274,18 @@ _SYSTEM_PROMPT = (
 )
 
 
-def _band(value: float, cuts: tuple[tuple[float, str], ...], top: str) -> str:
-    for cut, label in cuts:
-        if value < cut:
-            return label
-    return top
-
-
-def _bucket(token: str, value: float | int | str | date) -> str | None:
-    """A coarse qualitative band for a magnitude — the FREE-tier privacy dial sends
-    this instead of the exact figure, so the model can frame tone ("moderate",
-    "strong") without the number ever leaving the machine. None for values without
-    a natural band (dates, counts)."""
-    if not isinstance(value, (int, float)):
-        return None
-    v = float(value)
-    if token == "max_drawdown":
-        return _band(abs(v), ((0.05, "mild"), (0.15, "moderate"), (0.30, "significant")), "severe")
-    if token in ("sharpe", "sortino", "calmar"):
-        return _band(v, ((0.0, "negative"), (1.0, "weak"), (2.0, "solid")), "strong")
-    if token in ("twr_annual", "mwr_annual", "dietz_annual"):
-        return _band(v, ((0.0, "negative"), (0.10, "modest"), (0.20, "healthy")), "strong")
-    return None
-
-
 def build_prompt(claim_set: dict[str, Claim], *, tier: str) -> tuple[str, str]:
     """Pure: the (system, user) prompts for the narrator. The **privacy dial** lives
-    here — PAID sends each claim's exact rendered value (richer prose; the paid
-    tier doesn't train on inputs); FREE sends only a coarse qualitative band, so the
-    exact values stay home and are substituted locally by `render_narration`. Token
-    NAMES + labels always go (the model must know what it may cite)."""
+    here — PAID/LOCAL send each claim's exact rendered value (richer prose; a paid
+    provider doesn't train on inputs, a local model never leaves the machine); FREE
+    sends only the coarse qualitative band (``Claim.band``), so exact values stay home
+    and are substituted locally by `render_narration`. Token NAMES + labels always go
+    (the model must know what it may cite)."""
+    send_exact = tier in ("paid", "local")
     lines: list[str] = []
     for token in sorted(claim_set):
         c = claim_set[token]
-        hint = c.rendered if tier == "paid" else (_bucket(token, c.value) or "")
+        hint = c.rendered if send_exact else (c.band or "")
         lines.append("{{" + token + "}}  — " + c.label + (f" ({hint})" if hint else ""))
     user = (
         "Available figures — cite each ONLY as its {{token}}, never the value:\n"

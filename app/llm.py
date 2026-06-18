@@ -41,7 +41,7 @@ class NarratorConfig:
     model: str
     api_key: str
     base_url: str            # OpenAI-compatible endpoint; "" for Anthropic
-    tier: str                # "free" | "paid" (privacy dial + provenance)
+    tier: str                # "free" | "paid" | "local" (privacy dial + provenance)
     temperature: float | None
     max_tokens: int = 600
     timeout: float = 30.0
@@ -52,7 +52,8 @@ def load_config() -> NarratorConfig | None:
     configured (the default — narration is opt-in and off). Env:
     ``ASSET_NARRATE_PROVIDER`` (anthropic|openai), ``ASSET_NARRATE_MODEL``,
     ``ASSET_NARRATE_KEY``; for openai also ``ASSET_NARRATE_BASE_URL``; optional
-    ``ASSET_NARRATE_TIER`` (free|paid, default paid)."""
+    ``ASSET_NARRATE_TIER`` (free|paid|local, default free — fails safe toward less
+    disclosure: only an explicit ``paid``/``local`` sends exact figures)."""
     provider = os.environ.get("ASSET_NARRATE_PROVIDER", "").strip().lower()
     if not provider:
         return None
@@ -67,16 +68,8 @@ def load_config() -> NarratorConfig | None:
     if not key or not model:
         log.warning("narration needs ASSET_NARRATE_KEY and ASSET_NARRATE_MODEL; narration off")
         return None
-    # Privacy dial fails SAFE: exact values leave only on an explicit, correctly
-    # spelled `paid`. Unset / blank / misspelled → `free` (send coarse bands, keep
-    # values home) — a typo must never silently *upgrade* disclosure.
-    raw_tier = os.environ.get("ASSET_NARRATE_TIER", "").strip().lower()
-    if raw_tier and raw_tier not in ("free", "paid"):
-        log.warning(
-            "ASSET_NARRATE_TIER=%r unrecognized; defaulting to 'free' (values stay "
-            "home). Set ASSET_NARRATE_TIER=paid to send exact figures.", raw_tier,
-        )
-    tier = "paid" if raw_tier == "paid" else "free"
+    # Resolve the endpoint first — settling the tier needs to know if it's local.
+    base_url = ""
     if provider == "openai":
         base_url = os.environ.get("ASSET_NARRATE_BASE_URL", "").strip()
         if not base_url:
@@ -88,19 +81,66 @@ def load_config() -> NarratorConfig | None:
                 "narration off (refusing to send the API key in the clear)", base_url,
             )
             return None
-        return NarratorConfig("openai", model, key, base_url, tier, temperature=0.0)
-    # anthropic: omit temperature (Opus-tier 400s on sampling params; Haiku is fine)
-    return NarratorConfig("anthropic", model, key, "", tier, temperature=None)
+    is_local = provider == "openai" and _is_local_url(base_url)
+
+    # Privacy dial fails SAFE: exact values leave only on an explicit, correctly-spelled
+    # `paid` (a provider that doesn't train) or `local` (a model on your own machine, so
+    # nothing leaves). Anything else — unset / blank / misspelled, or `local` against a
+    # NON-local endpoint — falls back to `free` (coarse bands only). A typo must never
+    # silently *upgrade* disclosure.
+    raw_tier = os.environ.get("ASSET_NARRATE_TIER", "").strip().lower()
+    if raw_tier == "paid":
+        tier = "paid"
+    elif raw_tier == "local" and is_local:
+        tier = "local"
+    elif raw_tier == "local":  # 'local' tier but a remote endpoint → don't send exact to cloud
+        log.warning(
+            "ASSET_NARRATE_TIER=local needs a localhost endpoint; %r is remote — using "
+            "'free' (exact values stay home).", base_url or provider,
+        )
+        tier = "free"
+    else:
+        if raw_tier not in ("", "free"):
+            log.warning(
+                "ASSET_NARRATE_TIER=%r unrecognized; defaulting to 'free' (values stay home). "
+                "Use 'paid' (a provider that doesn't train) or 'local' to send exact figures.",
+                raw_tier,
+            )
+        tier = "free"
+
+    # Structural enrollment warning: free-tier on a CLOUD provider sends (coarse) context
+    # to a model the provider may train on, and small free models word things more roughly.
+    if tier == "free" and not is_local:
+        log.warning(
+            "free-tier narration: only coarse qualitative bands leave your machine (exact "
+            "figures stay home), but the provider may train on them and smaller models word "
+            "things more roughly — the numbers in your brief are always the tool's, never the "
+            "model's. Use ASSET_NARRATE_TIER=paid for a provider that doesn't train, or "
+            "'local' for a localhost model, to send exact figures."
+        )
+
+    # openai accepts temperature; anthropic omits it (Opus-tier 400s on sampling params,
+    # Haiku is fine). base_url is "" for anthropic (never set above).
+    temperature = 0.0 if provider == "openai" else None
+    return NarratorConfig(provider, model, key, base_url, tier, temperature=temperature)
+
+
+_LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "host.docker.internal"})
+
+
+def _is_local_url(url: str) -> bool:
+    """True if the endpoint is a local model (Ollama/llama.cpp) — nothing leaves for the
+    internet, so the ``local`` tier may send exact figures. Covers loopback (localhost /
+    127.0.0.1 / IPv6 ``::1``) and the Docker host (``host.docker.internal``)."""
+    return urlparse(url).hostname in _LOCAL_HOSTS
 
 
 def _is_safe_url(url: str) -> bool:
     """An LLM endpoint must be https (so the API key + prompt aren't sent in the
-    clear); http is tolerated only for a localhost proxy (Ollama/llama.cpp). Guards a
-    typo'd or hostile ASSET_NARRATE_BASE_URL (e.g. ``http://``, ``file://``)."""
+    clear); http is tolerated only for a localhost proxy. Guards a typo'd or hostile
+    ASSET_NARRATE_BASE_URL (e.g. ``http://``, ``file://``)."""
     parsed = urlparse(url)
-    if parsed.scheme == "https":
-        return True
-    return parsed.scheme == "http" and parsed.hostname in ("localhost", "127.0.0.1")
+    return parsed.scheme == "https" or (parsed.scheme == "http" and _is_local_url(url))
 
 
 def complete(config: NarratorConfig, system: str, user: str) -> str | None:
@@ -152,6 +192,10 @@ def _anthropic(config: NarratorConfig, system: str, user: str) -> str | None:
 
 
 def _openai(config: NarratorConfig, system: str, user: str) -> str | None:
+    # NB: `max_tokens` covers Gemini/Groq/OpenRouter/Mistral + standard OpenAI chat
+    # models. OpenAI's *reasoning* models (o*) reject it for `max_completion_tokens`;
+    # that 400 fails closed here (→ None + a logged warning), so narration is simply
+    # withheld rather than crashing. Switch the field only after verifying live (#8).
     body: dict[str, Any] = {
         "model": config.model,
         "max_tokens": config.max_tokens,
