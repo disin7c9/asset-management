@@ -33,10 +33,21 @@ def _run_summary(caplog: pytest.LogCaptureFixture) -> dict[str, Any]:
 
 @pytest.fixture(autouse=True)
 def _no_network_splits(monkeypatch: pytest.MonkeyPatch) -> None:
-    # cli now fetches stock splits on every run; default tests must not hit the
-    # network for it. Return "no splits known" → no adjustment (the price-basis
-    # guard remains the safety net). A split-specific test overrides this.
-    monkeypatch.setattr("app.cli.fetch_splits", lambda *a, **k: {})
+    # The brief loads + prices via app.pipeline (load_book + compute_prices_returns_
+    # risk); --screen/--backtest still fetch in app.cli. Tests drive a run by patching
+    # the app.cli fetch seam, so mirror it onto app.pipeline — one patch then controls
+    # the whole run (the brief AND any cli-path fetch), and no run silently hits the
+    # network. Splits are stubbed to "none known" (no adjustment; the price-basis guard
+    # stays the net); a split-specific test overrides pipeline's fetch_series.
+    import app.cli as _cli
+
+    monkeypatch.setattr(
+        "app.pipeline.fetch_series", lambda *a, **k: _cli.fetch_series(*a, **k)
+    )
+    monkeypatch.setattr(
+        "app.pipeline.fetch_latest", lambda *a, **k: _cli.fetch_latest(*a, **k)
+    )
+    monkeypatch.setattr("app.pipeline.fetch_splits", lambda *a, **k: {})
 
 
 @pytest.fixture(autouse=True)
@@ -366,7 +377,7 @@ def test_screen_panel_renders_with_verdicts(
     from app.metadata import MetadataResult, SecurityMeta
 
     monkeypatch.setattr("app.cli.fetch_series", _flat_series)
-    monkeypatch.setattr("app.cli.price_basis_mismatches", lambda *a, **k: [])
+    monkeypatch.setattr("app.pipeline.price_basis_mismatches", lambda *a, **k: [])
 
     def fake_meta(tickers, **k):  # type: ignore[no-untyped-def]
         rows = {
@@ -402,7 +413,7 @@ def test_screen_with_target_adds_role_row(
     from app.metadata import MetadataResult
 
     monkeypatch.setattr("app.cli.fetch_series", _flat_series)
-    monkeypatch.setattr("app.cli.price_basis_mismatches", lambda *a, **k: [])
+    monkeypatch.setattr("app.pipeline.price_basis_mismatches", lambda *a, **k: [])
     monkeypatch.setattr("app.cli.fetch_metadata", lambda tickers, **k: MetadataResult())
     with caplog.at_level(logging.INFO):
         rc = main(["--csv", str(SAMPLE), "--screen", "QQQM", "--target", str(TARGET)])
@@ -481,7 +492,7 @@ def test_discover_panel_renders(
         ),
     )
     monkeypatch.setattr("app.cli.fetch_series", _flat_series)
-    monkeypatch.setattr("app.cli.price_basis_mismatches", lambda *a, **k: [])
+    monkeypatch.setattr("app.pipeline.price_basis_mismatches", lambda *a, **k: [])
     monkeypatch.setattr(
         "app.cli.fetch_metadata",
         lambda tickers, **k: MetadataResult(
@@ -824,7 +835,7 @@ def test_main_resolves_today_once(
 
     monkeypatch.setattr("app.cli.date", _ClockSpy)
     monkeypatch.setattr("app.cli.fetch_series", _flat_series)
-    monkeypatch.setattr("app.cli.price_basis_mismatches", lambda *a, **k: [])
+    monkeypatch.setattr("app.pipeline.price_basis_mismatches", lambda *a, **k: [])
     with caplog.at_level(logging.INFO):
         rc = main(["--csv", str(SAMPLE), "--backtest", "--target", str(TARGET)])
     capsys.readouterr()
@@ -984,7 +995,7 @@ def test_split_handled_by_adjustment_keeps_ticker_in_twr(
     monkeypatch.setattr("app.cli.fetch_series", fake_series)
     # SPLT did a 10:1 AFTER the buy → adjustment makes it 10 @ $100, matching the series.
     monkeypatch.setattr(
-        "app.cli.fetch_splits", lambda *a, **k: {"SPLT": [(date(2024, 1, 15), 10.0)]}
+        "app.pipeline.fetch_splits", lambda *a, **k: {"SPLT": [(date(2024, 1, 15), 10.0)]}
     )
     with caplog.at_level(logging.INFO):
         rc = main(["--csv", str(csv)])

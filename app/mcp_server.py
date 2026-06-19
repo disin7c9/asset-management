@@ -6,7 +6,7 @@ core (holdings, returns, drawdown/risk) over local **stdio**. It wires; it adds 
 math. Design invariants (v2.0.0 Phase 1):
 
 - **Every figure comes from the validated core** (`derive`/`returns`/`risk`, via the
-  same `cli.compute_prices_returns_risk` the brief uses) — the LLM never computes.
+  same `pipeline.compute_prices_returns_risk` the brief uses) — the LLM never computes.
 - **Read-only + offline**: tools read already-derived data and the on-disk price
   **cache** (`online=False`), so a call never reaches the network (no egress) and is
   fast + deterministic. A cold cache degrades to `n/a`, never a guess.
@@ -36,12 +36,11 @@ from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel, Field
 
-from app.cli import compute_prices_returns_risk
-from app.corporate_actions import adjust_for_splits
-from app.derive import DerivedState, derive
-from app.events import Event, load_events, load_target
+from app.pipeline import compute_prices_returns_risk, load_book
+from app.derive import DerivedState
+from app.events import load_target
 from app.log_config import setup_logging
-from app.prices import PriceRow, fetch_splits
+from app.prices import PriceRow
 from app.returns import ReturnsSummary
 from app.risk import DollarDrawdown, MetricCI, RiskSummary
 from app.strategy import VALID_MODES, Mode, suggest
@@ -114,19 +113,9 @@ class _Build:
     dollar_dd: DollarDrawdown | None
 
 
-def _load_book(csv_path: Path, cache: Path) -> tuple[list[Event], DerivedState]:
-    """Replay the transaction log → derived holdings, split-adjusted offline."""
-    events = load_events(csv_path)
-    splits = fetch_splits(
-        sorted({ev.ticker for ev in events}), cache_dir=cache, online=False
-    )
-    events = adjust_for_splits(events, splits)
-    return events, derive(events)
-
-
 def _build(*, no_risk: bool, today: date) -> _Build:
     """Load the ASSET_CSV book and compute prices/returns/(risk) via the SAME core
-    path the CLI brief uses (`cli.compute_prices_returns_risk`), forced offline. The
+    path the CLI brief uses (`pipeline.compute_prices_returns_risk`), forced offline. The
     `no_risk` flag skips the bootstrap panel — `portfolio_summary`/`rebalance_check`
     don't need it (fast), `risk_report` does. `today` is resolved ONCE per tool call
     (one clock per request) and threaded through."""
@@ -134,7 +123,7 @@ def _build(*, no_risk: bool, today: date) -> _Build:
     csv_path = _env_csv(
         "ASSET_CSV", "point it at your transaction CSV (in .env or the MCP client env)"
     )
-    events, state = _load_book(csv_path, cache)
+    events, state = load_book(csv_path, cache, online=False)
     run: dict[str, Any] = {
         "status": "ok", "n_prices_fetched": 0, "n_prices_missing": 0,
         "n_series_fetched": 0, "n_series_missing": 0, "fallbacks_used": 0,
