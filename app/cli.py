@@ -33,7 +33,13 @@ from app.report import (
     render_text,
 )
 from app.llm import complete, load_config
-from app.narrate import build_claim_set, build_prompt, render_narration
+from app.narrate import (
+    build_claim_set,
+    build_discovery_claims,
+    build_discovery_prompt,
+    build_prompt,
+    render_narration,
+)
 from app.discover import Discovery, find_gaps, restrict_to
 from app.universe import ROLES, load_universe
 from app.returns import ReturnsSummary
@@ -330,6 +336,7 @@ def main(argv: list[str] | None = None) -> int:
         "screen": None,
         "narrate": None,
         "discover": None,
+        "discover_narrate": None,
     }
 
     # Nothing to do: no book and no notional backtest → guide, don't fabricate a brief.
@@ -432,15 +439,19 @@ def main(argv: list[str] | None = None) -> int:
         discovery, discovery_results = _compute_discover(state, prices, args, run, today, daily)
 
     summary_section: Section | None = None
+    discovery_summary: Section | None = None
     if args.narrate:
         summary_section = _compute_narration(state, prices, returns, risk, dollar_dd, run)
+        if discovery is not None and discovery_results is not None:
+            discovery_summary = _compute_discovery_narration(discovery, discovery_results, run)
 
     data = build_report_data(
         state, prices=prices, returns=returns, risk=risk,
         suggestions=suggestions, backtest=backtest, missing_tickers=missing,
         asof=today, generated_at=datetime.now(timezone.utc), twr_excluded=twr_excluded,
         dollar_dd=dollar_dd, metadata=meta, candidates=cands,
-        discovery=discovery, discovery_results=discovery_results, summary=summary_section,
+        discovery=discovery, discovery_results=discovery_results,
+        discovery_summary=discovery_summary, summary=summary_section,
     )
 
     sys.stdout.write(render_text(data) + "\n")
@@ -970,13 +981,49 @@ def _compute_narration(
     return Section("SUMMARY", (fenced, "", provenance), prose=True)
 
 
+def _compute_discovery_narration(
+    discovery: Discovery,
+    results: list[CandidateScreen],
+    run: dict[str, Any],
+) -> Section | None:
+    """Opt-in (`--discover --narrate`): rank/explain the screened gap-fillers through the
+    SAME fence as the brief SUMMARY — claims → LLM prose → SymGen/PCN → a source-labeled
+    note leading the DISCOVERY panel. Fail-closed at every step → None (the plain panel
+    still prints). Role-fit only; the verdicts and figures are the tool's, not the model's."""
+    config = load_config()
+    if config is None:
+        log.warning("--discover --narrate: no LLM backend configured (set ASSET_NARRATE_* in .env)")
+        run["discover_narrate"] = "skipped: not configured"
+        return None
+    claim_set = build_discovery_claims(discovery, results)
+    if not claim_set:
+        run["discover_narrate"] = "skipped: nothing to narrate"
+        return None
+    system, user = build_discovery_prompt(claim_set, tier=config.tier)
+    prose = complete(config, system, user)
+    fenced = render_narration(prose, claim_set) if prose else None
+    if fenced is None:
+        log.warning(
+            "--discover --narrate: note withheld — the model returned nothing, or its "
+            "output failed the number fence (a stray digit/ticker or an unknown token)"
+        )
+        run["discover_narrate"] = "withheld: empty or failed the fence"
+        return None
+    provenance = (
+        f"— wording by {config.model} ({config.tier} tier); ranked on role-fit by the "
+        "tool's screen, not the model. Propose-only; not financial advice."
+    )
+    run["discover_narrate"] = f"{config.model} ({config.tier})"
+    return Section("DISCOVERY — worth a closer look", (fenced, "", provenance), prose=True)
+
+
 def _log_run_summary(run: dict[str, Any]) -> None:
     """Emit one structured JSON line summarizing the run.
 
     Schema: {date, source, n_events_replayed, n_prices_fetched, n_prices_missing,
     n_series_fetched, n_series_missing, fallbacks_used, status, report_saved,
     email_sent, email_detail?, rebalance, backtest, allocate, metadata, screen,
-    narrate, discover, error?}.
+    narrate, discover, discover_narrate, error?}.
     """
     log.info("run_summary %s", json.dumps(run, separators=(",", ":")))
 

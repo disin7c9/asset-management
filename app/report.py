@@ -134,6 +134,7 @@ def build_report_data(
     candidates: list[CandidateScreen] | None = None,
     discovery: Discovery | None = None,
     discovery_results: list[CandidateScreen] | None = None,
+    discovery_summary: Section | None = None,
     summary: Section | None = None,
 ) -> ReportData:
     """Assemble the deterministic brief as ordered sections.
@@ -175,6 +176,8 @@ def build_report_data(
     if candidates:
         sections.append(_section_candidates(candidates))
     if discovery is not None and discovery_results is not None:
+        if discovery_summary is not None:  # the narrated note (P3b) leads its panel
+            sections.append(discovery_summary)
         sections.append(_section_discoveries(discovery, discovery_results))
     if backtest is not None and backtest.legs:
         sections.append(_section_backtest(backtest))

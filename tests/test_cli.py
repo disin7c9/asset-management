@@ -517,6 +517,65 @@ def test_discover_panel_renders(
     assert "VNQ:" in _run_summary(caplog)["discover"]  # verdict recorded
 
 
+def test_discover_narrate_leads_the_panel(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str],
+) -> None:
+    # --discover --narrate: a fence-validated LLM note leads the deterministic panel.
+    from app.llm import NarratorConfig
+    from app.metadata import MetadataResult, SecurityMeta
+
+    now = datetime.now(timezone.utc)
+    canned = {
+        tk: PriceRow(tk, date.today(), px, "test", now)
+        for tk, px in {"BND": 73.0, "IAU": 84.0, "VEA": 72.0, "VOO": 697.0}.items()
+    }
+    monkeypatch.setattr(
+        "app.cli.fetch_latest",
+        lambda tickers, *a, **k: PricesResult(
+            rows={tk: canned[tk] for tk in tickers if tk in canned},
+            missing=[tk for tk in tickers if tk not in canned],
+        ),
+    )
+    monkeypatch.setattr("app.cli.fetch_series", _flat_series)
+    monkeypatch.setattr("app.pipeline.price_basis_mismatches", lambda *a, **k: [])
+    monkeypatch.setattr(
+        "app.cli.fetch_metadata",
+        lambda tickers, **k: MetadataResult(
+            rows={
+                tk: SecurityMeta(
+                    ticker=tk, expense_ratio=0.0003, aum=5e9, avg_volume=2e6,
+                    category="Real Estate", family="Vanguard",
+                    legal_type="Exchange Traded Fund", quote_type="ETF",
+                    inception=date(2015, 1, 1),
+                )
+                for tk in tickers
+            }
+        ),
+    )
+
+    def fake_complete(_cfg: object, system: str, _user: str) -> str:
+        if "NEW funds" in system:  # the discovery note
+            return "You hold {{gap_reit}} of real estate; the screened picks are worth a look."
+        return "A calm summary of the book."  # the brief SUMMARY
+
+    monkeypatch.setattr(
+        "app.cli.load_config",
+        lambda: NarratorConfig("openai", "test-model", "k", "http://x", "paid", 0.0),
+    )
+    monkeypatch.setattr("app.cli.complete", fake_complete)
+
+    with caplog.at_level(logging.INFO):
+        rc = main(["--csv", str(SAMPLE), "--discover", "reit", "--narrate"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "DISCOVERY — worth a closer look" in out          # the narrated note section leads
+    assert "the screened picks are worth a look" in out      # the model's words, rendered
+    assert "wording by test-model (paid tier)" in out        # source-labeled provenance
+    assert "DISCOVERY (roles you're light in" in out         # deterministic panel still follows
+    assert _run_summary(caplog)["discover_narrate"] == "test-model (paid)"
+
+
 def _canned_meta() -> object:
     from app.metadata import MetadataResult, SecurityMeta
 

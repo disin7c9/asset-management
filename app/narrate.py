@@ -28,9 +28,11 @@ from dataclasses import dataclass
 from datetime import date
 
 from app.derive import DerivedState
+from app.discover import Discovery
 from app.prices import PriceRow
 from app.returns import ReturnsSummary
 from app.risk import DollarDrawdown, RiskSummary
+from app.screen import CandidateScreen
 
 
 @dataclass(frozen=True)
@@ -274,22 +276,167 @@ _SYSTEM_PROMPT = (
 )
 
 
-def build_prompt(claim_set: dict[str, Claim], *, tier: str) -> tuple[str, str]:
-    """Pure: the (system, user) prompts for the narrator. The **privacy dial** lives
-    here — PAID/LOCAL send each claim's exact rendered value (richer prose; a paid
-    provider doesn't train on inputs, a local model never leaves the machine); FREE
-    sends only the coarse qualitative band (``Claim.band``), so exact values stay home
-    and are substituted locally by `render_narration`. Token NAMES + labels always go
-    (the model must know what it may cite)."""
-    send_exact = tier in ("paid", "local")
+def _claim_listing(claim_set: dict[str, Claim], *, send_exact: bool) -> str:
+    """One line per claim — ``{{token}}  — label (hint)``. The privacy dial: ``send_exact``
+    (PAID/LOCAL) appends the exact rendered value; FREE appends only the coarse band (or
+    nothing). Token names + labels always go — the model must know what it may cite."""
     lines: list[str] = []
     for token in sorted(claim_set):
         c = claim_set[token]
         hint = c.rendered if send_exact else (c.band or "")
         lines.append("{{" + token + "}}  — " + c.label + (f" ({hint})" if hint else ""))
+    return "\n".join(lines)
+
+
+def build_prompt(claim_set: dict[str, Claim], *, tier: str) -> tuple[str, str]:
+    """Pure: the (system, user) prompts for the narrator. The **privacy dial** lives
+    here — PAID/LOCAL send each claim's exact rendered value (richer prose; a paid
+    provider doesn't train on inputs, a local model never leaves the machine); FREE
+    sends only the coarse qualitative band (``Claim.band``), so exact values stay home
+    and are substituted locally by `render_narration`."""
     user = (
         "Available figures — cite each ONLY as its {{token}}, never the value:\n"
-        + "\n".join(lines)
+        + _claim_listing(claim_set, send_exact=tier in ("paid", "local"))
         + "\n\nWrite the summary now."
     )
     return _SYSTEM_PROMPT, user
+
+
+# ── discovery narration (P3b): rank/explain the screened gap-fillers ──────────
+#
+# The SAME fence (Claim + render_narration), pointed at --discover's output. The LLM
+# ranks/explains candidates that ALREADY PASSED the deterministic screen, strictly on
+# ROLE FIT — never a return forecast. Candidate facts stay qualitative (the exact
+# cost/overlap/correlation figures live in the deterministic panel); only the book's
+# gap exposure is a citable figure, banded for FREE like every other claim.
+
+_EXPOSURE_BAND = _BandSpec(
+    ((0.005, "none"), (0.03, "very little"), (0.10, "some")), "a fair amount"
+)
+
+# Plain-English role names for the prose — the slugs ("bond-aggregate") read as jargon,
+# and the model may write these directly (they carry no digit, so the fence allows them),
+# keeping the {{gap_*}} token for the exposure FIGURE, not the role's name.
+_ROLE_NAMES: dict[str, str] = {
+    "us-large": "US large-cap stocks",
+    "us-small-mid": "US small- and mid-cap stocks",
+    "us-dividend": "US dividend stocks",
+    "intl-developed": "developed international stocks",
+    "em-equity": "emerging-market stocks",
+    "sector-equity": "sector equities",
+    "thematic-equity": "thematic equities",
+    "bond-aggregate": "total US bonds",
+    "treasury": "US Treasuries",
+    "tips": "inflation-protected bonds (TIPS)",
+    "corporate-bond": "corporate bonds",
+    "gold": "gold",
+    "commodity-broad": "broad commodities",
+    "reit": "real estate (REITs)",
+}
+
+# Number-free role-fit words per screen check + status — what the model may echo.
+_CHECK_WORDS: dict[str, dict[str, str]] = {
+    "cost": {"pass": "cheap", "warn": "a bit pricey", "fail": "expensive"},
+    "liquidity": {"pass": "liquid", "warn": "thinly traded", "fail": "illiquid"},
+    "overlap": {
+        "pass": "little overlap with what you hold",
+        "warn": "some overlap with what you hold",
+        "fail": "heavy overlap with what you hold",
+    },
+    "diversifier": {
+        "pass": "diversified your past drawdowns",
+        "warn": "a weak diversifier for your book",
+        "fail": "moved with your book",
+    },
+}
+
+
+def _fit_phrase(screen: CandidateScreen) -> str:
+    """A number-free role-fit phrase from the screen's headline checks (cost / liquidity
+    / overlap / diversifier) — the qualitative judgement the model may echo. The exact
+    figures stay in the deterministic DISCOVERY panel, never in the prompt."""
+    return ", ".join(
+        _CHECK_WORDS[chk.name][chk.status]
+        for chk in screen.checks
+        if chk.name in _CHECK_WORDS and chk.status in _CHECK_WORDS[chk.name]
+    )
+
+
+def _claim_token(prefix: str, raw: str) -> str:
+    """A valid {{token}} from a role/ticker: lowercased, non-alphanumerics → ``_``
+    (so ``us-large`` / ``BRK.B`` can't smuggle a stray character past the fence)."""
+    return prefix + re.sub(r"[^a-z0-9]+", "_", raw.lower())
+
+
+def build_discovery_claims(
+    discovery: Discovery, results: list[CandidateScreen]
+) -> dict[str, Claim]:
+    """Validated figures the discovery note may cite: the book's exposure to each gap
+    role (banded for FREE) and each screened candidate's TICKER (cited by name, so even
+    a digit-bearing ticker passes the PCN fence). Candidate cost/overlap/correlation stay
+    qualitative — those exact figures live in the panel, not here. A candidate without a
+    screen result is omitted: the note can't cite a fund the screen didn't judge."""
+    by_ticker = {r.ticker: r for r in results}
+    claims: dict[str, Claim] = {}
+    for role in discovery.gaps:
+        exposure = discovery.exposure.get(role, 0.0)
+        token = _claim_token("gap_", role)
+        claims[token] = Claim(
+            token=token, value=exposure, rendered=f"{exposure * 100:.0f}%",
+            label=f"the book's current exposure to {_ROLE_NAMES.get(role, role)}",
+            band=_EXPOSURE_BAND.label_for(exposure),
+        )
+    for c in discovery.candidates:
+        r = by_ticker.get(c.ticker)
+        if r is None:
+            continue
+        label = f"{c.name}, a {c.role} fund — the screen rates it {r.verdict.upper()}"
+        fit = _fit_phrase(r)
+        if fit:
+            label += f" ({fit})"
+        token = _claim_token("cand_", c.ticker)
+        claims[token] = Claim(token=token, value=c.ticker, rendered=c.ticker, label=label)
+    return claims
+
+
+_DISCOVERY_SYSTEM_PROMPT = (
+    "You help the owner of a personal portfolio consider NEW funds for the roles "
+    "their book is light in. You are given each gap role and a short list of candidate "
+    "funds, each SCORED by a deterministic screen (cost, liquidity, overlap with what "
+    "they hold, and whether the fund diversified their past drawdowns) — each "
+    "candidate's verdict, PASS / WARN / FAIL, is in its label.\n"
+    "Write a SHORT plain-language note (3-5 sentences): for each gap role, which "
+    "candidate(s) look worth a closer look and WHY — strictly on ROLE FIT (how cheap, "
+    "how liquid, how little it overlaps what they already hold, whether it diversified "
+    "their drawdowns). Favor PASS verdicts; mention a WARN's caveat; do NOT recommend a "
+    "FAIL (you may say why to steer clear).\n"
+    "HARD RULES:\n"
+    "- Refer to every fund and figure ONLY by its {{token}} placeholder. NEVER write a "
+    "ticker symbol, digit, percent, or dollar amount yourself — one stray character "
+    "voids the whole note. (Some fund names contain digits, e.g. year ranges — cite the "
+    "{{token}}, never spell the fund's name.)\n"
+    "- You MAY name each role in plain English ('real estate', 'bonds', 'emerging "
+    "markets') — role names are words, not figures. Use a {{gap_...}} token ONLY for the "
+    "exposure figure, never as the role's name.\n"
+    "- Rank ONLY on role fit and the screen's verdict. NEVER predict returns or say one "
+    "fund will out-perform, beat, grow more, or do better than another — you have no "
+    "performance figures and past return is NOT the criterion.\n"
+    "- Do NOT quantify in words ('half the cost', 'twice as liquid'); stay qualitative "
+    "('cheaper', 'more liquid', 'less overlap').\n"
+    "- A PASS means 'sane, cheap, liquid, genuinely different' — NOT a buy and NOT "
+    "advice. Frame every candidate as 'worth a look', for the owner to judge.\n"
+    "Output ONLY the note — no preamble, no heading, no bullet list."
+)
+
+
+def build_discovery_prompt(claim_set: dict[str, Claim], *, tier: str) -> tuple[str, str]:
+    """Pure: the (system, user) prompts for the discovery note. Same privacy dial as
+    `build_prompt` — FREE sends the coarse band for the gap exposures and the (already
+    qualitative) candidate labels; PAID/LOCAL send the exact rendered exposures. Nothing
+    sensitive about the candidates leaves on FREE — their facts are qualitative here."""
+    user = (
+        "Gap roles and the screened candidate funds — cite each ONLY as its {{token}}:\n"
+        + _claim_listing(claim_set, send_exact=tier in ("paid", "local"))
+        + "\n\nWrite the note now."
+    )
+    return _DISCOVERY_SYSTEM_PROMPT, user

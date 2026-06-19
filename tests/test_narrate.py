@@ -12,10 +12,20 @@ from datetime import date, datetime, timezone
 import pytest
 
 from app.derive import DerivedState, Position
-from app.narrate import Claim, build_claim_set, build_prompt, render_narration
+from app.discover import Discovery
+from app.narrate import (
+    Claim,
+    build_claim_set,
+    build_discovery_claims,
+    build_discovery_prompt,
+    build_prompt,
+    render_narration,
+)
 from app.prices import PriceRow
 from app.returns import ReturnsSummary
 from app.risk import DrawdownInfo, MetricCI, RiskSummary
+from app.screen import CandidateScreen, CheckResult
+from app.universe import Candidate
 
 
 @pytest.fixture
@@ -351,3 +361,76 @@ def test_compute_narration_withholds_on_fabrication(
     run: dict[str, object] = {}
     assert cli._compute_narration(state, prices, returns, risk, None, run) is None
     assert "withheld" in str(run["narrate"])
+
+
+# ── discovery narration (P3b): the SAME fence, pointed at --discover ───────────
+
+
+def _discovery_and_results() -> tuple[Discovery, list[CandidateScreen]]:
+    candidates = (
+        Candidate("SCHD", "Schwab US Dividend Equity ETF", "us-dividend", "Quality dividends."),
+        Candidate("BND", "Vanguard Total Bond Market ETF", "bond-aggregate", "Total US bond."),
+        Candidate("XYZ", "Unscreened Fund", "bond-aggregate", "n/a"),  # no screen result
+    )
+    discovery = Discovery(
+        gaps=("us-dividend", "bond-aggregate"),
+        exposure={"us-dividend": 0.0, "bond-aggregate": 0.02},
+        candidates=candidates,
+    )
+    results = [
+        CandidateScreen("SCHD", (
+            CheckResult("cost", "pass", "cheap"),
+            CheckResult("liquidity", "pass", "ample"),
+            CheckResult("overlap", "pass", "low"),
+            CheckResult("diversifier", "pass", "helped on red days"),
+        )),
+        CandidateScreen("BND", (
+            CheckResult("cost", "pass", "cheap"),
+            CheckResult("overlap", "warn", "some overlap"),
+        )),
+    ]
+    return discovery, results
+
+
+def test_discovery_claims_cover_gaps_and_screened_candidates() -> None:
+    claims = build_discovery_claims(*_discovery_and_results())
+    assert set(claims) == {"gap_us_dividend", "gap_bond_aggregate", "cand_schd", "cand_bnd"}
+    assert claims["cand_schd"].rendered == "SCHD"             # the ticker is cited by name
+    assert claims["gap_bond_aggregate"].rendered == "2%"      # exact exposure (substituted locally)
+    assert claims["gap_bond_aggregate"].band == "very little"  # the FREE-tier band
+
+
+def test_discovery_claims_omit_candidate_without_a_screen_result() -> None:
+    claims = build_discovery_claims(*_discovery_and_results())
+    assert "cand_xyz" not in claims  # the note can't cite a fund the screen didn't judge
+
+
+def test_discovery_prompt_keeps_exact_exposure_home_on_free() -> None:
+    claims = build_discovery_claims(*_discovery_and_results())
+    _, free_user = build_discovery_prompt(claims, tier="free")
+    _, paid_user = build_discovery_prompt(claims, tier="paid")
+    assert "2%" not in free_user and "very little" in free_user  # band, not the value
+    assert "2%" in paid_user                                     # exact only on paid/local
+
+
+def test_discovery_prompt_forbids_return_forecasts() -> None:
+    system, _ = build_discovery_prompt(build_discovery_claims(*_discovery_and_results()), tier="free")
+    assert "out-perform" in system and "NEVER predict returns" in system
+
+
+def test_discovery_fence_substitutes_tickers_and_stays_fenced() -> None:
+    claims = build_discovery_claims(*_discovery_and_results())
+    good = "For dividends, {{cand_schd}} is cheap and diversifies your book."
+    assert render_narration(good, claims) == "For dividends, SCHD is cheap and diversifies your book."
+    assert render_narration("{{cand_schd}} costs only 0.06%.", claims) is None  # PCN: bare digit
+    assert render_narration("Consider {{cand_nope}}.", claims) is None          # unknown token
+
+
+def test_role_names_cover_every_role() -> None:
+    # A role added to universe.ROLES must get a plain-English name here, or the note
+    # silently degrades to the jargon slug ("bond-aggregate"). Pin it, like the
+    # strategy gate pins _MODE_KIND ⊇ VALID_MODES.
+    from app.narrate import _ROLE_NAMES
+    from app.universe import ROLES
+
+    assert set(_ROLE_NAMES) == ROLES
