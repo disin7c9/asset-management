@@ -27,12 +27,14 @@ from datetime import date, datetime, timedelta, timezone
 
 from app.backtest import BacktestResult
 from app.derive import DerivedState
+from app.discover import Discovery
 from app.metadata import MetadataResult
 from app.prices import PriceRow
 from app.returns import ReturnsSummary
 from app.risk import NOISY_THRESHOLD_DAYS, DollarDrawdown, DrawdownInfo, MetricCI, RiskSummary
 from app.screen import CandidateScreen
 from app.strategy import Suggestion
+from app.universe import Candidate
 
 _NA = "n/a"
 _DISCLAIMER = (
@@ -130,6 +132,8 @@ def build_report_data(
     dollar_dd: DollarDrawdown | None = None,
     metadata: MetadataResult | None = None,
     candidates: list[CandidateScreen] | None = None,
+    discovery: Discovery | None = None,
+    discovery_results: list[CandidateScreen] | None = None,
     summary: Section | None = None,
 ) -> ReportData:
     """Assemble the deterministic brief as ordered sections.
@@ -170,6 +174,8 @@ def build_report_data(
         sections.append(_section_securities(metadata, asof))
     if candidates:
         sections.append(_section_candidates(candidates))
+    if discovery is not None and discovery_results is not None:
+        sections.append(_section_discoveries(discovery, discovery_results))
     if backtest is not None and backtest.legs:
         sections.append(_section_backtest(backtest))
 
@@ -426,6 +432,40 @@ def _section_candidates(results: list[CandidateScreen]) -> Section:
         )
     )
     return Section("CANDIDATES (deterministic screen)", tuple(lines))
+
+
+def _section_discoveries(discovery: Discovery, results: list[CandidateScreen]) -> Section:
+    """The discovery panel: roles the book is light in, with screened universe candidates.
+    Grouped by gap role; each candidate shows its summary, the screen verdict, and the
+    notable (warn/fail) reasons. Propose-only — a PASS is "sane, cheap, liquid, genuinely
+    different", never a prediction."""
+    by_ticker = {r.ticker: r for r in results}
+    by_role: dict[str, list[Candidate]] = {}
+    for c in discovery.candidates:
+        by_role.setdefault(c.role, []).append(c)
+    lines: list[str] = []
+    for role in discovery.gaps:
+        cands = by_role.get(role)
+        if not cands:
+            continue
+        lines.append(f"{role}  — you currently hold {discovery.exposure.get(role, 0.0) * 100:.0f}%")
+        for c in cands:
+            r = by_ticker.get(c.ticker)
+            verdict = r.verdict.upper() if r is not None else "N/A"
+            counts = f"  ({r.counts()})" if r is not None else ""
+            lines.append(f"  {c.ticker:6}{verdict:<5} {c.name}{counts}")
+            if c.summary:
+                lines.append(f"         {c.summary}")
+            if r is not None:
+                for chk in r.checks:
+                    if chk.status in ("warn", "fail"):
+                        lines.append(f"         [{chk.status}] {chk.name}: {chk.reason}")
+        lines.append("")
+    lines.append(
+        'Discovery is propose-only: roles you hold little of + screened options; a PASS is '
+        '"sane, cheap, liquid, genuinely different", never a prediction.'
+    )
+    return Section("DISCOVERY (roles you're light in — propose-only)", tuple(lines))
 
 
 def _section_backtest(bt: BacktestResult) -> Section:

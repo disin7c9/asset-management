@@ -16,11 +16,12 @@ __pycache__/
 .venv/
 venv/
 
-# Local data: private by default. Only data/sample_data/ is tracked (the bundled
-# example CSV the CLI + tests use); everything else under data/ — real broker
-# exports in my_data/, the price cache in prices/ — stays local-only.
+# Local data: private by default. Only data/sample_data/ + data/universe.csv are tracked
+# (the bundled example CSV + the curated discovery universe the CLI + tests use); everything
+# else under data/ — real broker exports in my_data/, the price cache in prices/ — stays local.
 data/*
 !data/sample_data/
+!data/universe.csv
 reports/
 *.sqlite
 *.db

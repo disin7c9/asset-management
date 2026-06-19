@@ -42,6 +42,8 @@ from app.report import (
 )
 from app.llm import complete, load_config
 from app.narrate import build_claim_set, build_prompt, render_narration
+from app.discover import Discovery, find_gaps, restrict_to
+from app.universe import ROLES, load_universe
 from app.returns import (
     ReturnsSummary,
     build_daily_returns,
@@ -141,6 +143,17 @@ def main(argv: list[str] | None = None) -> int:
         "held-out window? Needs the price pipeline (not compatible with --no-prices/"
         "--no-risk) and is propose-only (no --rebalance/--backtest/--allocate in the "
         "same run).",
+    )
+    parser.add_argument(
+        "--discover",
+        metavar="ROLES",
+        nargs="?",
+        const="",
+        default=None,
+        help="suggest NEW tickers for the roles your book is light in, from the curated "
+        "universe (data/universe.csv), each judged by the same screen. Bare --discover "
+        "covers every gap; --discover reit,tips targets specific roles. Needs the price "
+        "pipeline; propose-only (no --rebalance/--backtest/--allocate in the same run).",
     )
     parser.add_argument(
         "--save",
@@ -271,10 +284,10 @@ def main(argv: list[str] | None = None) -> int:
             "--allocate is propose-only; run it first (optionally with --allocate-out FILE), "
             "then --backtest / --rebalance --target FILE in a SEPARATE command"
         )
-    if args.screen and (args.rebalance or args.backtest or args.allocate):
+    if (args.screen or args.discover is not None) and (args.rebalance or args.backtest or args.allocate):
         # Same discipline: judge candidates first, decide/simulate in a separate run.
         parser.error(
-            "--screen is propose-only; review the verdicts, then act "
+            "--screen/--discover are propose-only; review the verdicts, then act "
             "(--allocate / --rebalance / --backtest) in a SEPARATE command"
         )
     if args.allocate_out is not None and not args.allocate:
@@ -284,7 +297,7 @@ def main(argv: list[str] | None = None) -> int:
     # exempt; the bundled example is opt-in via an explicit --csv path.
     needs_book = bool(
         args.rebalance or args.allocate or args.dump_target or args.save or args.send
-        or args.metadata or args.screen or args.narrate
+        or args.metadata or args.screen or args.narrate or args.discover is not None
     )
     # Personal defaults from .env (gitignored; loaded above). ASSET_CSV fills --csv
     # for runs that want a book; a pure `--backtest --target` run stays notional
@@ -327,6 +340,7 @@ def main(argv: list[str] | None = None) -> int:
         "metadata": None,
         "screen": None,
         "narrate": None,
+        "discover": None,
     }
 
     # Nothing to do: no book and no notional backtest → guide, don't fabricate a brief.
@@ -433,6 +447,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.screen:
         cands = _compute_screen(state, args, run, today, daily)
 
+    discovery: Discovery | None = None
+    discovery_results: list[CandidateScreen] | None = None
+    if args.discover is not None:
+        discovery, discovery_results = _compute_discover(state, prices, args, run, today, daily)
+
     summary_section: Section | None = None
     if args.narrate:
         summary_section = _compute_narration(state, prices, returns, risk, dollar_dd, run)
@@ -441,7 +460,8 @@ def main(argv: list[str] | None = None) -> int:
         state, prices=prices, returns=returns, risk=risk,
         suggestions=suggestions, backtest=backtest, missing_tickers=missing,
         asof=today, generated_at=datetime.now(timezone.utc), twr_excluded=twr_excluded,
-        dollar_dd=dollar_dd, metadata=meta, candidates=cands, summary=summary_section,
+        dollar_dd=dollar_dd, metadata=meta, candidates=cands,
+        discovery=discovery, discovery_results=discovery_results, summary=summary_section,
     )
 
     sys.stdout.write(render_text(data) + "\n")
@@ -931,13 +951,7 @@ def _compute_screen(
     today: date,
     daily: "pd.Series[float] | None",
 ) -> list[CandidateScreen] | None:
-    """Judge NEW candidate tickers against the book (propose-only).
-
-    Fetches the candidates' price history + metadata, and the held tickers'
-    metadata (the overlap test compares look-through holdings), then hands
-    everything to the pure screen. Non-fatal: a missing pipeline or candidate
-    degrades with a logged reason — the rest of the brief still prints.
-    """
+    """Judge NEW candidate tickers (from --screen) against the book (propose-only)."""
     tickers = sorted({t.strip().upper() for t in args.screen.split(",") if t.strip()})
     if CASH_TICKER in tickers:
         # The pseudo-ticker is not a screenable security; dropping it here keeps
@@ -948,11 +962,33 @@ def _compute_screen(
         log.error("--screen: no tickers given")
         run["screen"] = "skipped: no tickers"
         return None
+    return _screen_tickers(
+        state, tickers, args, run, today, daily, status_key="screen", with_role=True
+    )
+
+
+def _screen_tickers(
+    state: DerivedState,
+    tickers: list[str],
+    args: argparse.Namespace,
+    run: dict[str, Any],
+    today: date,
+    daily: "pd.Series[float] | None",
+    *,
+    status_key: str,
+    with_role: bool,
+) -> list[CandidateScreen] | None:
+    """Fetch the candidates' price history + metadata, and the held tickers' metadata (the
+    overlap test compares look-through holdings), then hand everything to the pure screen.
+    Shared by --screen (user tickers) and --discover (universe gap-fillers). Non-fatal: a
+    missing pipeline degrades with a logged reason — the rest of the brief still prints.
+    ``with_role`` runs the walk-forward role check when a --target is present.
+    """
     if daily is None or daily.empty:
         # The diversifier test correlates against YOUR portfolio's return series,
         # which only the full price pipeline produces.
-        log.warning("--screen needs the portfolio return series; remove --no-prices/--no-risk")
-        run["screen"] = "skipped: needs the price pipeline"
+        log.warning("--%s needs the portfolio return series; remove --no-prices/--no-risk", status_key)
+        run[status_key] = "skipped: needs the price pipeline"
         return None
     online = not args.offline
     start: date = daily.index[0].date()
@@ -967,13 +1003,13 @@ def _compute_screen(
     cand_meta = {tk: m for tk, m in meta.rows.items() if tk in tickers_set}
 
     role: dict[str, RoleCheck] | None = None
-    if args.target is not None:
+    if with_role and args.target is not None:
         # The walk-forward role check (the edge gate's evidence): simulate the
         # target vs target+sleeve per candidate, judged on the held-out window.
         try:
             target = load_target(args.target)
         except (ValueError, OSError) as exc:
-            log.error("--screen role check: %s", exc)
+            log.error("--%s role check: %s", status_key, exc)
         else:
             tgt_series = fetch_series(
                 sorted(set(target) - set(cand_series.rows)), start, today,
@@ -986,8 +1022,60 @@ def _compute_screen(
     results = screen_candidates(
         tickers, cand_series.rows, daily, cand_meta, held_meta, held, asof=today, role=role
     )
-    run["screen"] = " ".join(f"{r.ticker}:{r.verdict}" for r in results)
+    run[status_key] = " ".join(f"{r.ticker}:{r.verdict}" for r in results)
     return results
+
+
+def _compute_discover(
+    state: DerivedState,
+    prices: dict[str, PriceRow] | None,
+    args: argparse.Namespace,
+    run: dict[str, Any],
+    today: date,
+    daily: "pd.Series[float] | None",
+) -> tuple[Discovery | None, list[CandidateScreen] | None]:
+    """Suggest tickers for the book's role GAPS from the curated universe, each judged by the
+    same screen (propose-only). Bare ``--discover`` covers every gap; ``--discover reit,tips``
+    targets specific roles. Needs current prices; non-fatal at every step.
+    """
+    if not prices:
+        log.warning("--discover needs current prices; remove --no-prices")
+        run["discover"] = "skipped: needs the price pipeline"
+        return None, None
+    # The curated universe: ASSET_UNIVERSE overrides (like ASSET_CSV), else the bundled file.
+    universe_path = _env_path("ASSET_UNIVERSE") or Path(__file__).resolve().parent.parent / "data" / "universe.csv"
+    try:
+        universe = load_universe(universe_path)
+    except (OSError, ValueError) as exc:
+        log.error("--discover: cannot load the universe: %s", exc)
+        run["discover"] = "skipped: universe unavailable"
+        return None, None
+
+    discovery = find_gaps(state, prices, universe)
+    if args.discover:  # a non-empty value → restrict to the named roles
+        wanted = [r.strip() for r in args.discover.split(",") if r.strip()]
+        gapset = set(discovery.gaps)
+        for r in wanted:
+            if r not in ROLES:
+                log.warning("--discover: %r is not a known role; ignoring", r)
+            elif r not in gapset:
+                log.info("--discover: %r is already covered in your book; skipping", r)
+        chosen = {r for r in wanted if r in gapset}
+        if not chosen:
+            run["discover"] = "no matching gaps"
+            return None, None
+        discovery = restrict_to(discovery, chosen)
+
+    if not discovery.candidates:
+        log.info("--discover: your book already covers the universe's roles — no gaps to fill")
+        run["discover"] = "no gaps"
+        return None, None
+
+    results = _screen_tickers(
+        state, [c.ticker for c in discovery.candidates], args, run, today, daily,
+        status_key="discover", with_role=False,
+    )
+    return (discovery, results) if results is not None else (None, None)
 
 
 def _compute_backtest(
@@ -1066,7 +1154,7 @@ def _log_run_summary(run: dict[str, Any]) -> None:
     Schema: {date, source, n_events_replayed, n_prices_fetched, n_prices_missing,
     n_series_fetched, n_series_missing, fallbacks_used, status, report_saved,
     email_sent, email_detail?, rebalance, backtest, allocate, metadata, screen,
-    narrate, error?}.
+    narrate, discover, error?}.
     """
     log.info("run_summary %s", json.dumps(run, separators=(",", ":")))
 

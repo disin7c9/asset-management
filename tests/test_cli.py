@@ -438,6 +438,74 @@ def test_screen_skipped_without_price_pipeline(
     assert _run_summary(caplog)["screen"] == "skipped: needs the price pipeline"
 
 
+def test_discover_refuses_act_or_simulate_combos() -> None:
+    # Propose-only, same discipline as --screen: judge first, act in a separate command.
+    for extra in (
+        ["--rebalance", "to_total", "--target", str(TARGET)],
+        ["--backtest", "--target", str(TARGET)],
+        ["--allocate", "equal_weight"],
+    ):
+        with pytest.raises(SystemExit):
+            main(["--csv", str(SAMPLE), "--discover", *extra])
+
+
+def test_discover_skipped_without_price_pipeline(
+    caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str],
+) -> None:
+    # Exposure (and the diversifier) need the price pipeline; --no-prices can't supply it.
+    with caplog.at_level(logging.INFO):
+        rc = main(["--csv", str(SAMPLE), "--no-prices", "--discover"])
+    capsys.readouterr()
+    assert rc == 0
+    assert _run_summary(caplog)["discover"] == "skipped: needs the price pipeline"
+
+
+def test_discover_panel_renders(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str],
+) -> None:
+    # --discover finds the book's gaps from the curated universe and screens the fillers.
+    # Target one role (reit) so the screened set is small + deterministic.
+    from app.metadata import MetadataResult, SecurityMeta
+
+    now = datetime.now(timezone.utc)
+    canned = {
+        tk: PriceRow(tk, date.today(), px, "test", now)
+        for tk, px in {"BND": 73.0, "IAU": 84.0, "VEA": 72.0, "VOO": 697.0}.items()
+    }
+    monkeypatch.setattr(
+        "app.cli.fetch_latest",
+        lambda tickers, *a, **k: PricesResult(
+            rows={tk: canned[tk] for tk in tickers if tk in canned},
+            missing=[tk for tk in tickers if tk not in canned],
+        ),
+    )
+    monkeypatch.setattr("app.cli.fetch_series", _flat_series)
+    monkeypatch.setattr("app.cli.price_basis_mismatches", lambda *a, **k: [])
+    monkeypatch.setattr(
+        "app.cli.fetch_metadata",
+        lambda tickers, **k: MetadataResult(
+            rows={
+                tk: SecurityMeta(
+                    ticker=tk, expense_ratio=0.0003, aum=5e9, avg_volume=2e6,
+                    category="Real Estate", family="Vanguard",
+                    legal_type="Exchange Traded Fund", quote_type="ETF",
+                    inception=date(2015, 1, 1),
+                )
+                for tk in tickers
+            }
+        ),
+    )
+    with caplog.at_level(logging.INFO):
+        rc = main(["--csv", str(SAMPLE), "--discover", "reit"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "DISCOVERY (roles you're light in" in out
+    assert "reit  — you currently hold 0%" in out
+    assert "VNQ" in out  # a reit candidate from the universe was screened
+    assert "VNQ:" in _run_summary(caplog)["discover"]  # verdict recorded
+
+
 def _canned_meta() -> object:
     from app.metadata import MetadataResult, SecurityMeta
 
