@@ -1338,3 +1338,45 @@ def test_resolve_role_tickers_prefers_a_held_fund_then_the_universe_default() ->
     rt = _resolve_role_tickers(universe, {"IVV": 1000.0})  # holds IVV (us-large), no bonds
     assert rt["us-large"] == "IVV"        # the held fund wins its role over the VOO default
     assert rt["bond-aggregate"] == "BND"  # a gap role → the universe default (top-AUM)
+
+
+def test_benchmark_needs_backtest() -> None:
+    # --benchmark compares --target against a reference; the contract requires --backtest.
+    with pytest.raises(SystemExit):
+        main(["--csv", str(SAMPLE), "--benchmark", "60-40"])
+
+
+def test_backtest_benchmark_compares_target_vs_reference(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    # --backtest --target X --benchmark 60-40: a drawdown-first two-leg comparison + the
+    # walk-forward held-out verdict, instead of rebalanced-vs-buy-and-hold.
+    import math
+
+    import pandas as pd
+
+    target = tmp_path / "preset.csv"
+    target.write_text("Ticker,Weight\nVOO,0.5\nGLD,0.5\n", encoding="utf-8")
+    n = 320
+    dates = pd.bdate_range("2022-01-03", periods=n)
+    rows = {
+        "VOO": pd.Series([300.0 + i for i in range(n)], index=dates, dtype=float),
+        "GLD": pd.Series([170.0 + 10.0 * math.sin(i / 5.0) for i in range(n)], index=dates, dtype=float),
+        "BND": pd.Series([72.0 + 2.0 * math.sin(i / 9.0) for i in range(n)], index=dates, dtype=float),
+    }
+    monkeypatch.setattr(
+        "app.cli.fetch_series",
+        lambda tickers, *a, **k: SeriesResult(
+            rows={tk: rows[tk] for tk in tickers if tk in rows},
+            missing=[tk for tk in tickers if tk not in rows],
+        ),
+    )
+    with caplog.at_level(logging.INFO):
+        rc = main(["--backtest", "--target", str(target), "--benchmark", "60-40"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "BENCHMARK (preset vs 60-40" in out      # the comparison panel, not BACKTEST
+    assert "Walk-forward (held-out):" in out         # the held-out verdict row
+    assert "vs 60-40:" in _run_summary(caplog)["backtest"]

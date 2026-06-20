@@ -330,6 +330,37 @@ def _paired_dd_diff_ci(
     return (float(np.percentile(diffs, 2.5)), float(np.percentile(diffs, 97.5)))
 
 
+def _oos_verdict(
+    oos: RoleWindow,
+    r_without: "pd.Series[float]",
+    r_with: "pd.Series[float]",
+    *,
+    bootstrap_n: int,
+    seed: int,
+) -> tuple[RoleVerdict, tuple[float, float]]:
+    """Drawdown-first verdict on a HELD-OUT window + the paired-bootstrap honesty gate —
+    shared by `role_check` (target vs +candidate) and `benchmark_compare` (preset vs
+    reference). ``_with`` is the leg under test (candidate-added, or the preset), ``_without``
+    the baseline. The verdict ('improved' = shallower drawdown beyond the noise margin)
+    stands ONLY if the 95% CI of the drawdown difference excludes zero; else 'inconclusive'.
+    Returns (verdict, ci)."""
+    dd_gain = oos.dd_with - oos.dd_without     # >0 = shallower drawdown for the tested leg
+    vol_gain = oos.vol_without - oos.vol_with  # >0 = calmer
+    if dd_gain >= _DD_MARGIN and vol_gain >= -_VOL_MARGIN:
+        verdict: RoleVerdict = "improved"
+    elif dd_gain <= -_DD_MARGIN and vol_gain <= _VOL_MARGIN:
+        verdict = "worsened"
+    else:
+        verdict = "inconclusive"
+    ci: tuple[float, float] = (0.0, 0.0)
+    if verdict in ("improved", "worsened"):
+        ci = _paired_dd_diff_ci(r_without.to_numpy(), r_with.to_numpy(),
+                                bootstrap_n=bootstrap_n, seed=seed)
+        if ci[0] <= 0.0 <= ci[1]:
+            verdict = "inconclusive"
+    return verdict, ci
+
+
 def role_check(
     series: dict[str, "pd.Series[float]"],
     target: dict[str, float],
@@ -408,27 +439,12 @@ def role_check(
         return insufficient("held-out window could not be simulated")
     oos_win = _window_stats("out-of-sample", *oos_pair, start=split_ts.date(), end=hi.date())
 
-    # Verdict on the HELD-OUT window only, drawdown-first with noise margins.
-    dd_gain = oos_win.dd_with - oos_win.dd_without   # >0 = shallower drawdown
-    vol_gain = oos_win.vol_without - oos_win.vol_with  # >0 = calmer
-    if dd_gain >= _DD_MARGIN and vol_gain >= -_VOL_MARGIN:
-        verdict: RoleVerdict = "improved"
-    elif dd_gain <= -_DD_MARGIN and vol_gain <= _VOL_MARGIN:
-        verdict = "worsened"
-    else:
-        verdict = "inconclusive"
-
-    # Honesty gate: a PAIRED moving-block bootstrap of the drawdown DIFFERENCE
-    # (same resampled day-blocks applied to both legs, so common market moves
-    # cancel). The verdict stands only if the 95% CI of (dd_with − dd_without)
-    # excludes zero; otherwise the difference is inside the uncertainty band.
-    if verdict in ("improved", "worsened"):
-        lo_ci, hi_ci = _paired_dd_diff_ci(
-            oos_pair[0].to_numpy(), oos_pair[1].to_numpy(),
-            bootstrap_n=bootstrap_n, seed=seed,
-        )
-        if lo_ci <= 0.0 <= hi_ci:
-            verdict = "inconclusive"
+    # Verdict on the HELD-OUT window only (drawdown-first noise margins + the paired-
+    # bootstrap CI honesty gate), shared with benchmark_compare via _oos_verdict.
+    verdict, _ci = _oos_verdict(
+        oos_win, oos_pair[0], oos_pair[1], bootstrap_n=bootstrap_n, seed=seed
+    )
+    dd_gain = oos_win.dd_with - oos_win.dd_without  # for the reason + in-sample-gap lines
 
     parts = [
         f"OOS ({oos_win.start}→{oos_win.end}, {oos_win.n_days}d) with a "
@@ -463,3 +479,148 @@ def validate_from_role(rc: RoleCheck) -> bool:
     walk-forward role check, never by a caller asserting it.
     """
     return rc.verdict == "improved"
+
+
+# ── benchmark comparison: a preset vs a canonical reference (slice 2a) ───────
+
+# Well-known reference portfolios (canonical tickers, each summing to 1). 60-40 anchors
+# on the S&P 500 (the institutional benchmark); All-Weather (Dalio, retail) and Permanent
+# (Browne) anchor on the TOTAL US market (VTI). The verdict vs these is "where the preset
+# lands", never "beats" — on a short personal history it is usually inconclusive.
+_BENCHMARKS: dict[str, dict[str, float]] = {
+    "60-40": {"VOO": 0.60, "BND": 0.40},
+    "all-weather": {"VTI": 0.30, "TLT": 0.40, "IEI": 0.15, "GLD": 0.075, "DBC": 0.075},
+    "permanent": {"VTI": 0.25, "TLT": 0.25, "BIL": 0.25, "GLD": 0.25},
+}
+BENCHMARKS: frozenset[str] = frozenset(_BENCHMARKS)
+
+
+def benchmark_weights(reference: str) -> dict[str, float]:
+    """The reference portfolio's ticker:weight (a copy; empty for an unknown name)."""
+    return dict(_BENCHMARKS.get(reference, {}))
+
+
+@dataclass(frozen=True)
+class BenchmarkResult:
+    """A preset target vs a canonical reference over their COMMON priced window:
+    full-history legs (drawdown-first) + a walk-forward held-out verdict. The verdict is
+    "where the preset's drawdown lands vs the reference", NOT "beats it" — usually
+    'inconclusive' on a short history. `dd_diff_ci` is the 95% CI of (preset − reference)
+    out-of-sample drawdown depth."""
+
+    reference: str
+    start: date                       # full-history window (the legs' span)
+    end: date
+    legs: tuple[BacktestLeg, ...]     # (preset, reference)
+    oos: RoleWindow | None
+    verdict: BenchmarkVerdict
+    dd_diff_ci: tuple[float, float]
+    reason: str
+    missing: tuple[str, ...]
+    provenance: dict[str, tuple[str, datetime]] = field(default_factory=dict)
+
+
+BenchmarkVerdict = Literal["shallower", "deeper", "inconclusive", "insufficient"]
+
+# role_check's words ("improved"/"worsened") mean a candidate *helped*; for a preset-vs-
+# reference comparison the honest word is "shallower"/"deeper" drawdown, NEVER "improved" /
+# "beats" — a stored "improved" could be misread (e.g. by a future validate_from_* bridge)
+# as "this preset is validated", the framing the report works hard to forbid.
+_BENCHMARK_VERDICT: dict[RoleVerdict, BenchmarkVerdict] = {
+    "improved": "shallower", "worsened": "deeper",
+    "inconclusive": "inconclusive", "insufficient": "insufficient",
+}
+_BENCHMARK_PHRASE: dict[BenchmarkVerdict, str] = {
+    "shallower": "a SHALLOWER drawdown than",
+    "deeper": "a DEEPER drawdown than",
+    "inconclusive": "no clear drawdown difference from",
+}
+
+
+def benchmark_compare(
+    series: dict[str, "pd.Series[float]"],
+    target: dict[str, float],
+    reference_weights: dict[str, float],
+    *,
+    reference: str,
+    schedule: str = "quarterly",
+    initial: float = INITIAL_CAPITAL,
+    bootstrap_n: int = 1000,
+    seed: int = 42,
+    start: date | None = None,
+    provenance: dict[str, tuple[str, datetime]] | None = None,
+) -> BenchmarkResult | None:
+    """Compare a preset `target` against a `reference` portfolio over their common priced
+    window: full-history legs (`simulate` + `_leg`), then a walk-forward held-out verdict
+    (70/30 split, OOS-only, paired-bootstrap CI) reusing `_oos_verdict` with the preset as
+    the leg under test and the reference as the baseline. None if either side lacks usable
+    history; never raises."""
+    priced_t = _priced_tickers(series, target)
+    priced_r = _priced_tickers(series, reference_weights)
+    missing = tuple(sorted(
+        (set(target) - set(priced_t)) | (set(reference_weights) - set(priced_r))
+    ))
+    if not priced_t or not priced_r:
+        return None
+
+    all_priced = sorted(set(priced_t) | set(priced_r))
+    lo = max(series[tk].first_valid_index() for tk in all_priced)
+    if start is not None:  # honor --backtest-start (bound the sim, like backtest_compare)
+        lo = max(lo, pd.Timestamp(start))
+    hi = min(series[tk].index.max() for tk in all_priced)
+    preset_curve = simulate(series, target, schedule=schedule, initial=initial,
+                            start=lo.date(), end=hi.date())
+    ref_curve = simulate(series, reference_weights, schedule=schedule, initial=initial,
+                         start=lo.date(), end=hi.date())
+    if preset_curve.empty or ref_curve.empty:
+        return None
+    preset_leg = _leg("preset", preset_curve, bootstrap_n=bootstrap_n, seed=seed)
+    ref_leg = _leg(reference, ref_curve, bootstrap_n=bootstrap_n, seed=seed)
+    if preset_leg is None or ref_leg is None:
+        return None
+
+    # Walk-forward: split the common calendar 70/30; judge the held-out window only.
+    idx = pd.DatetimeIndex([])
+    for tk in all_priced:
+        idx = idx.union(series[tk].index)
+    common = idx[(idx >= lo) & (idx <= hi)].sort_values()
+    n_oos = int(len(common) * _OOS_FRACTION)
+    n_is = len(common) - n_oos
+    oos_win: RoleWindow | None = None
+    verdict: RoleVerdict = "insufficient"
+    ci: tuple[float, float] = (0.0, 0.0)
+    if n_is >= _MIN_WINDOW_DAYS and n_oos >= _MIN_WINDOW_DAYS:
+        split = common[n_is]
+        # baseline = reference, alt = preset → dd_with/_without read "preset vs reference"
+        oos_pair = _aligned_leg_returns(
+            series, reference_weights, target,
+            schedule=schedule, start=split.date(), end=hi.date(),
+        )
+        if oos_pair is not None:
+            oos_win = _window_stats("out-of-sample", *oos_pair, start=split.date(), end=hi.date())
+            verdict, ci = _oos_verdict(oos_win, *oos_pair, bootstrap_n=bootstrap_n, seed=seed)
+
+    bverdict = _BENCHMARK_VERDICT[verdict]  # "improved"→"shallower" etc. (never "beats")
+    if oos_win is None:
+        reason = (f"only {len(common)} common days — needs ≥ {_MIN_WINDOW_DAYS} in BOTH "
+                  f"windows to judge vs {reference} honestly")
+    else:
+        reason = (
+            f"OOS ({oos_win.start}→{oos_win.end}, {oos_win.n_days}d): preset max DD "
+            f"{oos_win.dd_with * 100:.1f}% vs {reference} {oos_win.dd_without * 100:.1f}% — "
+            f"{_BENCHMARK_PHRASE[bverdict]} {reference}"
+        )
+        if ci != (0.0, 0.0):  # a real drawdown gap → the paired bootstrap ran; show its width
+            reason += f"; 95% CI of the DD difference [{ci[0] * 100:+.1f}pp, {ci[1] * 100:+.1f}pp]"
+            if bverdict == "inconclusive":
+                reason += " straddles zero — not distinguishable on this history"
+        elif bverdict == "inconclusive":
+            reason += "; the gap is within the noise margin"
+
+    return BenchmarkResult(
+        reference=reference,
+        start=preset_curve.index[0].date(), end=preset_curve.index[-1].date(),
+        legs=(preset_leg, ref_leg), oos=oos_win, verdict=bverdict,
+        dd_diff_ci=ci, reason=reason, missing=missing,
+        provenance={tk: p for tk, p in (provenance or {}).items() if tk in all_priced},
+    )

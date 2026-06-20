@@ -59,7 +59,16 @@ from app.allocate import (
     needs_series,
     preset_target,
 )
-from app.backtest import BacktestResult, RoleCheck, backtest_compare, role_check
+from app.backtest import (
+    BENCHMARKS,
+    BacktestResult,
+    BenchmarkResult,
+    RoleCheck,
+    backtest_compare,
+    benchmark_compare,
+    benchmark_weights,
+    role_check,
+)
 from app.strategy import VALID_MODES, Suggestion, may_suggest, suggest
 
 log = logging.getLogger(__name__)
@@ -232,6 +241,14 @@ def main(argv: list[str] | None = None) -> int:
         help="rebalance schedule for the --backtest rebalanced leg (default: quarterly)",
     )
     parser.add_argument(
+        "--benchmark",
+        choices=sorted(BENCHMARKS),
+        default=None,
+        help="with --backtest --target: compare the target against a canonical reference "
+        "(60-40 / all-weather / permanent) over the common history, drawdown-first + a "
+        "walk-forward held-out verdict — instead of rebalanced-vs-buy-and-hold",
+    )
+    parser.add_argument(
         "--allocate",
         choices=sorted(VALID_RULES | PRESETS),
         default=None,
@@ -290,6 +307,8 @@ def main(argv: list[str] | None = None) -> int:
         )
     if args.allocate_out is not None and not args.allocate:
         parser.error("--allocate-out has no effect without --allocate")
+    if args.benchmark is not None and not args.backtest:
+        parser.error("--benchmark compares --target against a reference; it needs --backtest")
     # No silent sample fallback: book-dependent actions operate on YOUR holdings, so
     # they require your transaction log. --backtest is notional (target-only) and is
     # exempt; the bundled example is opt-in via an explicit --csv path.
@@ -417,7 +436,10 @@ def main(argv: list[str] | None = None) -> int:
         suggestions = _compute_suggestions(state, prices, args, run)
 
     backtest: BacktestResult | None = None
-    if args.backtest:
+    benchmark: BenchmarkResult | None = None
+    if args.backtest and args.benchmark is not None:
+        benchmark = _compute_benchmark(args, run, today)
+    elif args.backtest:
         backtest = _compute_backtest(args, run, today)
 
     meta: MetadataResult | None = None
@@ -454,7 +476,7 @@ def main(argv: list[str] | None = None) -> int:
         asof=today, generated_at=datetime.now(timezone.utc), twr_excluded=twr_excluded,
         dollar_dd=dollar_dd, metadata=meta, candidates=cands,
         discovery=discovery, discovery_results=discovery_results,
-        discovery_summary=discovery_summary, summary=summary_section,
+        discovery_summary=discovery_summary, summary=summary_section, benchmark=benchmark,
     )
 
     sys.stdout.write(render_text(data) + "\n")
@@ -999,6 +1021,39 @@ def _compute_backtest(
         run["backtest"] = "skipped: insufficient history"
         return None
     run["backtest"] = args.rebalance_every
+    return result
+
+
+def _compute_benchmark(
+    args: argparse.Namespace, run: dict[str, Any], today: date
+) -> BenchmarkResult | None:
+    """--backtest --benchmark: compare the --target preset against a canonical reference
+    (60-40 etc.) over their common history — full-history legs (drawdown-first) + a
+    walk-forward held-out verdict. Notional, target-only; non-fatal at every step."""
+    try:
+        target = load_target(args.target)
+    except (ValueError, OSError) as exc:
+        log.error("--benchmark: %s", exc)
+        run["backtest"] = "skipped: bad target"
+        return None
+    ref_weights = benchmark_weights(args.benchmark)
+    lookback = args.backtest_start or (today - timedelta(days=3653))  # ~10y of history
+    tickers = sorted(set(target) | set(ref_weights))
+    series = fetch_series(
+        tickers, lookback, today, cache_dir=args.cache_dir, online=not args.offline
+    )
+    if not series.rows:
+        log.warning("--benchmark: no price history for the target/reference tickers")
+        run["backtest"] = "skipped: no prices"
+        return None
+    result = benchmark_compare(
+        series.rows, target, ref_weights, reference=args.benchmark,
+        schedule=args.rebalance_every, start=args.backtest_start, provenance=series.provenance,
+    )
+    if result is None:
+        run["backtest"] = "skipped: insufficient history"
+        return None
+    run["backtest"] = f"vs {args.benchmark}: {result.verdict}"
     return result
 
 

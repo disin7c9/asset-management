@@ -25,7 +25,7 @@ from collections import Counter
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 
-from app.backtest import BacktestResult
+from app.backtest import BacktestLeg, BacktestResult, BenchmarkResult
 from app.derive import DerivedState
 from app.discover import Discovery
 from app.metadata import MetadataResult
@@ -125,6 +125,7 @@ def build_report_data(
     *,
     suggestions: list[Suggestion] | None = None,
     backtest: BacktestResult | None = None,
+    benchmark: BenchmarkResult | None = None,
     missing_tickers: list[str] | None = None,
     asof: date | None = None,
     generated_at: datetime | None = None,
@@ -181,6 +182,8 @@ def build_report_data(
         sections.append(_section_discoveries(discovery, discovery_results))
     if backtest is not None and backtest.legs:
         sections.append(_section_backtest(backtest))
+    if benchmark is not None and benchmark.legs:
+        sections.append(_section_benchmark(benchmark))
 
     footer = _footer_section(prices, missing_tickers, gen)
     if footer is not None:
@@ -471,9 +474,14 @@ def _section_discoveries(discovery: Discovery, results: list[CandidateScreen]) -
     return Section("DISCOVERY (roles you're light in — propose-only)", tuple(lines))
 
 
-def _section_backtest(bt: BacktestResult) -> Section:
-    """Two-leg comparison (rebalanced vs buy-and-hold), drawdown-first."""
-    legs = bt.legs
+def _leg_table(
+    legs: tuple[BacktestLeg, ...],
+    missing: tuple[str, ...],
+    provenance: dict[str, tuple[str, datetime]],
+) -> list[str]:
+    """Drawdown-first metric rows for a set of simulated legs (aligned columns), plus the
+    short-window warning, excluded-tickers line, and price-provenance line — shared by the
+    BACKTEST (rebalanced vs buy-and-hold) and BENCHMARK (preset vs reference) panels."""
     lw, cw = 26, 24  # label width, per-leg column width
 
     def row(label: str, cells: list[str]) -> str:
@@ -505,16 +513,20 @@ def _section_backtest(bt: BacktestResult) -> Section:
         row("Final value", [f"${leg.final_value:,.0f}" for leg in legs]),
     ]
     if any(leg.risk.is_noisy for leg in legs):
-        lines.append(
-            f"  ⚠ short window (< {NOISY_THRESHOLD_DAYS} return-days ≈ 2y); treat as noisy."
-        )
-    if bt.missing:
-        lines.append(f"  excluded (no price history): {', '.join(bt.missing)}")
-    if bt.provenance:
-        srcs = ", ".join(sorted({s for s, _ in bt.provenance.values()}))
-        oldest = min((fa for _, fa in bt.provenance.values()), default=None)
+        lines.append(f"  ⚠ short window (< {NOISY_THRESHOLD_DAYS} return-days ≈ 2y); treat as noisy.")
+    if missing:
+        lines.append(f"  excluded (no price history): {', '.join(missing)}")
+    if provenance:
+        srcs = ", ".join(sorted({s for s, _ in provenance.values()}))
+        oldest = min((fa for _, fa in provenance.values()), default=None)
         asof = f" · oldest fetch {oldest.date()}" if oldest is not None else ""
         lines.append(f"  prices: {srcs}{asof}")
+    return lines
+
+
+def _section_backtest(bt: BacktestResult) -> Section:
+    """Two-leg comparison (rebalanced vs buy-and-hold), drawdown-first."""
+    lines = _leg_table(bt.legs, bt.missing, bt.provenance)
     lines.append(
         "Rebalancing is discipline, not a prediction; past results don't guarantee future ones."
     )
@@ -523,6 +535,23 @@ def _section_backtest(bt: BacktestResult) -> Section:
         "simulation, not a prediction)"
     )
     return Section(title, tuple(lines))
+
+
+def _section_benchmark(bm: BenchmarkResult) -> Section:
+    """Preset vs a canonical reference, drawdown-first, with the walk-forward held-out
+    verdict. 'Where the preset lands', NOT 'beats the benchmark' — usually inconclusive
+    on a short history."""
+    lines = _leg_table(bm.legs, bm.missing, bm.provenance)
+    lines.append("")
+    lines.append(f"Walk-forward (held-out): {bm.reason}")
+    lines.append(
+        "Where your posture lands vs a known reference — never 'beats it'. On a short "
+        "history the honest verdict is usually inconclusive."
+    )
+    return Section(
+        f"BENCHMARK (preset vs {bm.reference} · {bm.start} → {bm.end} — propose-only)",
+        tuple(lines),
+    )
 
 
 def _footer_section(

@@ -301,3 +301,55 @@ def test_validate_from_role_end_to_end() -> None:
     clone_book = {"AAA": _close_path(rets), "CLONE": _close_path(rets)}
     rc2 = role_check(clone_book, {"AAA": 1.0}, "CLONE", sleeve=0.5)
     assert validate_from_role(rc2) is False
+
+
+# --- benchmark comparison: a preset vs a canonical reference (slice 2a) ---
+
+
+def _bdays(prices: list[float], start: str = "2022-01-03") -> "pd.Series[float]":
+    idx = pd.bdate_range(start, periods=len(prices))
+    return pd.Series(prices, index=idx, dtype=float)
+
+
+def test_benchmark_weights_and_names() -> None:
+    from app.backtest import BENCHMARKS, benchmark_weights
+
+    assert benchmark_weights("60-40") == {"VOO": 0.60, "BND": 0.40}
+    assert benchmark_weights("unknown") == {}
+    assert BENCHMARKS == {"60-40", "all-weather", "permanent"}
+    assert all(abs(sum(benchmark_weights(b).values()) - 1.0) < 1e-9 for b in BENCHMARKS)
+
+
+def test_benchmark_shallower_drawdown_reads_shallower() -> None:
+    from app.backtest import benchmark_compare
+
+    n = 300
+    rise = _bdays([100.0 + i for i in range(n)])                          # linear up → no drawdown
+    chop = _bdays([100.0 + 15.0 * math.sin(i / 4.0) for i in range(n)])   # oscillates → drawdowns
+    res = benchmark_compare(
+        {"RISE": rise, "CHOP": chop}, {"RISE": 1.0}, {"CHOP": 1.0},
+        reference="chop", bootstrap_n=200,
+    )
+    assert res is not None
+    assert [leg.label for leg in res.legs] == ["preset", "chop"]
+    assert res.oos is not None
+    assert res.verdict == "shallower"       # the preset (RISE) has the shallower OOS drawdown
+    assert res.dd_diff_ci[0] > 0.0          # 95% CI of (preset − ref) drawdown excludes zero
+
+
+def test_benchmark_identical_portfolios_are_inconclusive() -> None:
+    from app.backtest import benchmark_compare
+
+    x = _bdays([100.0 + 10.0 * math.sin(i / 7.0) for i in range(220)])
+    res = benchmark_compare({"X": x}, {"X": 1.0}, {"X": 1.0}, reference="self", bootstrap_n=100)
+    assert res is not None
+    assert res.verdict == "inconclusive"    # same portfolio → no difference to detect
+
+
+def test_benchmark_missing_ticker_and_none_without_history() -> None:
+    from app.backtest import benchmark_compare
+
+    series = {"A": _bdays([100.0 + i for i in range(220)])}
+    res = benchmark_compare(series, {"A": 1.0}, {"A": 0.5, "B": 0.5}, reference="r", bootstrap_n=50)
+    assert res is not None and "B" in res.missing            # reference ticker B has no history
+    assert benchmark_compare(series, {"A": 1.0}, {"Z": 1.0}, reference="r") is None  # no priced ref
