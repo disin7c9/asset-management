@@ -191,3 +191,78 @@ def test_allocate_edge_rule_opens_only_on_validated_role(
     ) == {"VOO": 1.0}
     with pytest.raises(UnvalidatedEdgeError, match="walk-forward"):
         allocate("fake_optimizer", ["VOO"], validated=validate_from_role(inconclusive))
+
+
+# --- strategic preset allocations (conservative / moderate / aggressive) ---
+
+
+def _all_roles_dummy() -> dict[str, str]:
+    # ticker == role name, so output weights map straight back to roles for asserting
+    return {role: role for role in A._ROLE_BUCKET}
+
+
+def _bucket_shares(target: dict[str, float]) -> dict[str, float]:
+    shares = {"equity": 0.0, "bonds": 0.0, "diversifiers": 0.0}
+    for role, w in target.items():  # ticker == role in the dummy map
+        shares[A._ROLE_BUCKET[role]] += w
+    return shares
+
+
+def test_preset_hits_its_bucket_posture_and_sums_to_one() -> None:
+    # Full universe present → each bucket's positive sub-weights sum to 1, so the
+    # bucket receives exactly its preset weight.
+    for preset, buckets in A._PRESET_BUCKETS.items():
+        target = A.preset_target(preset, _all_roles_dummy())
+        assert isclose(sum(target.values()), 1.0, abs_tol=1e-9)
+        shares = _bucket_shares(target)
+        for bucket, want in buckets.items():
+            assert isclose(shares[bucket], want, abs_tol=1e-9), (preset, bucket)
+
+
+def test_us_large_anchors_equity_not_one_over_n() -> None:
+    # The fix for equal_weight's nonsense: us-large >> a thematic/sector sleeve.
+    target = A.preset_target("moderate", _all_roles_dummy())
+    assert target["us-large"] > 0.25            # the equity core, not 55%/7
+    assert "thematic-equity" not in target      # zero sub-weight → excluded
+    assert "sector-equity" not in target
+
+
+def test_posture_orders_equity_conservative_lt_moderate_lt_aggressive() -> None:
+    eq = {
+        p: _bucket_shares(A.preset_target(p, _all_roles_dummy()))["equity"]
+        for p in ("conservative", "moderate", "aggressive")
+    }
+    assert eq["conservative"] < eq["moderate"] < eq["aggressive"]
+
+
+def test_missing_bucket_renormalizes_with_no_leak() -> None:
+    # Hold no bonds → the bonds bucket drops and equity+diversifiers renormalize to 1.
+    no_bonds = {r: r for r in A._ROLE_BUCKET if A._ROLE_BUCKET[r] != "bonds"}
+    target = A.preset_target("moderate", no_bonds)
+    assert isclose(sum(target.values()), 1.0, abs_tol=1e-9)
+    assert not any(A._ROLE_BUCKET[r] == "bonds" for r in target)
+
+
+def test_preset_respects_the_cap() -> None:
+    target = A.preset_target("aggressive", _all_roles_dummy(), cap=0.30)  # us-large > 30% uncapped
+    assert max(target.values()) <= 0.30 + 1e-9
+    assert isclose(sum(target.values()), 1.0, abs_tol=1e-9)
+
+
+def test_unknown_preset_raises() -> None:
+    with pytest.raises(ValueError, match="unknown preset"):
+        A.preset_target("balanced", _all_roles_dummy())
+
+
+def test_presets_are_discipline() -> None:
+    for preset in A.PRESETS:
+        assert allocation_kind(preset) == "discipline"
+
+
+def test_preset_role_tables_cover_every_role() -> None:
+    # A role added to universe.ROLES must get a bucket AND a sub-weight, or the preset
+    # silently ignores it. Pin both tables to ROLES (drift guard).
+    from app.universe import ROLES
+
+    assert set(A._ROLE_BUCKET) == ROLES
+    assert set(A._ROLE_WEIGHT) == ROLES

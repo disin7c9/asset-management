@@ -41,7 +41,7 @@ from app.narrate import (
     render_narration,
 )
 from app.discover import Discovery, find_gaps, restrict_to
-from app.universe import ROLES, load_universe
+from app.universe import ROLES, Candidate, load_universe
 from app.returns import ReturnsSummary
 from app.risk import DollarDrawdown, RiskSummary
 from app.pipeline import (
@@ -51,11 +51,13 @@ from app.pipeline import (
     record_series_fetch,
 )
 from app.allocate import (
+    PRESETS,
     VALID_RULES,
     UnvalidatedEdgeError,
     allocate,
     allocation_kind,
     needs_series,
+    preset_target,
 )
 from app.backtest import BacktestResult, RoleCheck, backtest_compare, role_check
 from app.strategy import VALID_MODES, Suggestion, may_suggest, suggest
@@ -231,12 +233,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--allocate",
-        choices=sorted(VALID_RULES),
+        choices=sorted(VALID_RULES | PRESETS),
         default=None,
-        help="propose a target allocation over your CURRENT holdings with this rule "
-        "(equal_weight | inverse_vol): prints the weights, and writes them to --allocate-out "
-        "if given. Propose-only — review the file, then run --backtest / --rebalance against it "
-        "in a SEPARATE command.",
+        help="propose a target allocation with this rule. equal_weight / inverse_vol "
+        "re-weight your CURRENT holdings; moderate / conservative / aggressive build a "
+        "strategic role-bucket template (your fund per role, or a universe default). Prints "
+        "the weights + writes them to --allocate-out if given. Propose-only — review, then run "
+        "--backtest / --rebalance against the file in a SEPARATE command.",
     )
     parser.add_argument(
         "--allocate-out",
@@ -684,10 +687,12 @@ def _print_proposed_allocation(
         )
     if omitted:
         # A held ticker absent from a target reloads as 0 = sell. Surface it here (not
-        # just a stderr warning) so the user sees it before acting on the file.
+        # just a stderr warning) so the user sees it before acting. The reason varies by
+        # rule — unpriced / no-history for a reweight, a deliberate substitution for a
+        # preset — so state the consequence, not one cause.
         lines.append(
-            "  NOT in target (unpriced / no usable history) — a to_total rebalance "
-            f"would SELL these: {', '.join(omitted)}"
+            "  held but NOT in the target — a to_total rebalance would SELL these: "
+            f"{', '.join(omitted)}"
         )
     if wrote_to is not None:
         lines.append(f"  wrote -> {wrote_to}")
@@ -698,6 +703,52 @@ def _print_proposed_allocation(
     sys.stdout.write("\n".join(lines) + "\n\n")
 
 
+def _load_universe(status_key: str, run: dict[str, Any]) -> list[Candidate] | None:
+    """Load the curated universe — `ASSET_UNIVERSE` overrides (like `ASSET_CSV`), else the
+    bundled `data/universe.csv`. On failure: log, set ``run[status_key]``, return None.
+    Shared by `--discover` and the preset allocator."""
+    universe_path = (
+        _env_path("ASSET_UNIVERSE")
+        or Path(__file__).resolve().parent.parent / "data" / "universe.csv"
+    )
+    try:
+        return load_universe(universe_path)
+    except (OSError, ValueError) as exc:
+        log.error("cannot load the universe (%s): %s", universe_path, exc)
+        run[status_key] = "skipped: universe unavailable"
+        return None
+
+
+def _resolve_role_tickers(
+    universe: list[Candidate], held_values: dict[str, float]
+) -> dict[str, str]:
+    """For each universe role, the ticker that fills it in a preset target: the holder's
+    LARGEST fund in that role (the dominant holding wins), else the universe default (the
+    top-AUM candidate — first in the AUM-ordered file). A held fund whose role the presets
+    zero-weight (e.g. thematic) still maps here; `preset_target` drops it, so a to_total
+    rebalance surfaces it as a sell."""
+    # One pass over the universe: a ticker→role index (to map the holder's funds) and
+    # each role's top-AUM default (first seen — the file is AUM-ordered within a role).
+    role_of: dict[str, str] = {}
+    default_for: dict[str, str] = {}
+    for c in universe:
+        role_of[c.ticker] = c.role
+        default_for.setdefault(c.role, c.ticker)
+    # The holder's LARGEST fund wins its role (ticker breaks an exact-value tie, so the
+    # result is independent of book/row order); a role with no held fund takes the default.
+    held_in_role: dict[str, str] = {}
+    for tk in sorted(held_values, key=lambda t: (-held_values[t], t)):
+        role = role_of.get(tk)
+        if role is not None:
+            held_in_role.setdefault(role, tk)
+    role_tickers: dict[str, str] = {}
+    for role in ROLES:
+        ticker = held_in_role.get(role) or default_for.get(role)
+        if ticker is not None:
+            role_tickers[role] = ticker
+    return role_tickers
+
+
 def _compute_allocation(
     state: DerivedState,
     prices: dict[str, PriceRow] | None,
@@ -706,10 +757,13 @@ def _compute_allocation(
     run: dict[str, Any],
     today: date,
 ) -> None:
-    """Propose a target allocation over the user's CURRENT holdings — a *discipline*
-    re-weighting, not new-ticker selection. Prints the weights for review and writes
-    them to --allocate-out if given. Backtesting / rebalancing against the result is a
-    SEPARATE command the user runs deliberately (propose ≠ simulate ≠ act).
+    """Propose a target allocation — a *discipline* step (no return forecast).
+    `equal_weight` / `inverse_vol` re-weight the user's CURRENT holdings; the `moderate`
+    / `conservative` / `aggressive` PRESETS build a strategic role-bucket template, filling
+    each role with the holder's fund or a universe default (so they DO introduce new
+    tickers). Prints the weights for review and writes them to --allocate-out if given;
+    backtesting / rebalancing against the result is a SEPARATE command (propose ≠ simulate
+    ≠ act).
 
     `series` is the price history already fetched for the brief; inverse_vol reuses it
     (no second round-trip) and only fetches when it's absent (the --no-risk path)."""
@@ -736,30 +790,41 @@ def _compute_allocation(
         run["allocate"] = "skipped: no prices"
         return
 
-    rows = None
-    if needs_series(rule):  # rule weighs on return history (inverse_vol)
-        src = series  # reuse the history already fetched for the brief (no refetch)
-        if src is None:  # --no-risk path: nothing fetched yet → fetch now AND record it
-            start = today - timedelta(days=400)  # ~13 months → a full year of returns
-            src = fetch_series(
-                priced, start, today, cache_dir=args.cache_dir, online=not args.offline
-            )
-            record_series_fetch(run, src)
-        rows = src.rows
-
-    try:
-        # The dispatcher enforces the discipline-vs-edge gate itself — the CLI no
-        # longer pre-checks, so a future edge rule is blocked at the chokepoint
-        # for every caller, not just this one.
-        target = allocate(rule, priced, rows, cap=args.allocate_cap)
-    except UnvalidatedEdgeError as exc:
-        log.warning("--allocate: %s", exc)
-        run["allocate"] = f"refused: {rule} unvalidated edge"
-        return
-    except ValueError as exc:  # infeasible --allocate-cap (cap * n < 1)
-        log.error("--allocate-cap: %s", exc)
-        run["allocate"] = "skipped: bad cap"
-        return
+    if rule in PRESETS:  # a strategic role-bucket template, not a reweight of holdings
+        universe = _load_universe("allocate", run)
+        if universe is None:
+            return
+        role_tickers = _resolve_role_tickers(universe, values)
+        try:
+            target = preset_target(rule, role_tickers, cap=args.allocate_cap)
+        except ValueError as exc:  # infeasible --allocate-cap (cap * n < 1)
+            log.error("--allocate-cap: %s", exc)
+            run["allocate"] = "skipped: bad cap"
+            return
+    else:
+        rows = None
+        if needs_series(rule):  # rule weighs on return history (inverse_vol)
+            src = series  # reuse the history already fetched for the brief (no refetch)
+            if src is None:  # --no-risk path: nothing fetched yet → fetch now AND record it
+                start = today - timedelta(days=400)  # ~13 months → a full year of returns
+                src = fetch_series(
+                    priced, start, today, cache_dir=args.cache_dir, online=not args.offline
+                )
+                record_series_fetch(run, src)
+            rows = src.rows
+        try:
+            # The dispatcher enforces the discipline-vs-edge gate itself — the CLI no
+            # longer pre-checks, so a future edge rule is blocked at the chokepoint
+            # for every caller, not just this one.
+            target = allocate(rule, priced, rows, cap=args.allocate_cap)
+        except UnvalidatedEdgeError as exc:
+            log.warning("--allocate: %s", exc)
+            run["allocate"] = f"refused: {rule} unvalidated edge"
+            return
+        except ValueError as exc:  # infeasible --allocate-cap (cap * n < 1)
+            log.error("--allocate-cap: %s", exc)
+            run["allocate"] = "skipped: bad cap"
+            return
 
     if not target:
         log.warning("--allocate: could not compute weights")
@@ -875,13 +940,8 @@ def _compute_discover(
         log.warning("--discover needs current prices; remove --no-prices")
         run["discover"] = "skipped: needs the price pipeline"
         return None, None
-    # The curated universe: ASSET_UNIVERSE overrides (like ASSET_CSV), else the bundled file.
-    universe_path = _env_path("ASSET_UNIVERSE") or Path(__file__).resolve().parent.parent / "data" / "universe.csv"
-    try:
-        universe = load_universe(universe_path)
-    except (OSError, ValueError) as exc:
-        log.error("--discover: cannot load the universe: %s", exc)
-        run["discover"] = "skipped: universe unavailable"
+    universe = _load_universe("discover", run)
+    if universe is None:
         return None, None
 
     discovery = find_gaps(state, prices, universe)

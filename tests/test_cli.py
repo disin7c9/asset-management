@@ -1294,3 +1294,47 @@ def test_target_writers_refuse_to_overwrite_the_transactions_csv(tmp_path: Path)
         main(["--csv", str(book), "--dump-target", str(book)])
     with pytest.raises(SystemExit):
         main(["--csv", str(book), "--allocate", "equal_weight", "--allocate-out", str(book)])
+
+
+def test_allocate_moderate_preset_keeps_held_funds_and_fills_gaps(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str],
+) -> None:
+    # --allocate moderate: a strategic template that keeps the user's fund per role
+    # (VOO/BND/VEA/IAU) and fills the gap roles with universe defaults (new tickers).
+    import re
+
+    now = datetime.now(timezone.utc)
+    held = {"BND": 73.0, "IAU": 84.0, "VEA": 72.0, "VOO": 697.0}
+    monkeypatch.setattr(
+        "app.cli.fetch_latest",
+        lambda tickers, *a, **k: PricesResult(
+            rows={
+                tk: PriceRow(tk, date.today(), held[tk], "test", now)
+                for tk in tickers if tk in held
+            },
+            missing=[tk for tk in tickers if tk not in held],
+        ),
+    )
+    with caplog.at_level(logging.INFO):
+        rc = main(["--csv", str(SAMPLE), "--allocate", "moderate", "--no-risk"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "VOO" in out  # the held us-large fund anchors the equity bucket
+    m = re.search(r"PROPOSED ALLOCATION: moderate \((\d+) holdings\)", out)
+    assert m is not None and int(m.group(1)) > 4  # held funds + gap-fills, not just the 4 held
+    assert _run_summary(caplog)["allocate"] == "moderate"
+
+
+def test_resolve_role_tickers_prefers_a_held_fund_then_the_universe_default() -> None:
+    from app.cli import _resolve_role_tickers
+    from app.universe import Candidate
+
+    universe = [
+        Candidate("VOO", "Vanguard S&P 500", "us-large", ""),  # AUM-ordered: VOO is the default
+        Candidate("IVV", "iShares Core S&P 500", "us-large", ""),
+        Candidate("BND", "Vanguard Total Bond", "bond-aggregate", ""),
+    ]
+    rt = _resolve_role_tickers(universe, {"IVV": 1000.0})  # holds IVV (us-large), no bonds
+    assert rt["us-large"] == "IVV"        # the held fund wins its role over the VOO default
+    assert rt["bond-aggregate"] == "BND"  # a gap role → the universe default (top-AUM)

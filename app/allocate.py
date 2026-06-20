@@ -5,9 +5,13 @@ this module decides **what the target should be**: pure functions over a univers
 and its price history. It plugs in one step upstream of the rebalance machinery —
 its output is a target-weight dict, the same shape `events.load_target` returns.
 
-`allocate(rule, universe, series, cap=…)` is THE entry point: it dispatches to the
-registered rule and enforces the **discipline-vs-edge gate** itself, so no caller
-(CLI, MCP tool, future searcher) can reach an unvalidated edge rule by accident.
+`allocate(rule, universe, series, cap=…)` is the entry point for the *reweight* rules:
+it dispatches to the registered rule and enforces the **discipline-vs-edge gate** itself,
+so no caller (CLI, MCP tool, future searcher) can reach an unvalidated edge rule by
+accident. The *strategic presets* take a different shape — a role→ticker template, not a
+reweight of the universe list — so they have their own entry, `preset_target`,
+discipline-only by construction (a prior, never a searched edge); `allocate()` rejects a
+preset name with a pointer to it.
 All current rules are *discipline*: they make no claim to beat the market (no
 return forecast), so they need no backtest to be honest and may always produce a
 target. An *edge* allocator (e.g. mean-variance optimization, which overfits
@@ -18,6 +22,10 @@ Rules:
     equal_weight   1/N over the universe — the robust baseline.
     inverse_vol    weight ∝ 1/volatility — each holding contributes ~equal *risk*,
                    not equal dollars; realized vol only, no return forecast.
+    conservative / moderate / aggressive
+                   strategic risk-posture PRESETS (see `preset_target`): a fixed
+                   role-bucket template (a prior, never a backtest-searched weight),
+                   not a reweight of held tickers. Discipline — they pass the gate.
 
 `apply_caps` enforces a per-asset weight ceiling (re-normalizing the rest) — a
 guard-rail against concentrating into one low-vol or past-winning asset.
@@ -59,6 +67,11 @@ AllocationKind = Literal["discipline", "edge"]
 _RULE_KIND: dict[str, AllocationKind] = {
     "equal_weight": "discipline",
     "inverse_vol": "discipline",
+    # Strategic presets are risk-posture priors, not return-forecasting optimizers →
+    # discipline (they dispatch through `preset_target`, not the `_RULES` registry).
+    "conservative": "discipline",
+    "moderate": "discipline",
+    "aggressive": "discipline",
 }
 
 _TRADING_DAYS = 252
@@ -203,6 +216,12 @@ def allocate(
     ``cap`` applies `apply_caps` (its ValueError on an infeasible cap propagates).
     Returns {} when no usable weights exist (empty universe, no risk signal).
     """
+    if rule in PRESETS:
+        msg = (
+            f"{rule!r} is a strategic preset — call preset_target(), not allocate() "
+            "(a preset is a role→ticker template, not a reweight of the universe list)"
+        )
+        raise ValueError(msg)
     runner = _RULES.get(rule)
     if runner is None:
         msg = f"unknown allocation rule {rule!r}; valid: {sorted(_RULES)}"
@@ -216,5 +235,91 @@ def allocate(
     clean = [tk for tk in universe if tk != CASH_TICKER]
     target = runner(clean, series_by_ticker)
     if cap is not None and target:
+        target = apply_caps(target, cap)
+    return target
+
+
+# --- Strategic preset allocations (conservative / moderate / aggressive) ---
+#
+# A risk-posture PRIOR, not an optimization: the weights are hand-designed (like a
+# balanced fund's policy), never searched by backtest score (that overfits — see
+# examples/ 05–06). Discipline, so they pass the gate freely. Two levels: a bucket
+# weight per preset (the equity/bond/diversifier posture) × a fixed core-satellite
+# sub-weight per role WITHIN its bucket (so us-large anchors equity — not 1/N across
+# VOO and a thematic sleeve). The CLI resolves each role to a ticker — the holder's
+# fund in that role, or a universe default — and passes the {role: ticker} map here.
+
+PresetName = Literal["conservative", "moderate", "aggressive"]
+PRESETS: frozenset[str] = frozenset(get_args(PresetName))
+
+# The 14 universe roles → 3 strategic buckets. Pinned to `universe.ROLES` by a test.
+_ROLE_BUCKET: dict[str, str] = {
+    "us-large": "equity", "us-small-mid": "equity", "us-dividend": "equity",
+    "intl-developed": "equity", "em-equity": "equity", "sector-equity": "equity",
+    "thematic-equity": "equity",
+    "bond-aggregate": "bonds", "treasury": "bonds", "tips": "bonds",
+    "corporate-bond": "bonds",
+    "gold": "diversifiers", "commodity-broad": "diversifiers", "reit": "diversifiers",
+}
+
+# Bucket weights per preset (tunable priors; vendor anchors = Vanguard LifeStrategy
+# 40/60 · 60/40 · 80/20). Each preset's buckets sum to 1.
+_PRESET_BUCKETS: dict[str, dict[str, float]] = {
+    "conservative": {"equity": 0.35, "bonds": 0.50, "diversifiers": 0.15},
+    "moderate":     {"equity": 0.55, "bonds": 0.30, "diversifiers": 0.15},
+    "aggressive":   {"equity": 0.75, "bonds": 0.12, "diversifiers": 0.13},
+}
+
+# Core-satellite sub-weight per role WITHIN its bucket — the fix for BOTH inverse_vol's
+# bond skew and equal_weight's 1/N nonsense: us-large anchors equity; sector / thematic /
+# broad-commodity are 0 (tactical satellites, not the strategic default — add them via
+# --discover or by hand). Each bucket's positive weights sum to 1.
+_ROLE_WEIGHT: dict[str, float] = {
+    "us-large": 0.55, "intl-developed": 0.22, "us-dividend": 0.10,
+    "us-small-mid": 0.08, "em-equity": 0.05, "sector-equity": 0.0, "thematic-equity": 0.0,
+    "bond-aggregate": 0.50, "treasury": 0.20, "corporate-bond": 0.18, "tips": 0.12,
+    "gold": 0.60, "reit": 0.40, "commodity-broad": 0.0,
+}
+
+
+def preset_target(
+    preset: str, role_tickers: dict[str, str], *, cap: float | None = None
+) -> dict[str, float]:
+    """A risk-posture template → ticker:weight. `role_tickers` maps each role to the
+    ticker filling it (the holder's fund in that role, or a universe default). Each
+    preset's bucket weight is split across the roles PRESENT in that bucket in
+    proportion to their core-satellite sub-weight; weights renormalize to 1 (a missing
+    role or empty bucket doesn't leak weight). Roles with a zero sub-weight (tactical
+    satellites) are excluded. `cap` applies `apply_caps`. Presets are discipline — they
+    are priors, not optimizers, so no gate/validation is needed."""
+    buckets = _PRESET_BUCKETS.get(preset)
+    if buckets is None:
+        raise ValueError(f"unknown preset {preset!r}; valid: {sorted(PRESETS)}")
+    present: dict[str, list[str]] = {}
+    for role in role_tickers:
+        bucket = _ROLE_BUCKET.get(role)
+        if bucket is not None and _ROLE_WEIGHT.get(role, 0.0) > 0.0:
+            present.setdefault(bucket, []).append(role)
+    weights: dict[str, float] = {}
+    for bucket, bw in buckets.items():
+        roles = present.get(bucket, [])
+        subtotal = sum(_ROLE_WEIGHT[r] for r in roles)
+        if subtotal <= 0.0:
+            # No fund resolved for this whole bucket → its weight is dropped and the
+            # rest renormalize, which SHIFTS the posture. Never happens with the bundled
+            # universe (every role has a default); warn loudly for a custom universe.
+            log.warning(
+                "preset %s: no fund for the %s bucket (%.0f%% of the target) — the "
+                "posture is renormalized over the remaining buckets", preset, bucket, bw * 100,
+            )
+            continue
+        for role in roles:
+            tk = role_tickers[role]
+            weights[tk] = weights.get(tk, 0.0) + bw * _ROLE_WEIGHT[role] / subtotal
+    total = sum(weights.values())
+    if total <= 0.0:
+        return {}
+    target = {tk: w / total for tk, w in weights.items()}
+    if cap is not None:
         target = apply_caps(target, cap)
     return target
