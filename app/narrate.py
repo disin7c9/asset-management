@@ -27,6 +27,7 @@ import re
 from dataclasses import dataclass
 from datetime import date
 
+from app.backtest import BenchmarkResult, BenchmarkVerdict
 from app.derive import DerivedState
 from app.discover import Discovery
 from app.prices import PriceRow
@@ -96,29 +97,62 @@ _RETURN_BAND = _BandSpec(((0.0, "negative"), (0.10, "modest"), (0.20, "healthy")
 # and CDaR (already a positive magnitude). All band thresholds here are ROUGH, coarse
 # tone buckets — tunable; they only nudge the FREE-tier model's wording, never a figure.
 _DD_CUTS = ((0.05, "mild"), (0.15, "moderate"), (0.30, "significant"))
+_DD_BAND = _BandSpec(_DD_CUTS, "severe", use_abs=True)  # depth is negative; shared by the
+#   brief's max_drawdown and the benchmark legs' {{bench_dd_*}} depths (slice 2b)
+# Book exposure (0..1) to a discovery gap role — how much of this slice you already hold.
+_EXPOSURE_BAND = _BandSpec(((0.005, "none"), (0.03, "very little"), (0.10, "some")), "a fair amount")
 
 # token → band spec. ONE table (was a per-token if-ladder in build_prompt): each
 # metric's band is computed *with* its Claim, so adding a metric can't silently drop
 # its FREE-tier band, and the privacy dial just reads ``c.band`` — it never
 # re-dispatches on token name. (Dates/counts/$ amounts have no band → not listed.)
 _BAND_SPECS: dict[str, _BandSpec] = {
-    "max_drawdown": _BandSpec(_DD_CUTS, "severe", use_abs=True),  # depth is negative
+    "max_drawdown": _DD_BAND,                                     # depth is negative
     "cdar": _BandSpec(_DD_CUTS, "severe"),                        # already a positive magnitude
     "ulcer": _BandSpec(((0.02, "mild"), (0.05, "moderate"), (0.10, "significant")), "severe"),
     "sharpe": _RATIO_BAND, "sortino": _RATIO_BAND, "calmar": _RATIO_BAND,
     "twr_annual": _RETURN_BAND, "mwr_annual": _RETURN_BAND, "dietz_annual": _RETURN_BAND,
 }
 
+# Token-PREFIX band families: a consumer whose claims are named by a stable prefix (one
+# per gap role, one per benchmark leg) shares a band by that prefix, so a new claim in the
+# family is banded automatically. The brief's fixed metrics match by exact name above;
+# these match by prefix only when no exact spec exists.
+_PREFIX_BANDS: tuple[tuple[str, _BandSpec], ...] = (
+    ("gap_", _EXPOSURE_BAND),    # discovery: the book's exposure to a gap role
+    ("bench_dd_", _DD_BAND),     # benchmark: a leg's max-drawdown depth
+)
+
 
 def _band_for(token: str, value: float | int | str | date) -> str | None:
     """The FREE-tier band for a claim, or None for a token without one. Computed once
     at claim construction and stored on ``Claim.band``. Fails closed (None) on a
-    non-finite value too — a band must never assert "severe" for a figure that is
-    actually n/a (matches the fence's ethos; today add() already pre-filters these)."""
-    spec = _BAND_SPECS.get(token)
-    if spec is None or isinstance(value, bool) or not isinstance(value, (int, float)):
+    non-finite or non-numeric value — a band must never assert "severe" for a figure that
+    is actually n/a (matches the fence's ethos)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
         return None
-    return None if not math.isfinite(value) else spec.label_for(float(value))
+    spec = _BAND_SPECS.get(token) or next(
+        (s for prefix, s in _PREFIX_BANDS if token.startswith(prefix)), None
+    )
+    return spec.label_for(float(value)) if spec is not None else None
+
+
+def _add_claim(
+    claims: dict[str, Claim],
+    token: str,
+    value: float | int | str | date,
+    rendered: str,
+    label: str,
+) -> None:
+    """Insert ONE claim, skipping a non-finite float figure — the single fail-closed gate
+    EVERY claim-builder routes through (brief / discovery / benchmark), so a nan/inf can
+    never reach the fence as "nan%"/"$inf" (which PCN's ``\\d`` would not catch). The
+    FREE-tier band derives once here from (token, value), so a new claim can't silently
+    lose its privacy band."""
+    if isinstance(value, float) and not math.isfinite(value):
+        return
+    claims[token] = Claim(token=token, value=value, rendered=rendered, label=label,
+                          band=_band_for(token, value))
 
 
 # ── claim set: the validated figures the LLM may reference ────────────────────
@@ -139,14 +173,7 @@ def build_claim_set(
     claims: dict[str, Claim] = {}
 
     def add(token: str, value: float | int | str | date, rendered: str, label: str) -> None:
-        # Fail-safe: never expose a non-finite figure (mirrors report.py rendering n/a).
-        # Most numeric claims are isfinite-gated by their caller; this central guard
-        # also covers the ungated ones (drawdown depth, P&L, $ giveback) so a nan/inf
-        # can never reach the fence as "nan%"/"$inf" (which PCN's \d would not catch).
-        if isinstance(value, float) and not math.isfinite(value):
-            return
-        claims[token] = Claim(token=token, value=value, rendered=rendered, label=label,
-                              band=_band_for(token, value))
+        _add_claim(claims, token, value, rendered, label)  # shared fail-closed guard + band
 
     prices = prices or {}
     held = state.held()
@@ -310,10 +337,6 @@ def build_prompt(claim_set: dict[str, Claim], *, tier: str) -> tuple[str, str]:
 # cost/overlap/correlation figures live in the deterministic panel); only the book's
 # gap exposure is a citable figure, banded for FREE like every other claim.
 
-_EXPOSURE_BAND = _BandSpec(
-    ((0.005, "none"), (0.03, "very little"), (0.10, "some")), "a fair amount"
-)
-
 # Plain-English role names for the prose — the slugs ("bond-aggregate") read as jargon,
 # and the model may write these directly (they carry no digit, so the fence allows them),
 # keeping the {{gap_*}} token for the exposure FIGURE, not the role's name.
@@ -380,11 +403,9 @@ def build_discovery_claims(
     claims: dict[str, Claim] = {}
     for role in discovery.gaps:
         exposure = discovery.exposure.get(role, 0.0)
-        token = _claim_token("gap_", role)
-        claims[token] = Claim(
-            token=token, value=exposure, rendered=f"{exposure * 100:.0f}%",
-            label=f"the book's current exposure to {_ROLE_NAMES.get(role, role)}",
-            band=_EXPOSURE_BAND.label_for(exposure),
+        _add_claim(  # band: the gap_ prefix → _EXPOSURE_BAND (see _PREFIX_BANDS)
+            claims, _claim_token("gap_", role), exposure, f"{exposure * 100:.0f}%",
+            f"the book's current exposure to {_ROLE_NAMES.get(role, role)}",
         )
     for c in discovery.candidates:
         r = by_ticker.get(c.ticker)
@@ -394,8 +415,7 @@ def build_discovery_claims(
         fit = _fit_phrase(r)
         if fit:
             label += f" ({fit})"
-        token = _claim_token("cand_", c.ticker)
-        claims[token] = Claim(token=token, value=c.ticker, rendered=c.ticker, label=label)
+        _add_claim(claims, _claim_token("cand_", c.ticker), c.ticker, c.ticker, label)
     return claims
 
 
@@ -440,3 +460,101 @@ def build_discovery_prompt(claim_set: dict[str, Claim], *, tier: str) -> tuple[s
         + "\n\nWrite the note now."
     )
     return _DISCOVERY_SYSTEM_PROMPT, user
+
+
+# ── benchmark narration (slice 2b): explain the preset-vs-reference verdict ────
+#
+# The SAME fence, pointed at --benchmark's result. The note is drawdown-first and HONEST:
+# where the posture's drawdown landed vs a canonical reference (60-40 / all-weather /
+# permanent), with the walk-forward verdict injected as FIXED framing — never "beats" /
+# "outperforms", never a forward prediction. Only the two legs' drawdown DEPTHS and the
+# reference's name are citable figures; the verdict is words the prompt pins, so the model
+# can't strengthen "no clear difference" into a win.
+
+# Plain, digit-free display names for the reference (the slug "60-40" carries a digit, so
+# the model MUST cite {{bench_reference}}, never type the name). Presentation — kept here
+# alongside _ROLE_NAMES, not in backtest's canonical _BENCHMARKS.
+_BENCHMARK_DISPLAY: dict[str, str] = {
+    "60-40": "the classic 60/40 stock-and-bond mix",
+    "all-weather": "the All-Weather portfolio",
+    "permanent": "the Permanent Portfolio",
+}
+
+# The held-out verdict as ONE fixed, number-free sentence the model must convey AS-IS and
+# never strengthen — drawdown DEPTH only; "no clear difference" is the honest, common
+# result on a short history.
+_VERDICT_SENTENCE: dict[BenchmarkVerdict, str] = {
+    "shallower": "Over the tested out-of-sample window, your posture's deepest drop was "
+    "SHALLOWER than the reference's.",
+    "deeper": "Over the tested out-of-sample window, your posture's deepest drop was "
+    "DEEPER than the reference's.",
+    "inconclusive": "A held-out test found NO CLEAR difference between the two drawdowns — "
+    "the usual, honest result on a short history.",
+    "insufficient": "There was not enough overlapping history to run a held-out test, so "
+    "the comparison is not yet judged.",
+}
+
+
+def build_benchmark_claims(result: BenchmarkResult) -> dict[str, Claim]:
+    """Validated figures the benchmark note may cite: each leg's max-drawdown DEPTH (your
+    posture and the reference, banded like the brief's max_drawdown via the bench_dd_
+    prefix) and the reference's NAME (cited by {{token}} so a digit-bearing name like
+    "60-40" can't trip PCN). The walk-forward VERDICT is NOT here — it's a word, mandated
+    as fixed framing in the prompt, never a number the model picks. Returns {} unless both
+    legs are present (an 'insufficient' run with no common window has nothing honest to
+    cite)."""
+    if len(result.legs) != 2:
+        return {}
+    posture, reference = result.legs
+    claims: dict[str, Claim] = {}
+    _add_claim(claims, "bench_dd_preset", posture.risk.max_drawdown_ci.point,
+               _pct(posture.risk.max_drawdown_ci.point),
+               "your posture's deepest peak-to-trough decline over the shared window")
+    _add_claim(claims, "bench_dd_reference", reference.risk.max_drawdown_ci.point,
+               _pct(reference.risk.max_drawdown_ci.point),
+               "the reference portfolio's deepest decline over the same window")
+    name = _BENCHMARK_DISPLAY.get(result.reference, result.reference)
+    _add_claim(claims, "bench_reference", name, name,
+               "the name of the well-known reference you are compared against")
+    return claims
+
+
+_BENCHMARK_SYSTEM_PROMPT = (
+    "You explain, in plain language for a portfolio's owner, how their chosen posture (a "
+    "conservative / moderate / aggressive preset mix) compares to a well-known reference "
+    "portfolio — DRAWDOWN-FIRST.\n"
+    "You are given each side's deepest decline and ONE fixed verdict sentence stating what "
+    "a held-out (walk-forward) test found. Put that verdict in plain words for the owner.\n"
+    "HARD RULES:\n"
+    "- Refer to every figure AND the reference's name ONLY by its {{token}} placeholder. "
+    "NEVER write a digit, percent, or portfolio name yourself — one stray character voids "
+    "the whole note. (The reference's name may contain digits; cite {{bench_reference}}, "
+    "never spell it.)\n"
+    "- Lead with drawdown: how deep your posture fell versus how deep the reference fell.\n"
+    "- Convey the verdict EXACTLY as given and NO stronger. NEVER say one portfolio 'beats', "
+    "'outperforms', 'wins', or is 'better than' the other — the finding is about drawdown "
+    "DEPTH alone, and on a short history it is usually 'no clear difference'.\n"
+    "- NEVER predict returns or say which will do better going forward; you have no forward "
+    "figures and past drawdown is not a forecast.\n"
+    "- Do NOT quantify in words ('twice as deep', 'half'); stay qualitative ('a little "
+    "deeper', 'about the same').\n"
+    "- This is a description for the owner to judge — NOT advice, NOT a recommendation.\n"
+    "Output ONLY the note (2-4 sentences) — no preamble, no heading, no bullet points."
+)
+
+
+def build_benchmark_prompt(
+    claim_set: dict[str, Claim], result: BenchmarkResult, *, tier: str
+) -> tuple[str, str]:
+    """Pure: the (system, user) prompts for the benchmark note. Same privacy dial as the
+    other builders. The held-out verdict is injected as a FIXED sentence the model must
+    convey without strengthening — so it can never turn 'no clear difference' into a win."""
+    user = (
+        "Figures — cite each ONLY as its {{token}}, never the value:\n"
+        + _claim_listing(claim_set, send_exact=tier in ("paid", "local"))
+        + "\n\nThe held-out verdict you MUST convey (in your own words, but never stronger "
+        "than this states):\n"
+        + _VERDICT_SENTENCE.get(result.verdict, _VERDICT_SENTENCE["inconclusive"])
+        + "\n\nWrite the note now."
+    )
+    return _BENCHMARK_SYSTEM_PROMPT, user

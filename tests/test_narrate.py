@@ -15,6 +15,8 @@ from app.derive import DerivedState, Position
 from app.discover import Discovery
 from app.narrate import (
     Claim,
+    build_benchmark_claims,
+    build_benchmark_prompt,
     build_claim_set,
     build_discovery_claims,
     build_discovery_prompt,
@@ -434,3 +436,96 @@ def test_role_names_cover_every_role() -> None:
     from app.universe import ROLES
 
     assert set(_ROLE_NAMES) == ROLES
+
+
+# ── R7: one fail-closed claim gate + banding centralized in _band_for ──────────
+
+
+def test_band_for_resolves_prefix_families_and_add_claim_fails_closed() -> None:
+    from app.narrate import _add_claim, _band_for
+
+    # Prefix families band a claim whose exact token isn't in _BAND_SPECS (discovery
+    # gaps, benchmark legs), so a new claim in the family is banded automatically.
+    assert _band_for("bench_dd_preset", -0.20) == "significant"   # |20%| ∈ [15%, 30%)
+    assert _band_for("gap_reit", 0.0) == "none"                   # exposure prefix, no holding
+    assert _band_for("bench_dd_x", float("nan")) is None          # non-finite → no band
+    assert _band_for("totally_unknown", 1.0) is None              # no exact spec, no prefix
+    # The single guard drops a non-finite figure before it can reach the fence.
+    claims: dict[str, Claim] = {}
+    _add_claim(claims, "bench_dd_x", float("inf"), "n/a", "label")
+    assert claims == {}
+
+
+# ── benchmark narration (slice 2b): the SAME fence, pointed at --benchmark ─────
+
+
+def _benchmark_result(reference: str = "60-40"):  # type: ignore[no-untyped-def]
+    """A real 2-leg BenchmarkResult from a tiny synthetic series (preset = monotone riser
+    → no drawdown; reference = oscillator → real drawdowns), so the claims read genuine
+    max-drawdown depths. Pure: benchmark_compare is in-memory, no I/O."""
+    import math
+
+    import pandas as pd
+
+    from app.backtest import benchmark_compare
+
+    def bdays(prices: list[float]) -> "pd.Series[float]":
+        return pd.Series(prices, index=pd.bdate_range("2022-01-03", periods=len(prices)), dtype=float)
+
+    n = 300
+    rise = bdays([100.0 + i for i in range(n)])
+    chop = bdays([100.0 + 15.0 * math.sin(i / 4.0) for i in range(n)])
+    res = benchmark_compare(
+        {"RISE": rise, "CHOP": chop}, {"RISE": 1.0}, {"CHOP": 1.0},
+        reference=reference, bootstrap_n=200,
+    )
+    assert res is not None
+    return res
+
+
+def test_benchmark_claims_cite_both_depths_and_the_reference_name() -> None:
+    claims = build_benchmark_claims(_benchmark_result("60-40"))
+    assert set(claims) == {"bench_dd_preset", "bench_dd_reference", "bench_reference"}
+    # The reference name is cited by token, so a digit-bearing slug ("60-40") can't trip PCN.
+    assert claims["bench_reference"].rendered == "the classic 60/40 stock-and-bond mix"
+    assert claims["bench_reference"].band is None                 # a name → no band
+    # The preset (RISE) never drew down; the reference (CHOP) did → banded by depth.
+    assert claims["bench_dd_preset"].band == "mild"              # |~0%| < 5%
+    assert claims["bench_dd_reference"].band in {"moderate", "significant", "severe"}
+    assert claims["bench_dd_reference"].rendered.endswith("%")    # a signed depth, e.g. -26.xx%
+
+
+def test_benchmark_claims_empty_without_two_legs() -> None:
+    from app.backtest import BenchmarkResult
+
+    bare = BenchmarkResult(
+        reference="60-40", start=date(2022, 1, 3), end=date(2022, 6, 1),
+        legs=(), oos=None, verdict="insufficient", dd_diff_ci=(0.0, 0.0),
+        reason="n/a", missing=("VOO", "BND"),
+    )
+    assert build_benchmark_claims(bare) == {}                    # nothing honest to cite
+
+
+def test_benchmark_prompt_injects_fixed_verdict_and_forbids_beats() -> None:
+    from app.narrate import _VERDICT_SENTENCE
+
+    res = _benchmark_result("all-weather")
+    system, user = build_benchmark_prompt(build_benchmark_claims(res), res, tier="free")
+    assert "beats" in system and "NEVER" in system               # the no-"beats" guardrail
+    assert "predict returns" in system                           # no forward forecast
+    # The held-out verdict is injected verbatim, so the model can't strengthen it.
+    assert _VERDICT_SENTENCE[res.verdict] in user
+
+
+def test_benchmark_narration_renders_and_stays_fenced() -> None:
+    res = _benchmark_result("permanent")
+    claims = build_benchmark_claims(res)
+    prose = (
+        "Your posture's deepest dip was {{bench_dd_preset}}, versus {{bench_dd_reference}} "
+        "for {{bench_reference}}; a held-out test couldn't tell them apart."
+    )
+    out = render_narration(prose, claims)
+    assert out is not None
+    assert "the Permanent Portfolio" in out                      # the reference name, substituted
+    assert "{{" not in out
+    assert render_narration("It fell 12% from its peak.", claims) is None  # PCN: a model-typed digit

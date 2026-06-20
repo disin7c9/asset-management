@@ -136,6 +136,7 @@ def build_report_data(
     discovery: Discovery | None = None,
     discovery_results: list[CandidateScreen] | None = None,
     discovery_summary: Section | None = None,
+    benchmark_summary: Section | None = None,
     summary: Section | None = None,
 ) -> ReportData:
     """Assemble the deterministic brief as ordered sections.
@@ -183,6 +184,8 @@ def build_report_data(
     if backtest is not None and backtest.legs:
         sections.append(_section_backtest(backtest))
     if benchmark is not None and benchmark.legs:
+        if benchmark_summary is not None:  # the narrated verdict (slice 2b) leads its panel
+            sections.append(benchmark_summary)
         sections.append(_section_benchmark(benchmark))
 
     footer = _footer_section(prices, missing_tickers, gen)

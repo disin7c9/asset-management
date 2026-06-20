@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import sys
+from collections.abc import Callable
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -34,6 +35,9 @@ from app.report import (
 )
 from app.llm import complete, load_config
 from app.narrate import (
+    Claim,
+    build_benchmark_claims,
+    build_benchmark_prompt,
     build_claim_set,
     build_discovery_claims,
     build_discovery_prompt,
@@ -359,6 +363,7 @@ def main(argv: list[str] | None = None) -> int:
         "narrate": None,
         "discover": None,
         "discover_narrate": None,
+        "benchmark_narrate": None,
     }
 
     # Nothing to do: no book and no notional backtest → guide, don't fabricate a brief.
@@ -465,10 +470,13 @@ def main(argv: list[str] | None = None) -> int:
 
     summary_section: Section | None = None
     discovery_summary: Section | None = None
+    benchmark_summary: Section | None = None
     if args.narrate:
         summary_section = _compute_narration(state, prices, returns, risk, dollar_dd, run)
         if discovery is not None and discovery_results is not None:
             discovery_summary = _compute_discovery_narration(discovery, discovery_results, run)
+        if benchmark is not None:
+            benchmark_summary = _compute_benchmark_narration(benchmark, run)
 
     data = build_report_data(
         state, prices=prices, returns=returns, risk=risk,
@@ -477,6 +485,7 @@ def main(argv: list[str] | None = None) -> int:
         dollar_dd=dollar_dd, metadata=meta, candidates=cands,
         discovery=discovery, discovery_results=discovery_results,
         discovery_summary=discovery_summary, summary=summary_section, benchmark=benchmark,
+        benchmark_summary=benchmark_summary,
     )
 
     sys.stdout.write(render_text(data) + "\n")
@@ -1057,6 +1066,49 @@ def _compute_benchmark(
     return result
 
 
+def _narrate(
+    *,
+    run: dict[str, Any],
+    run_key: str,
+    flag: str,
+    build_claims: Callable[[], dict[str, Claim]],
+    build_prompt_fn: Callable[[dict[str, Claim], str], tuple[str, str]],
+    title: str,
+    provenance_tail: str,
+) -> Section | None:
+    """The shared pipeline behind every fenced block (SUMMARY / DISCOVERY / BENCHMARK):
+    resolve the backend ONCE, build the claim set, prompt the model, run the SymGen/PCN
+    fence, and wrap a source-labeled prose Section. Fail-closed at every step (no backend,
+    no figures, a model failure, or a fence rejection) → None, so the plain brief always
+    prints. The numbers stay the tool's; only the wording is the model's.
+
+    `flag` labels the warnings (e.g. "--narrate"); `build_claims` is a thunk so the claim
+    set is built only AFTER the backend check; `provenance_tail` is the per-block source
+    clause appended to the shared "wording by <model> (<tier> tier)" credit."""
+    config = load_config()
+    if config is None:
+        log.warning("%s: no LLM backend configured (set ASSET_NARRATE_* in .env)", flag)
+        run[run_key] = "skipped: not configured"
+        return None
+    claim_set = build_claims()
+    if not claim_set:
+        run[run_key] = "skipped: nothing to narrate"
+        return None
+    system, user = build_prompt_fn(claim_set, config.tier)
+    prose = complete(config, system, user)
+    fenced = render_narration(prose, claim_set) if prose else None
+    if fenced is None:
+        log.warning(
+            "%s: narration withheld — the model returned nothing, or its output failed the "
+            "number fence (a stray digit/token or an unknown reference)", flag,
+        )
+        run[run_key] = "withheld: empty or failed the fence"
+        return None
+    provenance = f"— wording by {config.model} ({config.tier} tier); {provenance_tail}"
+    run[run_key] = f"{config.model} ({config.tier})"
+    return Section(title, (fenced, "", provenance), prose=True)
+
+
 def _compute_narration(
     state: DerivedState,
     prices: dict[str, PriceRow] | None,
@@ -1065,35 +1117,15 @@ def _compute_narration(
     dollar_dd: DollarDrawdown | None,
     run: dict[str, Any],
 ) -> Section | None:
-    """Build the opt-in SUMMARY narration: claim set → LLM prose → SymGen/PCN fence
-    → a source-labeled Section. Fail-closed at every step (no backend, no figures, a
-    model failure, or a fence rejection) → None, and the plain brief still prints.
-    The numbers are the tool's; only the wording is the model's."""
-    config = load_config()
-    if config is None:
-        log.warning("--narrate: no LLM backend configured (set ASSET_NARRATE_* in .env)")
-        run["narrate"] = "skipped: not configured"
-        return None
-    claim_set = build_claim_set(state, prices, returns, risk, dollar_dd=dollar_dd)
-    if not claim_set:
-        run["narrate"] = "skipped: no figures to narrate"
-        return None
-    system, user = build_prompt(claim_set, tier=config.tier)
-    prose = complete(config, system, user)
-    fenced = render_narration(prose, claim_set) if prose else None
-    if fenced is None:
-        log.warning(
-            "--narrate: narration withheld — the model returned nothing, or its output "
-            "failed the number fence (a stray digit / unknown token)"
-        )
-        run["narrate"] = "withheld: empty or failed the fence"
-        return None
-    provenance = (
-        f"— wording by {config.model} ({config.tier} tier); the figures are computed "
-        "and verified by the tool, not the model. Not financial advice."
+    """Opt-in (`--narrate`): the plain-language SUMMARY that leads the brief."""
+    return _narrate(
+        run=run, run_key="narrate", flag="--narrate",
+        build_claims=lambda: build_claim_set(state, prices, returns, risk, dollar_dd=dollar_dd),
+        build_prompt_fn=lambda cs, tier: build_prompt(cs, tier=tier),
+        title="SUMMARY",
+        provenance_tail="the figures are computed and verified by the tool, not the model. "
+        "Not financial advice.",
     )
-    run["narrate"] = f"{config.model} ({config.tier})"
-    return Section("SUMMARY", (fenced, "", provenance), prose=True)
 
 
 def _compute_discovery_narration(
@@ -1101,35 +1133,33 @@ def _compute_discovery_narration(
     results: list[CandidateScreen],
     run: dict[str, Any],
 ) -> Section | None:
-    """Opt-in (`--discover --narrate`): rank/explain the screened gap-fillers through the
-    SAME fence as the brief SUMMARY — claims → LLM prose → SymGen/PCN → a source-labeled
-    note leading the DISCOVERY panel. Fail-closed at every step → None (the plain panel
-    still prints). Role-fit only; the verdicts and figures are the tool's, not the model's."""
-    config = load_config()
-    if config is None:
-        log.warning("--discover --narrate: no LLM backend configured (set ASSET_NARRATE_* in .env)")
-        run["discover_narrate"] = "skipped: not configured"
-        return None
-    claim_set = build_discovery_claims(discovery, results)
-    if not claim_set:
-        run["discover_narrate"] = "skipped: nothing to narrate"
-        return None
-    system, user = build_discovery_prompt(claim_set, tier=config.tier)
-    prose = complete(config, system, user)
-    fenced = render_narration(prose, claim_set) if prose else None
-    if fenced is None:
-        log.warning(
-            "--discover --narrate: note withheld — the model returned nothing, or its "
-            "output failed the number fence (a stray digit/ticker or an unknown token)"
-        )
-        run["discover_narrate"] = "withheld: empty or failed the fence"
-        return None
-    provenance = (
-        f"— wording by {config.model} ({config.tier} tier); ranked on role-fit by the "
-        "tool's screen, not the model. Propose-only; not financial advice."
+    """Opt-in (`--discover --narrate`): rank/explain the screened gap-fillers — role-fit
+    only — in a fenced note leading the DISCOVERY panel."""
+    return _narrate(
+        run=run, run_key="discover_narrate", flag="--discover --narrate",
+        build_claims=lambda: build_discovery_claims(discovery, results),
+        build_prompt_fn=lambda cs, tier: build_discovery_prompt(cs, tier=tier),
+        title="DISCOVERY — worth a closer look",
+        provenance_tail="ranked on role-fit by the tool's screen, not the model. "
+        "Propose-only; not financial advice.",
     )
-    run["discover_narrate"] = f"{config.model} ({config.tier})"
-    return Section("DISCOVERY — worth a closer look", (fenced, "", provenance), prose=True)
+
+
+def _compute_benchmark_narration(
+    result: BenchmarkResult,
+    run: dict[str, Any],
+) -> Section | None:
+    """Opt-in (`--backtest --benchmark --narrate`): explain where the posture's drawdown
+    landed vs the reference — drawdown-first, the walk-forward verdict stated as-is, never
+    "beats" — in a fenced note leading the BENCHMARK panel."""
+    return _narrate(
+        run=run, run_key="benchmark_narrate", flag="--backtest --benchmark --narrate",
+        build_claims=lambda: build_benchmark_claims(result),
+        build_prompt_fn=lambda cs, tier: build_benchmark_prompt(cs, result, tier=tier),
+        title="BENCHMARK — how your posture compares",
+        provenance_tail="the drawdown verdict is the tool's walk-forward test, not the "
+        "model. Propose-only; not financial advice.",
+    )
 
 
 def _log_run_summary(run: dict[str, Any]) -> None:
@@ -1138,7 +1168,7 @@ def _log_run_summary(run: dict[str, Any]) -> None:
     Schema: {date, source, n_events_replayed, n_prices_fetched, n_prices_missing,
     n_series_fetched, n_series_missing, fallbacks_used, status, report_saved,
     email_sent, email_detail?, rebalance, backtest, allocate, metadata, screen,
-    narrate, discover, discover_narrate, error?}.
+    narrate, discover, discover_narrate, benchmark_narrate, error?}.
     """
     log.info("run_summary %s", json.dumps(run, separators=(",", ":")))
 

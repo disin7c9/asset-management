@@ -576,6 +576,45 @@ def test_discover_narrate_leads_the_panel(
     assert _run_summary(caplog)["discover_narrate"] == "test-model (paid)"
 
 
+def test_benchmark_narrate_leads_the_panel(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str],
+) -> None:
+    # --backtest --benchmark --narrate: a fence-validated note leads the BENCHMARK panel.
+    from app.llm import NarratorConfig
+
+    monkeypatch.setattr("app.cli.fetch_series", _flat_series)
+
+    def fake_complete(_cfg: object, system: str, _user: str) -> str:
+        if "reference portfolio" in system:  # the benchmark note
+            return (
+                "Your posture's deepest dip was {{bench_dd_preset}}, versus "
+                "{{bench_dd_reference}} for {{bench_reference}}; a held-out test "
+                "couldn't tell them apart."
+            )
+        return "A calm summary of the book."  # the (empty-book) SUMMARY block
+
+    monkeypatch.setattr(
+        "app.cli.load_config",
+        lambda: NarratorConfig("openai", "test-model", "k", "http://x", "paid", 0.0),
+    )
+    monkeypatch.setattr("app.cli.complete", fake_complete)
+
+    with caplog.at_level(logging.INFO):
+        rc = main([
+            "--csv", str(SAMPLE), "--no-prices", "--backtest", "--target", str(TARGET),
+            "--benchmark", "60-40", "--narrate",
+        ])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "BENCHMARK — how your posture compares" in out         # the narrated note section leads
+    assert "the classic 60/40 stock-and-bond mix" in out          # the reference name, rendered
+    assert "couldn't tell them apart" in out                      # the model's words
+    assert "wording by test-model (paid tier)" in out             # source-labeled provenance
+    assert "BENCHMARK (preset vs 60-40" in out                    # deterministic panel still follows
+    assert _run_summary(caplog)["benchmark_narrate"] == "test-model (paid)"
+
+
 def _canned_meta() -> object:
     from app.metadata import MetadataResult, SecurityMeta
 
