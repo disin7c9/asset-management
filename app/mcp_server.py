@@ -26,10 +26,11 @@ from __future__ import annotations
 import logging
 import math
 import os
+import re
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
@@ -38,12 +39,19 @@ from pydantic import BaseModel, Field
 
 from app.pipeline import compute_prices_returns_risk, load_book
 from app.derive import DerivedState
-from app.events import load_target
+from app.discover import find_gaps
+from app.events import CASH_TICKER, load_target
 from app.log_config import setup_logging
-from app.prices import PriceRow
+from app.metadata import fetch_metadata
+from app.prices import PriceRow, fetch_series
 from app.returns import ReturnsSummary
 from app.risk import DollarDrawdown, MetricCI, RiskSummary
+from app.screen import screen_candidates
 from app.strategy import VALID_MODES, Mode, suggest
+from app.universe import load_universe
+
+if TYPE_CHECKING:
+    import pandas as pd
 
 log = logging.getLogger(__name__)
 
@@ -98,6 +106,16 @@ def _cache_dir() -> Path:
     return _REPO_ROOT / "data" / "prices"
 
 
+def _universe_path() -> Path:
+    """The curated ETF universe `discover_gaps` reads. ``ASSET_UNIVERSE`` overrides the
+    default ``data/universe.csv`` (mirrors the CLI's override)."""
+    raw = os.environ.get("ASSET_UNIVERSE", "").strip()
+    if raw:
+        p = Path(raw).expanduser()
+        return p if p.is_absolute() else _REPO_ROOT / p
+    return _REPO_ROOT / "data" / "universe.csv"
+
+
 # ── the one offline build (shared by every tool) ─────────────────────────────
 
 
@@ -111,6 +129,7 @@ class _Build:
     risk: RiskSummary | None
     missing: list[str]            # held tickers with no usable cached price
     dollar_dd: DollarDrawdown | None
+    daily: "pd.Series[float] | None" = None  # the book's daily return series (for screen_candidate)
 
 
 def _build(*, no_risk: bool, today: date) -> _Build:
@@ -128,7 +147,7 @@ def _build(*, no_risk: bool, today: date) -> _Build:
         "status": "ok", "n_prices_fetched": 0, "n_prices_missing": 0,
         "n_series_fetched": 0, "n_series_missing": 0, "fallbacks_used": 0,
     }
-    prices, returns, risk, missing, _twr_excluded, dollar_dd, _series, _daily = (
+    prices, returns, risk, missing, _twr_excluded, dollar_dd, _series, daily = (
         compute_prices_returns_risk(
             events, state, no_risk=no_risk, offline=True,
             cache_dir=cache, today=today, run=run,
@@ -137,7 +156,7 @@ def _build(*, no_risk: bool, today: date) -> _Build:
     log.info("mcp build (offline, no_risk=%s): %s", no_risk, run)
     return _Build(
         state=state, prices=prices or {}, returns=returns, risk=risk,
-        missing=missing, dollar_dd=dollar_dd,
+        missing=missing, dollar_dd=dollar_dd, daily=daily,
     )
 
 
@@ -252,6 +271,74 @@ class RebalancePlan(BaseModel):
         description="held/target tickers with no cached price; offline, a NEW target "
         "ticker can't be sized — run the CLI online for a full plan"
     )
+    note: str = _OFFLINE_NOTE
+
+
+class SecurityFact(BaseModel):
+    """Published facts for one holding (null = honest absence, never a guess)."""
+
+    ticker: str
+    quote_type: str | None = Field(None, description='"ETF" | "EQUITY" — a fund vs a single stock')
+    expense_ratio: float | None = Field(None, description="annual fee as a fraction (0.0003 = 0.03%)")
+    aum: float | None = Field(None, description="assets under management, USD")
+    avg_volume: float | None = Field(None, description="average daily share volume")
+    age_years: float | None = None
+    category: str | None = None
+    family: str | None = None
+
+
+class SecuritiesFacts(BaseModel):
+    asof: date
+    securities: list[SecurityFact]
+    missing: list[str] = Field(
+        description="held tickers with no cached facts (warm via `--metadata` online)"
+    )
+    note: str = _OFFLINE_NOTE
+
+
+class GapCandidate(BaseModel):
+    ticker: str
+    name: str
+    role: str
+
+
+class RoleGap(BaseModel):
+    role: str
+    current_exposure: float = Field(description="share of your book in this role (0..1)")
+    candidates: list[GapCandidate] = Field(description="largest low-cost ETFs in this role, by AUM")
+
+
+class DiscoveryGaps(BaseModel):
+    asof: date
+    gaps: list[RoleGap]
+    unpriced_holdings: list[str] = Field(
+        default_factory=list,
+        description="held tickers with no cached price — role exposure (and thus the gaps) "
+        "may be skewed; warm the cache for the full picture",
+    )
+    note: str = (
+        "Roles your book holds ≤3% of, with the biggest funds for each — propose-only, "
+        "never a prediction. For the full screen (cost / liquidity / overlap / "
+        "did-it-diversify-your-drawdowns) call `screen_candidate`. " + _OFFLINE_NOTE
+    )
+
+
+class ScreenCheck(BaseModel):
+    name: str
+    status: str = Field(description="pass | warn | fail | n/a")
+    reason: str
+    values: dict[str, float] = Field(
+        default_factory=dict,
+        description="machine-readable figures behind the check (e.g. correlation, expense ratio)",
+    )
+
+
+class CandidateVerdict(BaseModel):
+    ticker: str
+    verdict: str = Field(
+        description="PASS | WARN | FAIL | N/A — necessary, not sufficient; never a prediction"
+    )
+    checks: list[ScreenCheck]
     note: str = _OFFLINE_NOTE
 
 
@@ -427,6 +514,125 @@ def rebalance_check(mode: str = "to_total") -> RebalancePlan:
         for s in sugg
     ]
     return RebalancePlan(asof=today, mode=mode, suggestions=trades, unpriced=unpriced)
+
+
+@mcp.tool(
+    annotations=_READ_ONLY,
+    description="Published fund facts for each of the user's holdings (offline, read-only): "
+    "type (ETF vs stock), expense ratio, AUM, average volume, age, category. Use to answer "
+    "'what am I paying / how big / how liquid / how old are my funds'. Reads the 7-day "
+    "metadata cache; uncached holdings appear under 'missing'.",
+)
+def securities_facts() -> SecuritiesFacts:
+    today = date.today()
+    cache = _cache_dir()
+    csv_path = _env_csv(
+        "ASSET_CSV", "point it at your transaction CSV (in .env or the MCP client env)"
+    )
+    _events, state = load_book(csv_path, cache, online=False)
+    held = sorted(state.held())
+    meta = fetch_metadata(held, cache_dir=cache, online=False)
+    facts = [
+        SecurityFact(
+            ticker=tk,
+            quote_type=m.quote_type,
+            expense_ratio=m.expense_ratio,
+            aum=m.aum,
+            avg_volume=m.avg_volume,
+            age_years=m.age_years(today),
+            category=m.category,
+            family=m.family,
+        )
+        for tk in held
+        if (m := meta.rows.get(tk)) is not None
+    ]
+    return SecuritiesFacts(asof=today, securities=facts, missing=sorted(meta.missing))
+
+
+@mcp.tool(
+    annotations=_READ_ONLY,
+    description="Roles the user's portfolio is light in (≤3% of market value) and the largest "
+    "low-cost ETFs that fill each (offline, read-only, propose-only). Use to answer 'what am I "
+    "missing / what could I consider adding'. The candidate listing is deterministic; for the "
+    "full per-candidate screen call `screen_candidate`.",
+)
+def discover_gaps() -> DiscoveryGaps:
+    today = date.today()
+    b = _build(no_risk=True, today=today)
+    if not b.prices:
+        raise ValueError(
+            "discovery needs your holdings priced from the cache, which is empty offline. "
+            "Warm the cache (run the brief online once), then retry."
+        )
+    universe = load_universe(_universe_path())
+    if not universe:
+        raise ValueError(f"the curated universe is empty or missing at {_universe_path()}.")
+    discovery = find_gaps(b.state, b.prices, universe)
+    gaps = [
+        RoleGap(
+            role=role,
+            current_exposure=discovery.exposure.get(role, 0.0),
+            candidates=[
+                GapCandidate(ticker=c.ticker, name=c.name, role=c.role)
+                for c in discovery.candidates
+                if c.role == role
+            ],
+        )
+        for role in discovery.gaps
+    ]
+    return DiscoveryGaps(asof=today, gaps=gaps, unpriced_holdings=sorted(b.missing))
+
+
+@mcp.tool(
+    annotations=_READ_ONLY,
+    description="Judge a NEW ticker against the user's book (offline, read-only, propose-only): "
+    "cost, liquidity, age, concentration, overlap with what they hold, and whether it diversified "
+    "their past drawdowns — each with a reason and the figures behind it. Use to answer 'is "
+    "TICKER a good fit'. Needs TICKER's price history in the cache; if it isn't there, returns "
+    "an N/A verdict with how to warm it. Never a buy recommendation or a return forecast.",
+)
+def screen_candidate(ticker: str) -> CandidateVerdict:
+    today = date.today()
+    tk = ticker.strip().upper()
+    if not tk or tk == CASH_TICKER:
+        raise ValueError(f"{ticker!r} is not a screenable security.")
+    if not re.fullmatch(r"[A-Z0-9.\-]{1,15}", tk):
+        # The one free-text argument on this surface: reject anything that isn't a
+        # plain ticker (no path separators / traversal), upholding the "bound to one
+        # book, can't point at an arbitrary file" invariant.
+        raise ValueError(f"{ticker!r} is not a valid ticker symbol.")
+    b = _build(no_risk=False, today=today)
+    if b.daily is None or b.daily.empty:
+        raise ValueError(
+            "screening compares against your portfolio's return series, which needs a warm "
+            "price cache. Run the brief online once, then retry."
+        )
+    cache = _cache_dir()
+    start = b.daily.index[0].date()
+    cand_series = fetch_series([tk], start, today, cache_dir=cache, online=False)
+    if tk not in cand_series.rows:
+        return CandidateVerdict(
+            ticker=tk, verdict="N/A", checks=[],
+            note=f"{tk} isn't in your price cache. Warm it once online — "
+            f"`uv run python -m app --csv <your.csv> --screen {tk}` — then ask again.",
+        )
+    held = set(b.state.held())
+    meta = fetch_metadata(sorted({tk} | held), cache_dir=cache, online=False)
+    held_meta = {t: m for t, m in meta.rows.items() if t in held}
+    cand_meta = {t: m for t, m in meta.rows.items() if t == tk}
+    results = screen_candidates(
+        [tk], cand_series.rows, b.daily, cand_meta, held_meta, held, asof=today, role=None
+    )
+    r = results[0]
+    checks = [
+        ScreenCheck(
+            name=c.name, status=c.status, reason=c.reason,
+            # Drop any non-finite figure (mirrors `_ci`): a nan/inf is not valid JSON.
+            values={k: v for k, v in c.values.items() if math.isfinite(v)},
+        )
+        for c in r.checks
+    ]
+    return CandidateVerdict(ticker=tk, verdict=r.verdict.upper(), checks=checks)
 
 
 def run() -> None:

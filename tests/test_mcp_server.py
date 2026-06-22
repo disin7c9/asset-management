@@ -26,10 +26,19 @@ def _warm_series_cache(cache: Path, ticker: str, base: float, n: int = 320) -> N
     """Write a fresh <T>_series.parquet ending ~today so an OFFLINE read succeeds.
 
     A gentle oscillation + drift gives real drawdowns and finite risk ratios (a
-    monotonic series would make Calmar non-finite)."""
+    monotonic series would make Calmar non-finite). ``fetched_at`` is backdated a
+    minute (still fresh within TTL) so a sub-second backward clock jiggle (WSL/CI)
+    can't read the just-written cache as 'in the future' and refuse it."""
     idx = pd.bdate_range(end=pd.Timestamp.today().normalize(), periods=n)
     vals = [base * (1.0 + 0.03 * math.sin(i / 4.0) + 0.0003 * i) for i in range(n)]
-    prices_mod._write_series_cache(ticker, pd.Series(vals, index=idx, dtype=float), cache)
+    df = pd.DataFrame(
+        {
+            "date": idx,
+            "close": vals,
+            "fetched_at": pd.Timestamp.now(tz="UTC") - pd.Timedelta(minutes=1),
+        }
+    )
+    df.to_parquet(cache / f"{ticker}_series.parquet", index=False)
 
 
 @pytest.fixture
@@ -74,7 +83,10 @@ def _error_text(res: CallToolResult) -> str:
 def test_tools_registered_and_read_only() -> None:
     res = _list_tools()
     names = {t.name for t in res.tools}
-    assert {"portfolio_summary", "risk_report", "rebalance_check"} <= names
+    assert {
+        "portfolio_summary", "risk_report", "rebalance_check",
+        "securities_facts", "discover_gaps", "screen_candidate",
+    } <= names
     for t in res.tools:
         assert t.annotations is not None, f"{t.name} missing annotations"
         assert t.annotations.readOnlyHint is True
@@ -208,3 +220,90 @@ def test_risk_report_undefined_ratio_is_null(
     assert sc is not None
     assert sc["max_drawdown"]["depth"] == pytest.approx(0.0)
     assert sc["calmar"] is None  # undefined with no drawdown → null, not inf/nan
+
+
+def _canned_meta(monkeypatch: pytest.MonkeyPatch) -> None:
+    from datetime import date as _date
+
+    from app.metadata import MetadataResult, SecurityMeta
+
+    def canned(tickers, **k):  # type: ignore[no-untyped-def]
+        return MetadataResult(
+            rows={
+                tk: SecurityMeta(
+                    ticker=tk, expense_ratio=0.0003, aum=5e9, avg_volume=2e6,
+                    category="Bond", family="Vanguard", legal_type="ETF",
+                    quote_type="ETF", inception=_date(2015, 1, 1),
+                )
+                for tk in tickers
+            }
+        )
+
+    monkeypatch.setattr("app.mcp_server.fetch_metadata", canned)
+
+
+def test_securities_facts(warm_book: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _canned_meta(monkeypatch)
+    res = _call("securities_facts")
+    assert not res.isError, _error_text(res)
+    sc = res.structuredContent
+    assert sc is not None
+    facts = {f["ticker"]: f for f in sc["securities"]}
+    assert set(facts) == {"AAA", "BBB"}
+    assert facts["AAA"]["quote_type"] == "ETF"               # the surfaced fund type
+    assert facts["AAA"]["expense_ratio"] == pytest.approx(0.0003)
+    assert sc["missing"] == []
+
+
+def test_discover_gaps(warm_book: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Hermetic: a temp universe (not the repo's). AAA/BBB aren't in it, so every role reads
+    # as a gap; the roles WITH candidates surface them (deterministic, offline).
+    uni = warm_book / "universe.csv"
+    uni.write_text(
+        "ticker,name,role,summary\n"
+        "VNQ,Vanguard Real Estate ETF,reit,US REITs\n"
+        "VWO,Vanguard FTSE Emerging Markets ETF,em-equity,Emerging markets\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("ASSET_UNIVERSE", str(uni))
+    res = _call("discover_gaps")
+    assert not res.isError, _error_text(res)
+    sc = res.structuredContent
+    assert sc is not None
+    with_cands = [g for g in sc["gaps"] if g["candidates"]]
+    assert with_cands, "expected gap roles with candidates"
+    g = with_cands[0]
+    assert {"role", "current_exposure", "candidates"} <= set(g)
+    assert all(c["ticker"] and c["role"] == g["role"] for c in g["candidates"])
+    assert {c["ticker"] for gg in with_cands for c in gg["candidates"]} == {"VNQ", "VWO"}
+    assert sc["unpriced_holdings"] == []  # AAA/BBB are priced → no partial-book caveat
+
+
+def test_screen_candidate_cached(warm_book: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _warm_series_cache(warm_book / "cache", "CCC", 40.0)     # candidate is in the cache
+    _canned_meta(monkeypatch)
+    res = _call("screen_candidate", {"ticker": "ccc"})
+    assert not res.isError, _error_text(res)
+    sc = res.structuredContent
+    assert sc is not None
+    assert sc["ticker"] == "CCC"                             # normalized to upper
+    assert sc["verdict"] in {"PASS", "WARN", "FAIL"}
+    assert sc["checks"]                                      # the screen actually ran
+    assert all({"name", "status", "reason", "values"} <= set(c) for c in sc["checks"])
+
+
+def test_screen_candidate_cache_miss_is_na(warm_book: Path) -> None:
+    res = _call("screen_candidate", {"ticker": "ZZZ"})       # not warmed
+    assert not res.isError, _error_text(res)
+    sc = res.structuredContent
+    assert sc is not None
+    assert sc["ticker"] == "ZZZ"
+    assert sc["verdict"] == "N/A"
+    assert "cache" in sc["note"].lower()                     # honest "warm the cache" note
+
+
+def test_screen_candidate_rejects_path_like_ticker(warm_book: Path) -> None:
+    # The one free-text argument can't be used to read outside the bound book.
+    res = _call("screen_candidate", {"ticker": "../../etc/passwd"})
+    assert res.isError
+    assert "valid ticker" in _error_text(res).lower()
