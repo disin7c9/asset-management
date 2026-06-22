@@ -234,7 +234,9 @@ def test_dump_target_never_writes_zero_for_a_holding(tmp_path: Path) -> None:
         "DUST": PriceRow("DUST", date.today(), 3.0, "t", now),   # $3 → 0.003%
     }
     out = tmp_path / "dump.csv"
-    _dump_target(state, prices, out)
+    run: dict[str, Any] = {}
+    _dump_target(state, prices, out, run)
+    assert run["dump_target"] == str(out)  # the write is recorded in the run summary (#4)
 
     t = load_target(out)
     assert t["DUST"] > 0.0  # not written as 0.00 → not an accidental exit
@@ -515,6 +517,90 @@ def test_discover_panel_renders(
     assert "reit  — you currently hold 0%" in out
     assert "VNQ" in out  # a reit candidate from the universe was screened
     assert "VNQ:" in _run_summary(caplog)["discover"]  # verdict recorded
+
+
+def test_discover_with_target_runs_the_role_check(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    # --discover --target: discovered gap-fillers now also get the walk-forward role check
+    # (#1) — the same held-out evidence a hand-typed --screen candidate gets.
+    from app.metadata import MetadataResult, SecurityMeta
+
+    now = datetime.now(timezone.utc)
+    canned = {
+        tk: PriceRow(tk, date.today(), px, "test", now)
+        for tk, px in {"BND": 73.0, "IAU": 84.0, "VEA": 72.0, "VOO": 697.0}.items()
+    }
+    monkeypatch.setattr(
+        "app.cli.fetch_latest",
+        lambda tickers, *a, **k: PricesResult(
+            rows={tk: canned[tk] for tk in tickers if tk in canned},
+            missing=[tk for tk in tickers if tk not in canned],
+        ),
+    )
+    monkeypatch.setattr("app.cli.fetch_series", _flat_series)
+    monkeypatch.setattr("app.pipeline.price_basis_mismatches", lambda *a, **k: [])
+    monkeypatch.setattr(
+        "app.cli.fetch_metadata",
+        lambda tickers, **k: MetadataResult(
+            rows={
+                tk: SecurityMeta(
+                    ticker=tk, expense_ratio=0.0003, aum=5e9, avg_volume=2e6,
+                    category="Real Estate", family="Vanguard",
+                    legal_type="Exchange Traded Fund", quote_type="ETF",
+                    inception=date(2015, 1, 1),
+                )
+                for tk in tickers
+            }
+        ),
+    )
+    rc = main(["--csv", str(SAMPLE), "--discover", "reit", "--target", str(TARGET)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "DISCOVERY (roles you're light in" in out
+    assert "role:" in out  # the walk-forward role check ran for the discovered candidates
+
+
+def test_metadata_not_double_fetched_with_screen(monkeypatch: pytest.MonkeyPatch) -> None:
+    # --metadata + --screen: the held tickers' facts are fetched ONCE — the run's --metadata
+    # fetch is reused by the screen, not re-fetched (#3).
+    from app.metadata import MetadataResult, SecurityMeta
+
+    now = datetime.now(timezone.utc)
+    canned = {
+        tk: PriceRow(tk, date.today(), px, "test", now)
+        for tk, px in {"BND": 73.0, "IAU": 84.0, "VEA": 72.0, "VOO": 697.0}.items()
+    }
+    monkeypatch.setattr(
+        "app.cli.fetch_latest",
+        lambda tickers, *a, **k: PricesResult(
+            rows={tk: canned[tk] for tk in tickers if tk in canned},
+            missing=[tk for tk in tickers if tk not in canned],
+        ),
+    )
+    monkeypatch.setattr("app.cli.fetch_series", _flat_series)
+    monkeypatch.setattr("app.pipeline.price_basis_mismatches", lambda *a, **k: [])
+
+    calls: list[list[str]] = []
+
+    def counting_meta(tickers, **k):  # type: ignore[no-untyped-def]
+        calls.append(list(tickers))
+        return MetadataResult(
+            rows={
+                tk: SecurityMeta(
+                    ticker=tk, expense_ratio=0.0003, aum=5e9, avg_volume=2e6,
+                    category="X", family="Y", legal_type="ETF", quote_type="ETF",
+                    inception=date(2015, 1, 1),
+                )
+                for tk in tickers
+            }
+        )
+
+    monkeypatch.setattr("app.cli.fetch_metadata", counting_meta)
+    rc = main(["--csv", str(SAMPLE), "--metadata", "--screen", "QQQM"])
+    assert rc == 0
+    assert any("VOO" in c for c in calls)              # held facts were fetched
+    assert sum("VOO" in c for c in calls) == 1         # exactly once, not twice (#3)
 
 
 def test_discover_narrate_leads_the_panel(

@@ -89,6 +89,8 @@ def derive(events: list[Event]) -> DerivedState:
         if ev.action in ("buy", "sell") and ev.fee > 0.0:
             trade_fees[(ev.date, ev.ticker)].append(ev.fee)
 
+    # NOTE: returns.event_cashflow switches on this SAME ev.action set for the CASH-FLOW
+    # view; a new action type must be handled in both (positions here, cash flow there).
     for ev in events:
         if ev.action in ("deposit", "withdraw"):
             # External cash flows (CASH pseudo-ticker) carry no position and no

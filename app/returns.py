@@ -71,22 +71,35 @@ class ReturnsSummary:
         return (self.asof_date - self.period_start).days
 
 
-def cash_flows_from_events(events: list[Event]) -> list[CashFlow]:
-    """Translate the transaction log into signed cash flows.
+def event_cashflow(ev: Event) -> float | None:
+    """The signed external cash flow for ONE event, user's perspective — outflow negative
+    (buy, standalone fee), inflow positive (sell, dividend, interest), or None for an event
+    that moves no investment cash (deposit/withdraw are external funding, not flows; any
+    unrecognized action). ONE place that maps an action to cash, so a new action type is
+    interpreted here, not re-encoded at each call site.
 
-    Buy/fee = outflow (negative). Sell/dividend/interest = inflow (positive).
+    NOTE: `derive.derive` switches on the SAME `ev.action` set for POSITION effects; a new
+    action type must be handled in BOTH (the cash-flow view here, the holdings view there).
     """
-    cfs: list[CashFlow] = []
-    for ev in events:
-        if ev.action == "buy":
-            cfs.append(CashFlow(ev.date, -(ev.quantity * ev.price + ev.fee)))
-        elif ev.action == "sell":
-            cfs.append(CashFlow(ev.date, ev.quantity * ev.price - ev.fee))
-        elif ev.action in ("dividend", "interest"):
-            cfs.append(CashFlow(ev.date, ev.cash - ev.fee))  # net of any withholding fee
-        elif ev.action == "fee":
-            cfs.append(CashFlow(ev.date, -ev.fee))
-    return cfs
+    if ev.action == "buy":
+        return -(ev.quantity * ev.price + ev.fee)
+    if ev.action == "sell":
+        return ev.quantity * ev.price - ev.fee
+    if ev.action in ("dividend", "interest"):
+        return ev.cash - ev.fee  # net of any withholding fee
+    if ev.action == "fee":
+        return -ev.fee
+    return None
+
+
+def cash_flows_from_events(events: list[Event]) -> list[CashFlow]:
+    """Translate the transaction log into signed cash flows (one per cash-moving event).
+
+    Buy/fee = outflow (negative); sell/dividend/interest = inflow (positive). The per-event
+    rule lives in `event_cashflow`."""
+    return [
+        CashFlow(ev.date, amt) for ev in events if (amt := event_cashflow(ev)) is not None
+    ]
 
 
 def money_weighted_return(

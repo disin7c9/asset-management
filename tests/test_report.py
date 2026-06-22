@@ -291,3 +291,4 @@ def test_securities_section_uses_one_consistent_asof(state) -> None:
     assert data.asof_date == "2026-01-01"  # title asof = gen.date()
     sec = next(s for s in data.sections if s.title.startswith("SECURITIES"))
     assert any("10.0y" in line for line in sec.lines)  # age computed from the SAME date
+    assert any("ETF" in line for line in sec.lines)    # quote_type surfaced in the row

@@ -398,7 +398,7 @@ def _section_securities(meta: MetadataResult, asof: date) -> Section:
     lacks some fields — never substitute a guess for a missing published fact.
     """
     lines = [
-        f"{'ticker':7}{'exp ratio':>10}{'AUM':>10}{'avg vol':>10}{'age':>7}   category — family",
+        f"{'ticker':7}{'exp ratio':>10}{'AUM':>10}{'avg vol':>10}{'age':>7}   type — category — family",
         "-" * 78,
     ]
     for tk in sorted(meta.rows):
@@ -408,7 +408,7 @@ def _section_securities(meta: MetadataResult, asof: date) -> Section:
         vol = _human_count(m.avg_volume) if m.avg_volume is not None else _NA
         age = m.age_years(asof)
         age_s = f"{age:.1f}y" if age is not None else _NA
-        desc = " — ".join(p for p in (m.category, m.family) if p) or _NA
+        desc = " — ".join(p for p in (m.quote_type, m.category, m.family) if p) or _NA
         lines.append(f"{tk:7}{exp:>10}{aum:>10}{vol:>10}{age_s:>7}   {desc}")
     lines.append("-" * 78)
     n_cache = meta.n_cache

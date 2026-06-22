@@ -97,6 +97,13 @@ def _priced_tickers(series: dict[str, "pd.Series[float]"], target: dict[str, flo
     ]
 
 
+def _latest_start(series: dict[str, "pd.Series[float]"], tickers: list[str]) -> "pd.Timestamp":
+    """The common window's left edge: the latest first-valid index across `tickers` — the
+    earliest date they ALL have data. Callers pass already-priced tickers (each has a
+    non-None first_valid_index). Shared by simulate / role_check / benchmark_compare."""
+    return max(series[tk].first_valid_index() for tk in tickers)
+
+
 def simulate(
     series: dict[str, "pd.Series[float]"],
     target: dict[str, float],
@@ -119,7 +126,7 @@ def simulate(
     idx = pd.DatetimeIndex([])
     for tk in tickers:
         idx = idx.union(series[tk].index)
-    lo = max(series[tk].first_valid_index() for tk in tickers)
+    lo = _latest_start(series, tickers)
     if start is not None:
         lo = max(lo, pd.Timestamp(start))
     hi = pd.Timestamp(end) if end is not None else idx.max()
@@ -405,7 +412,7 @@ def role_check(
     # window — same ffill semantics as --backtest; flagged for a staleness warn
     # if it ever bites real data.
     lo = max(
-        max(series[tk].first_valid_index() for tk in priced),
+        _latest_start(series, priced),
         cand_series.first_valid_index(),
     )
     hi = min(max(series[tk].index.max() for tk in priced), cand_series.index.max())
@@ -564,7 +571,7 @@ def benchmark_compare(
         return None
 
     all_priced = sorted(set(priced_t) | set(priced_r))
-    lo = max(series[tk].first_valid_index() for tk in all_priced)
+    lo = _latest_start(series, all_priced)
     if start is not None:  # honor --backtest-start (bound the sim, like backtest_compare)
         lo = max(lo, pd.Timestamp(start))
     hi = min(series[tk].index.max() for tk in all_priced)

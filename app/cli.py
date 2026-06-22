@@ -8,7 +8,7 @@ import json
 import logging
 import os
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -358,6 +358,7 @@ def main(argv: list[str] | None = None) -> int:
         "rebalance": None,
         "backtest": None,
         "allocate": None,
+        "dump_target": None,
         "metadata": None,
         "screen": None,
         "narrate": None,
@@ -431,7 +432,7 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     if args.dump_target:
-        _dump_target(state, prices, args.dump_target)
+        _dump_target(state, prices, args.dump_target, run)
     if args.allocate:
         # Reuse the price history already fetched above (no second round-trip).
         _compute_allocation(state, prices, series, args, run, today)
@@ -461,12 +462,14 @@ def main(argv: list[str] | None = None) -> int:
 
     cands: list[CandidateScreen] | None = None
     if args.screen:
-        cands = _compute_screen(state, args, run, today, daily)
+        cands = _compute_screen(state, args, run, today, daily, held_meta=meta)
 
     discovery: Discovery | None = None
     discovery_results: list[CandidateScreen] | None = None
     if args.discover is not None:
-        discovery, discovery_results = _compute_discover(state, prices, args, run, today, daily)
+        discovery, discovery_results = _compute_discover(
+            state, prices, args, run, today, daily, held_meta=meta
+        )
 
     summary_section: Section | None = None
     discovery_summary: Section | None = None
@@ -674,27 +677,34 @@ def _dump_target(
     state: DerivedState,
     prices: dict[str, PriceRow] | None,
     path: Path,
+    run: dict[str, Any],
 ) -> None:
     """Write the user's CURRENT allocation as a target CSV they can edit.
 
     Weights are current market-value shares (held × price), so the file already
     lists the real universe; the user edits the numbers toward their desired mix.
     Needs prices (skips under --no-prices); unpriced holdings are noted, not guessed.
+    Records its outcome in ``run["dump_target"]`` (like every other action) so a
+    scheduled run leaves a structured trace.
     """
     if not prices:
         log.warning("--dump-target needs prices; remove --no-prices")
+        run["dump_target"] = "skipped: no prices"
         return
     values = held_market_value(state, prices)
     total = sum(values.values())
     if total <= 0:
         log.warning("--dump-target: no priced holdings to write")
+        run["dump_target"] = "skipped: no priced holdings"
         return
     if not _write_target_csv({tk: v / total for tk, v in values.items()}, path):
+        run["dump_target"] = "skipped: write failed"
         return  # write failed (already logged) — non-fatal
     log.info(
         "wrote current allocation (%d tickers) to %s — edit toward your target",
         len(values), path,
     )
+    run["dump_target"] = str(path)
     omitted = sorted(tk for tk in state.held() if tk not in values)
     if omitted:
         log.warning("--dump-target: skipped unpriced holdings: %s", ", ".join(omitted))
@@ -879,8 +889,11 @@ def _compute_screen(
     run: dict[str, Any],
     today: date,
     daily: "pd.Series[float] | None",
+    held_meta: MetadataResult | None = None,
 ) -> list[CandidateScreen] | None:
-    """Judge NEW candidate tickers (from --screen) against the book (propose-only)."""
+    """Judge NEW candidate tickers (from --screen) against the book (propose-only).
+    ``held_meta`` is the run's --metadata fetch when present, reused so the held set
+    isn't fetched twice."""
     tickers = sorted({t.strip().upper() for t in args.screen.split(",") if t.strip()})
     if CASH_TICKER in tickers:
         # The pseudo-ticker is not a screenable security; dropping it here keeps
@@ -892,7 +905,8 @@ def _compute_screen(
         run["screen"] = "skipped: no tickers"
         return None
     return _screen_tickers(
-        state, tickers, args, run, today, daily, status_key="screen", with_role=True
+        state, tickers, args, run, today, daily,
+        status_key="screen", with_role=True, held_meta=held_meta,
     )
 
 
@@ -906,12 +920,15 @@ def _screen_tickers(
     *,
     status_key: str,
     with_role: bool,
+    held_meta: MetadataResult | None = None,
 ) -> list[CandidateScreen] | None:
     """Fetch the candidates' price history + metadata, and the held tickers' metadata (the
     overlap test compares look-through holdings), then hand everything to the pure screen.
     Shared by --screen (user tickers) and --discover (universe gap-fillers). Non-fatal: a
     missing pipeline degrades with a logged reason — the rest of the brief still prints.
-    ``with_role`` runs the walk-forward role check when a --target is present.
+    ``with_role`` runs the walk-forward role check when a --target is present. ``held_meta``
+    reuses the run's --metadata fetch (the held set) when present, so the held tickers
+    aren't fetched twice; otherwise their facts are fetched here.
     """
     if daily is None or daily.empty:
         # The diversifier test correlates against YOUR portfolio's return series,
@@ -925,11 +942,20 @@ def _screen_tickers(
     record_series_fetch(run, cand_series)
     held = set(state.held())
     tickers_set = set(tickers)
-    meta = fetch_metadata(sorted(tickers_set | held), cache_dir=args.cache_dir, online=online)
-    if meta.missing and run["status"] == "ok":
+    # Candidate facts always; held facts reuse the run's --metadata fetch when present (so
+    # the held set isn't re-fetched), else fetch them here. The overlap check compares the
+    # candidate's look-through holdings against the held funds'.
+    cand_res = fetch_metadata(sorted(tickers_set), cache_dir=args.cache_dir, online=online)
+    if held_meta is not None:
+        held_facts = {tk: m for tk, m in held_meta.rows.items() if tk in held}
+        meta_missing = cand_res.missing
+    else:
+        held_res = fetch_metadata(sorted(held), cache_dir=args.cache_dir, online=online)
+        held_facts = held_res.rows
+        meta_missing = [*cand_res.missing, *held_res.missing]
+    if meta_missing and run["status"] == "ok":
         run["status"] = "partial"
-    held_meta = {tk: m for tk, m in meta.rows.items() if tk in held}
-    cand_meta = {tk: m for tk, m in meta.rows.items() if tk in tickers_set}
+    cand_meta = {tk: m for tk, m in cand_res.rows.items() if tk in tickers_set}
 
     role: dict[str, RoleCheck] | None = None
     if with_role and args.target is not None:
@@ -949,7 +975,7 @@ def _screen_tickers(
             role = {tk: role_check(sim_series, target, tk) for tk in tickers}
 
     results = screen_candidates(
-        tickers, cand_series.rows, daily, cand_meta, held_meta, held, asof=today, role=role
+        tickers, cand_series.rows, daily, cand_meta, held_facts, held, asof=today, role=role
     )
     run[status_key] = " ".join(f"{r.ticker}:{r.verdict}" for r in results)
     return results
@@ -962,10 +988,13 @@ def _compute_discover(
     run: dict[str, Any],
     today: date,
     daily: "pd.Series[float] | None",
+    held_meta: MetadataResult | None = None,
 ) -> tuple[Discovery | None, list[CandidateScreen] | None]:
     """Suggest tickers for the book's role GAPS from the curated universe, each judged by the
     same screen (propose-only). Bare ``--discover`` covers every gap; ``--discover reit,tips``
-    targets specific roles. Needs current prices; non-fatal at every step.
+    targets specific roles. Needs current prices; non-fatal at every step. With a ``--target``,
+    each gap-filler also gets the walk-forward role check (held-out evidence) — one simulation
+    per candidate, so it only runs when you opt in with a target.
     """
     if not prices:
         log.warning("--discover needs current prices; remove --no-prices")
@@ -997,17 +1026,17 @@ def _compute_discover(
 
     results = _screen_tickers(
         state, [c.ticker for c in discovery.candidates], args, run, today, daily,
-        status_key="discover", with_role=False,
+        status_key="discover", with_role=args.target is not None, held_meta=held_meta,
     )
     return (discovery, results) if results is not None else (None, None)
 
 
-def _compute_backtest(
-    args: argparse.Namespace, run: dict[str, Any], today: date
-) -> BacktestResult | None:
-    """Notional backtest of the target: fetch its price history and simulate the
-    rebalanced leg vs buy-and-hold. Independent of the user's holdings (notional);
-    a bad target or missing history is non-fatal — the rest of the brief prints."""
+def _load_target_series(
+    args: argparse.Namespace, run: dict[str, Any], today: date, *, extra: Iterable[str] = ()
+) -> tuple[dict[str, float], SeriesResult] | None:
+    """Shared by --backtest and --benchmark: load the --target, fetch ~10y of price history
+    for it (plus any ``extra`` reference tickers), and write the common skip reasons to
+    ``run["backtest"]``. None on a bad target or no usable prices — both non-fatal."""
     try:
         target = load_target(args.target)
     except (ValueError, OSError) as exc:
@@ -1016,12 +1045,25 @@ def _compute_backtest(
         return None
     lookback = args.backtest_start or (today - timedelta(days=3653))  # ~10y of history
     series = fetch_series(
-        sorted(target), lookback, today, cache_dir=args.cache_dir, online=not args.offline
+        sorted(set(target) | set(extra)), lookback, today,
+        cache_dir=args.cache_dir, online=not args.offline,
     )
     if not series.rows:
         log.warning("--backtest: no price history for the target tickers")
         run["backtest"] = "skipped: no prices"
         return None
+    return target, series
+
+
+def _compute_backtest(
+    args: argparse.Namespace, run: dict[str, Any], today: date
+) -> BacktestResult | None:
+    """Notional backtest of the target: simulate the rebalanced leg vs buy-and-hold over its
+    price history. Independent of the user's holdings; non-fatal at every step."""
+    loaded = _load_target_series(args, run, today)
+    if loaded is None:
+        return None
+    target, series = loaded
     result = backtest_compare(
         series.rows, target, schedule=args.rebalance_every,
         start=args.backtest_start, end=today, provenance=series.provenance,
@@ -1036,25 +1078,14 @@ def _compute_backtest(
 def _compute_benchmark(
     args: argparse.Namespace, run: dict[str, Any], today: date
 ) -> BenchmarkResult | None:
-    """--backtest --benchmark: compare the --target preset against a canonical reference
-    (60-40 etc.) over their common history — full-history legs (drawdown-first) + a
-    walk-forward held-out verdict. Notional, target-only; non-fatal at every step."""
-    try:
-        target = load_target(args.target)
-    except (ValueError, OSError) as exc:
-        log.error("--benchmark: %s", exc)
-        run["backtest"] = "skipped: bad target"
-        return None
+    """--backtest --benchmark: compare the --target against a canonical reference (60-40
+    etc.) over their common history — full-history legs (drawdown-first) + a walk-forward
+    held-out verdict. Notional, target-only; non-fatal at every step."""
     ref_weights = benchmark_weights(args.benchmark)
-    lookback = args.backtest_start or (today - timedelta(days=3653))  # ~10y of history
-    tickers = sorted(set(target) | set(ref_weights))
-    series = fetch_series(
-        tickers, lookback, today, cache_dir=args.cache_dir, online=not args.offline
-    )
-    if not series.rows:
-        log.warning("--benchmark: no price history for the target/reference tickers")
-        run["backtest"] = "skipped: no prices"
+    loaded = _load_target_series(args, run, today, extra=ref_weights)
+    if loaded is None:
         return None
+    target, series = loaded
     result = benchmark_compare(
         series.rows, target, ref_weights, reference=args.benchmark,
         schedule=args.rebalance_every, start=args.backtest_start, provenance=series.provenance,
@@ -1167,8 +1198,8 @@ def _log_run_summary(run: dict[str, Any]) -> None:
 
     Schema: {date, source, n_events_replayed, n_prices_fetched, n_prices_missing,
     n_series_fetched, n_series_missing, fallbacks_used, status, report_saved,
-    email_sent, email_detail?, rebalance, backtest, allocate, metadata, screen,
-    narrate, discover, discover_narrate, benchmark_narrate, error?}.
+    email_sent, email_detail?, rebalance, backtest, allocate, dump_target, metadata,
+    screen, narrate, discover, discover_narrate, benchmark_narrate, error?}.
     """
     log.info("run_summary %s", json.dumps(run, separators=(",", ":")))
 
