@@ -29,12 +29,15 @@ uv run python -m app --csv your.csv --send       # also email the brief as HTML 
 uv run python -m app --csv your.csv --metadata   # + SECURITIES panel: expense ratio, AUM, liquidity, age per holding
 uv run python -m app --csv your.csv --screen QQQM,SCHD  # judge NEW candidate tickers against your book (propose-only)
 uv run python -m app --csv your.csv --screen SCHD --target target.csv  # + walk-forward ROLE check (held-out evidence)
+uv run python -m app --csv your.csv --discover   # + DISCOVERY panel: screened NEW ETFs for roles you're light in
 uv run python -m app --csv your.csv --narrate    # + a plain-language SUMMARY (opt-in; bring your own LLM key in .env)
 uv run python -m app --csv your.csv --dump-target target.csv                    # write current allocation to edit
 uv run python -m app --csv your.csv --allocate inverse_vol --allocate-out t.csv  # PROPOSE a target (re-weight holdings)
+uv run python -m app --csv your.csv --allocate moderate --allocate-out t.csv     # PROPOSE a strategic preset (conservative|moderate|aggressive)
 uv run python -m app --csv your.csv --rebalance to_total --target target.csv    # suggestions toward a target
 uv run python -m app --csv your.csv --rebalance cash_flow_only --target target.csv --new-cash 1000
 uv run python -m app --backtest --target target.csv             # notional backtest — needs only --target, no --csv
+uv run python -m app --backtest --target target.csv --benchmark 60-40   # validate a target vs a reference (60-40|all-weather|permanent)
 uv run python -m app --csv your.csv --rebalance bands --backtest --target target.csv  # panels stack
 ```
 
@@ -44,10 +47,12 @@ The report is **composable panels**, not exclusive modes — combine flags and t
 |---|---|---|
 | status brief (default) | `--csv` | your holdings + returns + drawdown/risk |
 | `--rebalance MODE` | `--csv` + `--target` | buy/sell suggestions toward the target (`--new-cash` sizes a deposit) |
-| `--allocate RULE` | `--csv` | propose a target by re-weighting your holdings (write it with `--allocate-out`) |
+| `--allocate RULE` | `--csv` | propose a target — re-weight your holdings (`equal_weight`/`inverse_vol`) or build a strategic role template (`conservative`/`moderate`/`aggressive`); write it with `--allocate-out` |
 | `--metadata` | `--csv` | published fund facts per holding (expense ratio, AUM, volume, age, category), cached 7 days |
 | `--screen TICKERS` | `--csv` + prices | judge NEW candidates vs your book: diversifier (incl. your red days + worst drawdown), cost, liquidity, age, concentration, leveraged/inverse auto-reject, holdings-overlap dedup — each verdict with its reason. Add `--target` for the **walk-forward role check**: did a 5% sleeve improve drawdown/vol on a held-out window? (paired-bootstrap honesty gate; "inconclusive" when inside the noise band). Propose-only; a PASS is "sane, cheap, liquid, genuinely different", never a prediction |
+| `--discover [roles]` | `--csv` + prices | suggest **new** ETFs for the roles you hold ≤3% of, run through the same screen — propose-only (see Discovery, below) |
 | `--backtest` | `--target` | notional rebalance-vs-buy-and-hold — **no `--csv`**; prints the simulation alone |
+| `--backtest --benchmark REF` | `--target` | validate a target vs a canonical reference (`60-40` / `all-weather` / `permanent`) — drawdown-first legs + a walk-forward held-out verdict |
 | `--narrate` | `--csv` + an LLM key | a plain-language **SUMMARY** at the top of the brief; the model writes only the words, every number is substituted and verified from the core (opt-in, off by default — see [Narration](#narration-optional-plain-language-summary)) |
 
 There is **no silent built-in default**: a book-dependent action without `--csv` errors out, and a bare `python -m app` prints a hint — the bundled example is opt-in (`--csv data/sample_data/transactions.csv`), never assumed. `--allocate` is **propose-only** and cannot be combined with `--rebalance`/`--backtest` (review the written file, then act on it in a separate command). A `target.csv` is one you create with `--dump-target` / `--allocate-out` (or use `data/sample_data/target.csv`).
@@ -56,10 +61,11 @@ There is **no silent built-in default**: a book-dependent action without `--csv`
 
 ## Choose a target — the strategy engine
 
-`--allocate <rule>` builds a target allocation **over your current holdings** and prints it next to your present weights; add `--allocate-out path` to save it (a dedicated flag — `--dump-target` always means your current holdings). It re-weights what you already own (no new tickers — finding new ones is a later, AI-assisted step), so it's *discipline*, not prediction. Rules:
+`--allocate <rule>` builds a target allocation and prints it next to your present weights; add `--allocate-out path` to save it (a dedicated flag — `--dump-target` always means your current holdings). It's *discipline* — a rule or a strategic prior — never a return prediction. Rules:
 
-- **`equal_weight`** — 1/N. The robust baseline (it beat optimization out-of-sample in our own studies).
-- **`inverse_vol`** — weight ∝ 1 ÷ volatility, so each holding contributes roughly the *same risk* rather than the same dollars (a calm bond and a wild theme ETF get balanced by how much they move). Cap any single weight with `--allocate-cap 0.30`.
+- **`equal_weight`** — 1/N over your current holdings. The robust baseline (it beat optimization out-of-sample in our own studies).
+- **`inverse_vol`** — over your current holdings, weight ∝ 1 ÷ volatility, so each holding contributes roughly the *same risk* rather than the same dollars (a calm bond and a wild theme ETF get balanced by how much they move). Cap any single weight with `--allocate-cap 0.30`.
+- **`conservative` / `moderate` / `aggressive`** — a strategic **role-bucket template** (stocks / bonds / diversifiers, split by risk posture, then core-satellite *within* each bucket). Unlike the two above it isn't limited to what you own: a role you're missing is filled with a sensible default ETF from the curated universe (`data/universe.csv`). Each role otherwise resolves to *your* largest fund in it. Validate the result against a known reference with `--backtest --benchmark` (below).
 
 Deliberately **not** included: return-forecasting optimizers (mean-variance / max-Sharpe) — they overfit and lost to equal-weight out-of-sample in our tests, so they stay behind an *edge* gate for a later version.
 
@@ -81,6 +87,8 @@ A **target is a complete spec** (`--target path`, columns `Ticker,Weight`; weigh
 `--backtest --target T.csv` runs a **notional $10,000** historical simulation of that target and prints a **BACKTEST** panel comparing **rebalanced** (schedule via `--rebalance-every {monthly,quarterly,annually}`, default quarterly) vs **buy-and-hold** — drawdown-first, with bootstrap CIs. It's *notional*: it starts a clean $10k at the target weights on the earliest date all tickers have prices (`--backtest-start` to override), so it tests the *strategy*, independent of your actual buy timing. Labeled **a historical simulation, not a prediction**.
 
 A fixed rebalance policy fits no parameters, so the whole history is out-of-sample-clean (nothing to overfit). The **walk-forward train/test *selection*** machinery — needed only once a strategy *searches* (tunes parameters or picks among candidates: an optimizer, or an *edge* timing strategy) — is deliberately deferred; a **discipline-vs-edge gate** enforces that any future edge strategy must pass a walk-forward backtest before it may surface a suggestion. Today's rebalance modes are all *discipline*, so they suggest freely.
+
+**Validate a strategic preset against a reference** — `--backtest --target preset.csv --benchmark 60-40` (or `all-weather` / `permanent`). It simulates your target and the reference over their common history, drawdown-first, and adds a **walk-forward held-out verdict**: where your posture's drawdown lands vs the reference — `shallower` / `deeper` / `inconclusive` — never "beats it". On a short history the honest verdict is usually *inconclusive*, and it says so. Add `--narrate` for a plain-language note explaining the verdict.
 
 The same report can leave three ways from one build: plain text on stdout (always),
 markdown to `reports/<asof>.md` (`--save`), and an HTML email (`--send`). `--send`
@@ -138,7 +146,7 @@ Prices: 4 cache  (age: 6.2h .. 6.2h old as of 2026-06-02 02:42 UTC)
 Generated by asset-management. Figures are deterministic and reconciled against ghostfolio + quantstats; this is not financial advice.
 ```
 
-Confidence bands come from a moving-block bootstrap. Drawdown is *investment* (time-weighted) drawdown, not account-balance drawdown. Each run also emits one structured JSON log line (`run_summary`) on stderr: `{date, source, n_events_replayed, n_prices_fetched, n_prices_missing, n_series_fetched, n_series_missing, fallbacks_used, status, report_saved, email_sent, rebalance, backtest, allocate, metadata, screen, narrate, discover, discover_narrate}` (with `email_detail`/`error` present when relevant).
+Confidence bands come from a moving-block bootstrap. Drawdown is *investment* (time-weighted) drawdown, not account-balance drawdown. Each run also emits one structured JSON log line (`run_summary`) on stderr: `{date, source, n_events_replayed, n_prices_fetched, n_prices_missing, n_series_fetched, n_series_missing, fallbacks_used, status, report_saved, email_sent, rebalance, backtest, allocate, dump_target, metadata, screen, narrate, discover, discover_narrate, benchmark_narrate}` (with `email_detail`/`error` present when relevant).
 
 ## MCP server (read-only, for AI assistants)
 
