@@ -18,46 +18,46 @@ uv sync
 ## Run
 
 ```bash
-uv run python -m app --csv data/sample_data/transactions.csv  # the bundled example book (opt-in)
-uv run python -m app --csv path/to/your.csv  # your own book: holdings + returns + risk
-uv run python -m app --csv your.csv --no-risk    # skip the holdings drawdown/risk panel (a --backtest still shows its own)
-uv run python -m app --csv your.csv --no-prices  # holdings + realized P&L only (no network)
-uv run python -m app --csv your.csv --offline    # serve from on-disk cache; no network (latest falls back to the series cache)
-uv run python -m app --csv your.csv --cache-dir /some/dir   # override the default cache location
-uv run python -m app --csv your.csv --save       # also write reports/<asof>.md (markdown)
-uv run python -m app --csv your.csv --send       # also email the brief as HTML via Resend
-uv run python -m app --csv your.csv --metadata   # + SECURITIES panel: expense ratio, AUM, liquidity, age per holding
-uv run python -m app --csv your.csv --screen QQQM,SCHD  # judge NEW candidate tickers against your book (propose-only)
-uv run python -m app --csv your.csv --screen SCHD --target target.csv  # + walk-forward ROLE check (held-out evidence)
-uv run python -m app --csv your.csv --discover   # + DISCOVERY panel: screened NEW ETFs for roles you're light in
-uv run python -m app --csv your.csv --narrate    # + a plain-language SUMMARY (opt-in; bring your own LLM key in .env)
-uv run python -m app --csv your.csv --dump-target target.csv                    # write current allocation to edit
-uv run python -m app --csv your.csv --allocate inverse_vol --allocate-out t.csv  # PROPOSE a target (re-weight holdings)
-uv run python -m app --csv your.csv --allocate moderate --allocate-out t.csv     # PROPOSE a strategic preset (conservative|moderate|aggressive)
-uv run python -m app --csv your.csv --rebalance to_total --target target.csv    # suggestions toward a target
-uv run python -m app --csv your.csv --rebalance cash_flow_only --target target.csv --new-cash 1000
-uv run python -m app --backtest --target target.csv             # notional backtest — needs only --target, no --csv
+uv run python -m app --book data/sample_data/transactions.csv  # the bundled example book (opt-in)
+uv run python -m app --book path/to/your.csv  # your own book: holdings + returns + risk
+uv run python -m app --book your.csv --no-risk    # skip the holdings drawdown/risk panel (a --backtest still shows its own)
+uv run python -m app --book your.csv --no-prices  # holdings + realized P&L only (no network)
+uv run python -m app --book your.csv --offline    # serve from on-disk cache; no network (latest falls back to the series cache)
+uv run python -m app --book your.csv --cache-dir /some/dir   # override the default cache location
+uv run python -m app --book your.csv --save       # also write reports/<asof>.md (markdown)
+uv run python -m app --book your.csv --send       # also email the brief as HTML via Resend
+uv run python -m app --book your.csv --metadata   # + SECURITIES panel: expense ratio, AUM, liquidity, age per holding
+uv run python -m app --book your.csv --screen QQQM,SCHD  # judge NEW candidate tickers against your book (propose-only)
+uv run python -m app --book your.csv --screen SCHD --target target.csv  # + walk-forward ROLE check (held-out evidence)
+uv run python -m app --book your.csv --discover   # + DISCOVERY panel: screened NEW ETFs for roles you're light in
+uv run python -m app --book your.csv --narrate    # + a plain-language SUMMARY (opt-in; bring your own LLM key in .env)
+uv run python -m app --book your.csv --dump-target target.csv                    # write current allocation to edit
+uv run python -m app --book your.csv --allocate inverse_vol --allocate-out t.csv  # PROPOSE a target (re-weight holdings)
+uv run python -m app --book your.csv --allocate moderate --allocate-out t.csv     # PROPOSE a strategic preset (conservative|moderate|aggressive)
+uv run python -m app --book your.csv --rebalance to_total --target target.csv    # suggestions toward a target
+uv run python -m app --book your.csv --rebalance cash_flow_only --target target.csv --new-cash 1000
+uv run python -m app --backtest --target target.csv             # notional backtest — needs only --target, no --book
 uv run python -m app --backtest --target target.csv --benchmark 60-40   # validate a target vs a reference (60-40|all-weather|permanent)
-uv run python -m app --csv your.csv --rebalance bands --backtest --target target.csv  # panels stack
+uv run python -m app --book your.csv --rebalance bands --backtest --target target.csv  # panels stack
 ```
 
 The report is **composable panels**, not exclusive modes — combine flags and the panels stack (the last example prints SUGGESTED ACTIONS *and* BACKTEST). What each action needs:
 
 | action | needs | what it does |
 |---|---|---|
-| status brief (default) | `--csv` | your holdings + returns + drawdown/risk |
-| `--rebalance MODE` | `--csv` + `--target` | buy/sell suggestions toward the target (`--new-cash` sizes a deposit) |
-| `--allocate RULE` | `--csv` | propose a target — re-weight your holdings (`equal_weight`/`inverse_vol`) or build a strategic role template (`conservative`/`moderate`/`aggressive`); write it with `--allocate-out` |
-| `--metadata` | `--csv` | published fund facts per holding (expense ratio, AUM, volume, age, category), cached 7 days |
-| `--screen TICKERS` | `--csv` + prices | judge NEW candidates vs your book: diversifier (incl. your red days + worst drawdown), cost, liquidity, age, concentration, leveraged/inverse auto-reject, holdings-overlap dedup — each verdict with its reason. Add `--target` for the **walk-forward role check**: did a 5% sleeve improve drawdown/vol on a held-out window? (paired-bootstrap honesty gate; "inconclusive" when inside the noise band). Propose-only; a PASS is "sane, cheap, liquid, genuinely different", never a prediction |
-| `--discover [roles]` | `--csv` + prices | suggest **new** ETFs for the roles you hold ≤3% of, run through the same screen — propose-only (see Discovery, below) |
-| `--backtest` | `--target` | notional rebalance-vs-buy-and-hold — **no `--csv`**; prints the simulation alone |
+| status brief (default) | `--book` | your holdings + returns + drawdown/risk |
+| `--rebalance MODE` | `--book` + `--target` | buy/sell suggestions toward the target (`--new-cash` sizes a deposit) |
+| `--allocate RULE` | `--book` | propose a target — re-weight your holdings (`equal_weight`/`inverse_vol`) or build a strategic role template (`conservative`/`moderate`/`aggressive`); write it with `--allocate-out` |
+| `--metadata` | `--book` | published fund facts per holding (expense ratio, AUM, volume, age, category), cached 7 days |
+| `--screen TICKERS` | `--book` + prices | judge NEW candidates vs your book: diversifier (incl. your red days + worst drawdown), cost, liquidity, age, concentration, leveraged/inverse auto-reject, holdings-overlap dedup — each verdict with its reason. Add `--target` for the **walk-forward role check**: did a 5% sleeve improve drawdown/vol on a held-out window? (paired-bootstrap honesty gate; "inconclusive" when inside the noise band). Propose-only; a PASS is "sane, cheap, liquid, genuinely different", never a prediction |
+| `--discover [roles]` | `--book` + prices | suggest **new** ETFs for the roles you hold ≤3% of, run through the same screen — propose-only (see Discovery, below) |
+| `--backtest` | `--target` | notional rebalance-vs-buy-and-hold — **no `--book`**; prints the simulation alone |
 | `--backtest --benchmark REF` | `--target` | validate a target vs a canonical reference (`60-40` / `all-weather` / `permanent`) — drawdown-first legs + a walk-forward held-out verdict |
-| `--narrate` | `--csv` + an LLM key | a plain-language **SUMMARY** at the top of the brief; the model writes only the words, every number is substituted and verified from the core (opt-in, off by default — see [Narration](#narration-optional-plain-language-summary)) |
+| `--narrate` | `--book` + an LLM key | a plain-language **SUMMARY** at the top of the brief; the model writes only the words, every number is substituted and verified from the core (opt-in, off by default — see [Narration](#narration-optional-plain-language-summary)) |
 
-There is **no silent built-in default**: a book-dependent action without `--csv` errors out, and a bare `python -m app` prints a hint — the bundled example is opt-in (`--csv data/sample_data/transactions.csv`), never assumed. `--allocate` is **propose-only** and cannot be combined with `--rebalance`/`--backtest` (review the written file, then act on it in a separate command). A `target.csv` is one you create with `--dump-target` / `--allocate-out` (or use `data/sample_data/target.csv`).
+There is **no silent built-in default**: a book-dependent action without `--book` errors out, and a bare `python -m app` prints a hint — the bundled example is opt-in (`--book data/sample_data/transactions.csv`), never assumed. `--allocate` is **propose-only** and cannot be combined with `--rebalance`/`--backtest` (review the written file, then act on it in a separate command). A `target.csv` is one you create with `--dump-target` / `--allocate-out` (or use `data/sample_data/target.csv`).
 
-**Your own default** lives in a gitignored `.env` at the repo root: set `ASSET_CSV=path/to/your.csv` (and optionally `ASSET_TARGET=path/to/target.csv`; `~` is expanded, relative paths resolve against the repo root) and a bare `python -m app` becomes your brief, `--rebalance MODE` alone works, etc. Explicit flags always win, and the pure `--backtest --target` run stays book-free by contract — pass `--csv` explicitly to stack your status panel onto a backtest.
+**Your own default** lives in a gitignored `.env` at the repo root: set `ASSET_BOOK=path/to/your.csv` (and optionally `ASSET_TARGET=path/to/target.csv`; `~` is expanded, relative paths resolve against the repo root; the older `ASSET_CSV` name is still honored) and a bare `python -m app` becomes your brief, `--rebalance MODE` alone works, etc. Explicit flags always win, and the pure `--backtest --target` run stays book-free by contract — pass `--book` explicitly to stack your status panel onto a backtest.
 
 ## Choose a target — the strategy engine
 
@@ -103,7 +103,15 @@ Monday brief is just this on cron:
 0 8 * * 1  cd /path/to/asset-management && /path/to/uv run python -m app --send --save
 ```
 
-The CSV is expected to have columns: `Date, Code, DataSource, Currency, Price, Quantity, Action, Fee, Note`. `Action` is one of `buy`, `sell`, `dividend`, `fee`, `interest`, `deposit`, `withdraw`. Cash flows (`deposit`/`withdraw`) use a `CASH` code and put the amount in the `Price` column. Empty cells in numeric columns are treated as zero. Non-ISO dates are rejected with a clear error. UTF-8 BOM is tolerated.
+The CSV format is **Ghostfolio's own CSV-import schema** (so a book you keep here imports straight into Ghostfolio too) — columns `Date, Code, DataSource, Currency, Price, Quantity, Action, Fee, Note`. `Action` is one of `buy`, `sell`, `dividend`, `fee`, `interest`, `deposit`, `withdraw`. Cash flows (`deposit`/`withdraw`) use a `CASH` code and put the amount in the `Price` column. Empty cells in numeric columns are treated as zero. Non-ISO dates are rejected with a clear error. UTF-8 BOM is tolerated.
+
+**Already use [Ghostfolio](https://ghostfol.io)?** Point the input straight at a Ghostfolio **JSON** export (Portfolio → Activities → ⋯ → Export) — the loader detects it and reads it directly, no conversion step:
+
+```bash
+uv run python -m app --book ghostfolio-export.json   # format auto-detected; --json/--csv are aliases of --book
+```
+
+It reads the activities (a dividend's cash = `quantity × unitPrice`; Ghostfolio's UTC timestamps are rounded back to your local date) and skips non-USD, crypto, and non-security (`ITEM`/`LIABILITY`) rows with a warning (USD-only, long-only equity/ETF for now). Brokers without a native Ghostfolio account can run a community converter such as [Export-To-Ghostfolio](https://github.com/dickwolff/Export-To-Ghostfolio) (26 brokers → a Ghostfolio JSON) first.
 
 The drawdown panel also reports **Gains given back** — the largest dollar decline in your cumulative market profit (the felt "how much did I watch evaporate"). It's flow-neutral: deposits, withdrawals, and trades cancel, so funding and broker transfers don't distort it (the raw account balance would dip on every transfer).
 
@@ -150,7 +158,7 @@ Confidence bands come from a moving-block bootstrap. Drawdown is *investment* (t
 
 ## MCP server (read-only, for AI assistants)
 
-Expose your portfolio to an AI assistant (Claude Desktop, Claude Code, …) as **read-only tools** it can call — so you can "chat with your portfolio" while every number still comes from the validated core, not the model. The server is **local, offline, and read-only**: it serves from the on-disk cache (no network), exposes **no write tools**, and is bound to your `ASSET_CSV` book (it takes no file paths). Three tools:
+Expose your portfolio to an AI assistant (Claude Desktop, Claude Code, …) as **read-only tools** it can call — so you can "chat with your portfolio" while every number still comes from the validated core, not the model. The server is **local, offline, and read-only**: it serves from the on-disk cache (no network), exposes **no write tools**, and is bound to your `ASSET_BOOK` book (it takes no file paths). Three tools:
 
 - **`portfolio_summary`** — holdings, P&L, and annualized returns.
 - **`risk_report`** — drawdown-first risk: max drawdown (depth/dates/recovery), Ulcer, CDaR, Sharpe/Sortino/Calmar, all with bootstrap confidence intervals.
@@ -159,7 +167,7 @@ Expose your portfolio to an AI assistant (Claude Desktop, Claude Code, …) as *
 Run it directly, or register it with Claude Code:
 
 ```bash
-uv run python -m app.mcp_server                                    # serve over stdio (set ASSET_CSV in .env)
+uv run python -m app.mcp_server                                    # serve over stdio (set ASSET_BOOK in .env)
 claude mcp add asset-management -- uv run python -m app.mcp_server  # register, then /mcp to use it
 ```
 
@@ -191,9 +199,9 @@ ASSET_NARRATE_TIER=paid                  # free | paid | local — privacy dial 
 3. it runs them through the **same screen** as `--screen` — cost, liquidity, age, overlap with what you hold, and whether they actually diversified *your* worst drawdowns — and prints a **DISCOVERY** panel, each candidate with its verdict (PASS/WARN/FAIL) and reasons.
 
 ```bash
-uv run python -m app --csv your.csv --discover            # every gap role (a few candidates each)
-uv run python -m app --csv your.csv --discover reit,tips  # just these roles (faster)
-uv run python -m app --csv your.csv --discover --narrate  # + an AI note ranking the picks (opt-in; needs an LLM key)
+uv run python -m app --book your.csv --discover            # every gap role (a few candidates each)
+uv run python -m app --book your.csv --discover reit,tips  # just these roles (faster)
+uv run python -m app --book your.csv --discover --narrate  # + an AI note ranking the picks (opt-in; needs an LLM key)
 ```
 
 The universe is **auto-built** (and refreshable) — no hand-maintenance:

@@ -104,13 +104,16 @@ def main(argv: list[str] | None = None) -> int:
     load_dotenv(_REPO_ROOT / ".env")  # RESEND_API_KEY / REPORT_TO for --send
     parser = argparse.ArgumentParser(prog="asset-management", description=__doc__)
     parser.add_argument(
-        "--csv",
+        "--book", "--csv", "--json",
+        dest="book",
         type=Path,
         default=None,  # None = not given → print a usage hint (no silent sample); the sample is opt-in
-        help="path to YOUR ghostfolio-format transaction CSV. Required for the brief and for "
+        metavar="PATH",
+        help="path to YOUR transaction file — a Ghostfolio-compatible CSV or a Ghostfolio JSON "
+        "export (format auto-detected; --csv/--json are aliases). Required for the brief and for "
         "--rebalance/--allocate/--dump-target/--save/--send. The bundled example is opt-in: "
-        "pass --csv data/sample_data/transactions.csv. (--backtest --target works without it.) "
-        "Set ASSET_CSV in .env to make your book the default for book runs.",
+        "--book data/sample_data/transactions.csv. (--backtest --target works without it.) Set "
+        "ASSET_BOOK in .env to make your book the default for book runs.",
     )
     parser.add_argument(
         "--cache-dir",
@@ -315,17 +318,17 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--benchmark compares --target against a reference; it needs --backtest")
     # No silent sample fallback: book-dependent actions operate on YOUR holdings, so
     # they require your transaction log. --backtest is notional (target-only) and is
-    # exempt; the bundled example is opt-in via an explicit --csv path.
+    # exempt; the bundled example is opt-in via an explicit --book path.
     needs_book = bool(
         args.rebalance or args.allocate or args.dump_target or args.save or args.send
         or args.metadata or args.screen or args.narrate or args.discover is not None
     )
-    # Personal defaults from .env (gitignored; loaded above). ASSET_CSV fills --csv
-    # for runs that want a book; a pure `--backtest --target` run stays notional
-    # (book-free) by contract — pass --csv explicitly to include your book there.
+    # Personal defaults from .env (gitignored; loaded above). ASSET_BOOK (or ASSET_CSV,
+    # back-compat) fills --book for runs that want a book; a pure `--backtest --target` run
+    # stays notional (book-free) by contract — pass --book explicitly to include your book.
     # ASSET_TARGET fills --target only when a rule needs one. Explicit flags win.
-    if args.csv is None and (needs_book or not args.backtest):
-        args.csv = _env_path("ASSET_CSV")
+    if args.book is None and (needs_book or not args.backtest):
+        args.book = _env_path("ASSET_BOOK") or _env_path("ASSET_CSV")
     if args.target is None and (args.rebalance or args.backtest or args.screen):
         args.target = _env_path("ASSET_TARGET")  # screen: enables the role check row
     if (args.rebalance or args.backtest) and args.target is None:
@@ -334,17 +337,17 @@ def main(argv: list[str] | None = None) -> int:
             "with --dump-target PATH, or pass data/sample_data/target.csv for the example; "
             "or set ASSET_TARGET in .env)"
         )
-    if args.csv is None and needs_book:
+    if args.book is None and needs_book:
         parser.error(
-            "this run needs your transaction log — pass --csv PATH "
-            "(or the bundled example: --csv data/sample_data/transactions.csv; "
-            "or set ASSET_CSV in .env). "
-            "Only '--backtest --target FILE' runs without --csv."
+            "this run needs your transaction file — pass --book PATH (a Ghostfolio-compatible "
+            "CSV or a Ghostfolio JSON export; or the bundled example: "
+            "--book data/sample_data/transactions.csv; or set ASSET_BOOK in .env). "
+            "Only '--backtest --target FILE' runs without --book."
         )
     today = date.today()  # one as-of date for the title, the filename, and the log
     run: dict[str, Any] = {
         "date": today.isoformat(),
-        "source": str(args.csv) if args.csv is not None else "(no book; backtest-only)",
+        "source": str(args.book) if args.book is not None else "(no book; backtest-only)",
         "n_events_replayed": 0,
         "n_prices_fetched": 0,
         "n_prices_missing": 0,
@@ -368,13 +371,14 @@ def main(argv: list[str] | None = None) -> int:
     }
 
     # Nothing to do: no book and no notional backtest → guide, don't fabricate a brief.
-    if args.csv is None and not args.backtest:
+    if args.book is None and not args.backtest:
         sys.stdout.write(
-            "No portfolio given. Pass --csv PATH to see your brief, e.g.\n"
-            "  uv run python -m app --csv your_transactions.csv\n"
+            "No portfolio given. Pass --book PATH (a Ghostfolio-compatible CSV or a Ghostfolio "
+            "JSON export) to see your brief, e.g.\n"
+            "  uv run python -m app --book your_transactions.csv\n"
             "or try the bundled example:\n"
-            "  uv run python -m app --csv data/sample_data/transactions.csv\n"
-            "or set ASSET_CSV=path/to/your.csv in .env to make it the default.\n"
+            "  uv run python -m app --book data/sample_data/transactions.csv\n"
+            "or set ASSET_BOOK=path/to/your-book in .env to make it the default.\n"
             "(to backtest a target without a book: --backtest --target FILE; "
             "see --help for all options)\n"
         )
@@ -382,22 +386,22 @@ def main(argv: list[str] | None = None) -> int:
 
     state = DerivedState()
     events: list[Event] = []
-    if args.csv is not None:  # a real book → derive holdings (else: notional backtest only)
-        csv_path = args.csv
+    if args.book is not None:  # a real book → derive holdings (else: notional backtest only)
+        book_path = args.book
         # Read-only invariant: a generated target CSV must never overwrite the
-        # transaction log. Both writers take an explicit path, so a mistyped
+        # transaction file. Both writers take an explicit path, so a mistyped
         # --dump-target / --allocate-out could otherwise clobber the input.
-        src_resolved = csv_path.resolve()
+        src_resolved = book_path.resolve()
         for flag, out in (("--dump-target", args.dump_target), ("--allocate-out", args.allocate_out)):
             if out is not None and out.resolve() == src_resolved:
                 parser.error(
-                    f"{flag} must not point at the transaction CSV ({csv_path}); "
+                    f"{flag} must not point at the transaction file ({book_path}); "
                     "choose a different output path"
                 )
-        if not csv_path.exists():
-            log.error("transaction CSV not found: %s", csv_path)
+        if not book_path.exists():
+            log.error("transaction file not found: %s", book_path)
             run["status"] = "error"
-            run["error"] = "csv_not_found"
+            run["error"] = "book_not_found"
             _log_run_summary(run)
             return 2
         try:
@@ -405,13 +409,13 @@ def main(argv: list[str] | None = None) -> int:
             # guard in pipeline stays the net for any split we couldn't fetch). Splits
             # are cache-only under --offline / --no-prices.
             events, state = load_book(
-                csv_path,
+                book_path,
                 args.cache_dir,
                 online=not args.offline and not args.no_prices,
             )
             run["n_events_replayed"] = len(events)
         except (ValueError, KeyError) as exc:
-            log.error("failed to process %s: %s", csv_path, exc)
+            log.error("failed to process %s: %s", book_path, exc)
             run["status"] = "error"
             run["error"] = str(exc)
             _log_run_summary(run)
@@ -737,6 +741,16 @@ def _print_proposed_allocation(
         )
     if wrote_to is not None:
         lines.append(f"  wrote -> {wrote_to}")
+        if rule in PRESETS:
+            # A preset is a risk POSTURE, so the design's next step is to validate it
+            # against a canonical reference (60-40 = the safe default). Print the exact
+            # ready-to-run command with the real path to close the generate -> validate
+            # seam — --allocate is propose-only, so this is a separate run the user
+            # reviews and launches, not an auto-chain.
+            lines.append(
+                "  Next, validate this posture -> "
+                f"uv run python -m app --backtest --benchmark 60-40 --target {wrote_to}"
+            )
     lines.append(
         "  review these weights, then act separately: "
         "--backtest --target <file>  or  --rebalance <mode> --target <file>"
@@ -745,7 +759,7 @@ def _print_proposed_allocation(
 
 
 def _load_universe(status_key: str, run: dict[str, Any]) -> list[Candidate] | None:
-    """Load the curated universe — `ASSET_UNIVERSE` overrides (like `ASSET_CSV`), else the
+    """Load the curated universe — `ASSET_UNIVERSE` overrides (like `ASSET_BOOK`), else the
     bundled `data/universe.csv`. On failure: log, set ``run[status_key]``, return None.
     Shared by `--discover` and the preset allocator."""
     universe_path = (

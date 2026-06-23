@@ -143,3 +143,109 @@ def test_load_target_all_zero_rejected(tmp_path: Path) -> None:
 def test_load_target_nonnumeric_weight_rejected(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="non-numeric"):
         load_target(_csv(tmp_path, "Ticker,Weight\nVOO,0.5x\n", "t.csv"))
+
+
+# ── Ghostfolio JSON export (load_events accepts a Ghostfolio export directly) ──
+
+
+def _gf_json(tmp_path: Path, activities: list[dict[str, object]], wrap: bool = True) -> Path:
+    """Write a Ghostfolio JSON export — the full object with an `activities` array, or
+    (wrap=False) a bare activities list — and return its path."""
+    import json
+
+    obj: object = {"activities": activities} if wrap else activities
+    p = tmp_path / "export.json"
+    p.write_text(json.dumps(obj), encoding="utf-8")
+    return p
+
+
+def _act(**kw: object) -> dict[str, object]:
+    base: dict[str, object] = {
+        "symbol": "VOO", "currency": "USD", "unitPrice": 400, "quantity": 10, "type": "BUY",
+        "fee": 1, "dataSource": "YAHOO", "date": "2024-01-02T00:00:00.000Z", "comment": None,
+    }
+    base.update(kw)
+    return base
+
+
+def test_loads_a_ghostfolio_json_export(tmp_path: Path) -> None:
+    p = _gf_json(tmp_path, [
+        _act(type="BUY", unitPrice=400, quantity=10, fee=1),
+        _act(type="DIVIDEND", unitPrice=22.4, quantity=1, fee=0, date="2024-02-01T00:00:00.000Z"),
+        _act(type="SELL", unitPrice=450, quantity=4, fee=1, date="2024-03-01T00:00:00.000Z"),
+    ])
+    by = {(e.action, e.ticker): e for e in load_events(p)}
+    assert by[("buy", "VOO")].quantity == 10 and by[("buy", "VOO")].price == 400
+    div = by[("dividend", "VOO")]
+    assert div.cash == 22.4 and div.price == 0 and div.quantity == 0  # quantity×unitPrice
+    assert by[("sell", "VOO")].quantity == 4
+
+
+def test_ghostfolio_json_accepts_a_bare_activities_list(tmp_path: Path) -> None:
+    assert load_events(_gf_json(tmp_path, [_act()], wrap=False))[0].ticker == "VOO"
+
+
+def test_ghostfolio_dividend_is_quantity_times_unitprice(tmp_path: Path) -> None:
+    # shares × per-share AND 1 × total both yield the right cash ($50).
+    assert load_events(_gf_json(tmp_path, [_act(type="DIVIDEND", quantity=100, unitPrice=0.5)]))[0].cash == 50.0
+    assert load_events(_gf_json(tmp_path, [_act(type="DIVIDEND", quantity=1, unitPrice=50)]))[0].cash == 50.0
+
+
+def test_ghostfolio_json_date_rounds_to_nearest_day(tmp_path: Path) -> None:
+    # Ghostfolio stores UTC; a KST-midnight entry exports as 15:00Z the PREVIOUS day.
+    # Round-to-nearest recovers the intended local date.
+    assert load_events(_gf_json(tmp_path, [_act(date="2023-01-04T15:00:00.000Z")]))[0].date == date(2023, 1, 5)
+    assert load_events(_gf_json(tmp_path, [_act(date="2024-01-02T00:00:00.000Z")]))[0].date == date(2024, 1, 2)
+
+
+def test_ghostfolio_json_skips_out_of_scope(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    p = _gf_json(tmp_path, [
+        _act(symbol="VOO"),
+        _act(symbol="HOUSE", type="ITEM"),
+        _act(symbol="ASML.AS", currency="EUR"),
+        _act(symbol="BTC", dataSource="COINGECKO"),
+    ])
+    with caplog.at_level("WARNING"):
+        events = load_events(p)
+    assert {e.ticker for e in events} == {"VOO"}
+    assert "ITEM" in caplog.text and "EUR" in caplog.text
+
+
+def test_ghostfolio_json_end_to_end_derive(tmp_path: Path) -> None:
+    from app.derive import derive
+
+    p = _gf_json(tmp_path, [
+        _act(type="BUY", unitPrice=400, quantity=10, fee=1),
+        _act(type="DIVIDEND", unitPrice=22.4, quantity=1, fee=0, date="2024-02-01T00:00:00.000Z"),
+        _act(type="SELL", unitPrice=450, quantity=4, fee=1, date="2024-03-01T00:00:00.000Z"),
+    ])
+    state = derive(load_events(p))
+    assert state.held()["VOO"].shares == 6
+    assert isclose(state.realized["VOO"], 22.4 + 4 * (450.0 - 4001.0 / 10.0) - 1.0)
+
+
+def test_ghostfolio_json_preserves_fractional_share_precision(tmp_path: Path) -> None:
+    # _gf_num must not truncate fractional shares — DRIP buys carry 7-8 decimals, and a
+    # 6-dp round (the old %.6f) would drift the share count and cost basis vs the broker.
+    p = _gf_json(tmp_path, [_act(type="BUY", quantity=0.123456789, unitPrice=400.0)])
+    assert load_events(p)[0].quantity == 0.123456789
+
+
+def test_ghostfolio_json_skips_symbol_less_activity(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # A null/missing symbol must be skipped with a warning, never minted as a "" ticker.
+    p = _gf_json(tmp_path, [_act(symbol=None, type="BUY"), _act(symbol="VOO")])
+    with caplog.at_level("WARNING"):
+        events = load_events(p)
+    assert [e.ticker for e in events] == ["VOO"]
+    assert "no symbol" in caplog.text
+
+
+def test_csv_dividend_with_quantity_collapses(tmp_path: Path) -> None:
+    # Ghostfolio's *CSV* import uses our columns but per-share × shares dividends; the
+    # income rule handles it (Price 0.62 × Quantity 5 → $3.10), while ours stays Quantity 0.
+    assert isclose(load_events(_csv(tmp_path, _HEADER + "2024-02-01,VOO,YAHOO,USD,0.62,5,dividend,0,\n"))[0].cash, 3.10)
+    assert load_events(_csv(tmp_path, _HEADER + "2024-02-01,VOO,YAHOO,USD,22.40,0,dividend,0,\n"))[0].cash == 22.40

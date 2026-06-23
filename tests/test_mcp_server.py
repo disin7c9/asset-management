@@ -9,6 +9,7 @@ degrade to clean MCP errors rather than crashing.
 from __future__ import annotations
 
 import math
+import os
 from pathlib import Path
 from typing import Any
 
@@ -41,6 +42,16 @@ def _warm_series_cache(cache: Path, ticker: str, base: float, n: int = 320) -> N
     df.to_parquet(cache / f"{ticker}_series.parquet", index=False)
 
 
+@pytest.fixture(autouse=True)
+def _hermetic_mcp_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The server reads ASSET_BOOK / ASSET_CSV / ASSET_TARGET from os.environ. Pin them to
+    # "" (treated as unset) so a developer's real .env can't leak a book into the suite —
+    # the original 14-failure class. Tests that need a value setenv a real one over this.
+    monkeypatch.setenv("ASSET_BOOK", "")
+    monkeypatch.setenv("ASSET_CSV", "")
+    monkeypatch.setenv("ASSET_TARGET", "")
+
+
 @pytest.fixture
 def warm_book(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     csv = tmp_path / "txn.csv"
@@ -54,7 +65,8 @@ def warm_book(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     cache.mkdir()
     _warm_series_cache(cache, "AAA", 100.0)
     _warm_series_cache(cache, "BBB", 50.0)
-    monkeypatch.setenv("ASSET_CSV", str(csv))
+    monkeypatch.delenv("ASSET_CSV", raising=False)
+    monkeypatch.setenv("ASSET_BOOK", str(csv))
     monkeypatch.setenv("ASSET_CACHE_DIR", str(cache))
     monkeypatch.delenv("ASSET_TARGET", raising=False)
     return tmp_path
@@ -154,12 +166,26 @@ def test_unknown_mode_is_clean_error(warm_book: Path) -> None:
     assert "momentum" in _error_text(res)
 
 
-def test_missing_asset_csv_is_clean_error(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_missing_book_is_clean_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("ASSET_BOOK", raising=False)
     monkeypatch.delenv("ASSET_CSV", raising=False)
     monkeypatch.delenv("ASSET_CACHE_DIR", raising=False)
     res = _call("portfolio_summary")
     assert res.isError
-    assert "ASSET_CSV" in _error_text(res)
+    assert "ASSET_BOOK" in _error_text(res)
+
+
+def test_asset_csv_env_is_back_compat(warm_book: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # ASSET_BOOK is the canonical var, but the legacy ASSET_CSV must still resolve
+    # the book when ASSET_BOOK is unset (a pre-rename .env keeps working).
+    book = os.environ["ASSET_BOOK"]
+    monkeypatch.delenv("ASSET_BOOK", raising=False)
+    monkeypatch.setenv("ASSET_CSV", book)
+    res = _call("portfolio_summary")
+    assert not res.isError, _error_text(res)
+    # The legacy var must resolve the SAME book, not just any non-error: pin its holdings.
+    sc = res.structuredContent
+    assert sc is not None and {h["ticker"] for h in sc["holdings"]} == {"AAA", "BBB"}
 
 
 def test_rebalance_refuses_partial_book(
@@ -179,7 +205,8 @@ def test_rebalance_refuses_partial_book(
     _warm_series_cache(cache, "AAA", 100.0)  # BBB deliberately left uncached
     target = tmp_path / "target.csv"
     target.write_text("Ticker,Weight\nAAA,50\nBBB,50\n", encoding="utf-8")
-    monkeypatch.setenv("ASSET_CSV", str(csv))
+    monkeypatch.delenv("ASSET_CSV", raising=False)
+    monkeypatch.setenv("ASSET_BOOK", str(csv))
     monkeypatch.setenv("ASSET_CACHE_DIR", str(cache))
     monkeypatch.setenv("ASSET_TARGET", str(target))
 
@@ -211,7 +238,8 @@ def test_risk_report_undefined_ratio_is_null(
     idx = pd.bdate_range(end=pd.Timestamp.today().normalize(), periods=320)
     rising = pd.Series([100.0 * (1.0 + 0.001 * i) for i in range(320)], index=idx, dtype=float)
     prices_mod._write_series_cache("UP", rising, cache)
-    monkeypatch.setenv("ASSET_CSV", str(csv))
+    monkeypatch.delenv("ASSET_CSV", raising=False)
+    monkeypatch.setenv("ASSET_BOOK", str(csv))
     monkeypatch.setenv("ASSET_CACHE_DIR", str(cache))
 
     res = _call("risk_report")

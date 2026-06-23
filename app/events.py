@@ -1,7 +1,9 @@
-"""Transaction-log events: typed model + ghostfolio-format CSV loader.
+"""Transaction-log events: typed model + loader (our CSV or a Ghostfolio export).
 
 The append-only event log is the source of truth. Holdings, cost basis, and
-P&L are *derived* from these events — never stored.
+P&L are *derived* from these events — never stored. `load_events` accepts our native
+CSV OR a Ghostfolio JSON activities export (auto-detected; normalized to our schema on
+read), so the rest of the pipeline only ever sees one format.
 
 Float arithmetic is used throughout v0 to match the hand-verified golden
 values in `tests/test_derive.py`. Upgrade to Decimal later if precision bites.
@@ -10,10 +12,12 @@ values in `tests/test_derive.py`. Upgrade to Decimal later if precision bites.
 from __future__ import annotations
 
 import csv
+import io
+import json
 import logging
 from dataclasses import dataclass
 from collections.abc import Sequence
-from datetime import date
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Literal, get_args
 
@@ -120,8 +124,110 @@ def _validate_columns(header: Sequence[str] | None, path: Path) -> None:
         raise ValueError(msg)
 
 
+# ── Ghostfolio export adapter ────────────────────────────────────────────────
+#
+# Accept a Ghostfolio activities export directly, so `--book export.json` Just Works.
+# Ghostfolio's native export is **JSON** (`{..., "activities": [...]}`); each activity
+# uses `symbol`/`type`/`unitPrice`/`quantity`. We map those to our schema BEFORE the
+# parser, so the canonical Event model and everything downstream see only one format.
+# Income value is `quantity × unitPrice` (collapsed to our cash-in-Price total by the
+# loader). Out of scope (warned + skipped): ITEM/LIABILITY, non-USD, non-equity data
+# sources. Ghostfolio has no deposit/withdraw (cash is account-level), unused by the brief.
+
+_GF_ACTION_MAP: dict[str, str] = {  # Ghostfolio type → our action
+    "BUY": "buy", "SELL": "sell", "DIVIDEND": "dividend", "FEE": "fee", "INTEREST": "interest",
+}
+_GF_SKIP_TYPES: frozenset[str] = frozenset({"ITEM", "LIABILITY"})  # not securities
+_GF_SKIP_SOURCES: frozenset[str] = frozenset({"COINGECKO"})        # crypto / non-equity
+
+
+def _gf_date(raw: str) -> str:
+    """A Ghostfolio activity date → our ISO `YYYY-MM-DD`. Ghostfolio stores UTC timestamps,
+    so a date-only entry becomes local-midnight in UTC (e.g. KST midnight → 15:00Z the
+    PREVIOUS day). Round to the NEAREST day (+12h then truncate) to recover the intended
+    local calendar date; a plain date passes through.
+
+    The rounding is done in UTC with no tz knowledge, so it is exact only for UTC offsets
+    within ±12h (every common zone, incl. the user's KST). Offsets beyond that (UTC+13/+14:
+    NZ daylight time, Samoa, Tonga, Kiribati) and a genuine intraday timestamp at exactly
+    12:00:00Z can land one day off — acceptable for a weekly, drawdown-first brief."""
+    s = raw.strip()
+    if "T" not in s:
+        return s[:10]
+    dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    return (dt + timedelta(hours=12)).date().isoformat()
+
+
+def _gf_num(x: float) -> str:
+    """A clean numeric string for the shared parse loop: an int when integer-valued, else
+    the shortest round-tripping float repr. `repr` (not a fixed `%.6f`) so a fractional
+    share / sub-cent price keeps full precision through the str→`_to_float` hop."""
+    return str(int(x)) if x == int(x) else repr(x)
+
+
+def _rows_from_ghostfolio_json(raw: str, path: Path) -> tuple[list[dict[str, str]], list[str]]:
+    """Map a Ghostfolio JSON export's `activities` → our-schema row dicts (+ skip warnings).
+    Accepts the full export object (`{..., "activities": [...]}`) or a bare activities list.
+    Income keeps `quantity`+`unitPrice` (the loader collapses it to a cash total). Never
+    raises on a single bad activity — that one is skipped with a warning."""
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{path}: not valid JSON ({exc})") from exc
+    activities = data.get("activities", []) if isinstance(data, dict) else data
+    if not isinstance(activities, list):
+        raise ValueError(f"{path}: Ghostfolio JSON has no 'activities' list")
+    out: list[dict[str, str]] = []
+    warnings: list[str] = []
+    for i, a in enumerate(activities, start=1):
+        if not isinstance(a, dict):
+            warnings.append(f"activity {i}: skipped (not an object)")
+            continue
+        gtype = str(a.get("type", "")).upper()
+        if gtype in _GF_SKIP_TYPES:
+            warnings.append(f"activity {i}: skipped {gtype} (not a security)")
+            continue
+        action = _GF_ACTION_MAP.get(gtype)
+        if action is None:
+            warnings.append(f"activity {i}: skipped unrecognized type {gtype!r}")
+            continue
+        currency = str(a.get("currency") or "USD").upper()
+        if currency != "USD":
+            warnings.append(f"activity {i}: skipped {currency} {a.get('symbol')} (USD-only for now)")
+            continue
+        if str(a.get("dataSource") or "MANUAL").upper() in _GF_SKIP_SOURCES:
+            warnings.append(f"activity {i}: skipped {a.get('symbol')} (non-equity source)")
+            continue
+        symbol = str(a.get("symbol") or "").upper()
+        if not symbol:  # no security to attach to — don't mint a "" ticker
+            warnings.append(f"activity {i}: skipped {gtype} (no symbol)")
+            continue
+        try:
+            row = {
+                "Date": _gf_date(str(a.get("date") or "")),
+                "Code": symbol,
+                "Action": action,
+                "Quantity": _gf_num(float(a.get("quantity") or 0.0)),
+                "Price": _gf_num(float(a.get("unitPrice") or 0.0)),
+                "Fee": _gf_num(float(a.get("fee") or 0.0)),
+                "Currency": currency,
+                "DataSource": str(a.get("dataSource") or "MANUAL"),
+                "Note": str(a.get("comment") or ""),
+            }
+        except (ValueError, TypeError) as exc:
+            warnings.append(f"activity {i}: skipped (bad field: {exc})")
+            continue
+        out.append(row)
+    return out, warnings
+
+
 def load_events(path: Path) -> list[Event]:
-    """Parse a ghostfolio-format CSV into an ordered event list.
+    """Parse a transaction file into an ordered event list.
+
+    Accepts EITHER our native CSV OR a **Ghostfolio JSON activities export** — the file is
+    auto-detected (JSON if it starts with `{`/`[`) and a Ghostfolio export is normalized to
+    our schema on read (income from quantity × unitPrice; non-USD / crypto / ITEM / LIABILITY
+    skipped with a warning), so the rest of the pipeline sees one format.
 
     Tolerates:
     - UTF-8 BOM (Excel-saved CSVs)
@@ -136,36 +242,50 @@ def load_events(path: Path) -> list[Event]:
     Ordering: by date, then by action (buy → div/fee/interest → sell) so a
     same-day SELL listed before its BUY in the CSV doesn't crash.
     """
-    events: list[Event] = []
-    # utf-8-sig strips a leading BOM if present.
-    with path.open(newline="", encoding="utf-8-sig") as fh:
-        reader = csv.DictReader(fh)
+    raw = path.read_text(encoding="utf-8-sig")  # utf-8-sig strips a leading BOM
+    if raw.lstrip()[:1] in ("{", "["):  # a Ghostfolio JSON activities export
+        rows, skipped = _rows_from_ghostfolio_json(raw, path)
+        for msg in skipped:
+            log.warning("%s: ghostfolio import — %s", path, msg)
+    else:
+        reader = csv.DictReader(io.StringIO(raw))
         _validate_columns(reader.fieldnames, path)
-        for row in reader:
-            action = _parse_action(row["Action"])
-            price = _to_float(row.get("Price"))
-            quantity = _to_float(row.get("Quantity"))
-            # For income (dividend/interest) and cash-flow (deposit/withdraw) rows
-            # the CSV's Price column carries cash, not per-share price. Move it to
-            # `cash` to keep the schema honest.
-            cash = price if action in _CASH_IN_PRICE else 0.0
-            if action in _CASH_IN_PRICE:
-                price = 0.0
+        rows = list(reader)
 
-            events.append(
-                Event(
-                    date=_parse_date(row["Date"]),
-                    ticker=row["Code"].strip().upper(),
-                    action=action,
-                    quantity=quantity,
-                    price=price,
-                    fee=_to_float(row.get("Fee")),
-                    cash=cash,
-                    currency=(row.get("Currency") or "USD").strip() or "USD",
-                    source=(row.get("DataSource") or "MANUAL").strip() or "MANUAL",
-                    note=(row.get("Note") or "").strip(),
-                )
+    events: list[Event] = []
+    for row in rows:
+        action = _parse_action(row["Action"])
+        price = _to_float(row.get("Price"))
+        quantity = _to_float(row.get("Quantity"))
+        # Income (dividend/interest) and cash flows carry a cash TOTAL, not a per-share
+        # price. Our format puts the total in Price with Quantity 0; a Ghostfolio activity
+        # puts a per-unit Price × a Quantity. quantity×price unifies both (Quantity 0 → just
+        # Price); the shares aren't a holding change, so zero them out.
+        # NOTE: this widened the native-CSV contract — a hand-written income row that left a
+        # stray non-zero Quantity now reads as quantity×price, not bare price. Every shipped
+        # book uses Quantity 0 on income/cash rows (per the README schema), so none is
+        # affected; the per-share×shares reading is the correct one for a Ghostfolio CSV.
+        if action in _CASH_IN_PRICE:
+            cash = quantity * price if quantity else price
+            price = 0.0
+            quantity = 0.0
+        else:
+            cash = 0.0
+
+        events.append(
+            Event(
+                date=_parse_date(row["Date"]),
+                ticker=row["Code"].strip().upper(),
+                action=action,
+                quantity=quantity,
+                price=price,
+                fee=_to_float(row.get("Fee")),
+                cash=cash,
+                currency=(row.get("Currency") or "USD").strip() or "USD",
+                source=(row.get("DataSource") or "MANUAL").strip() or "MANUAL",
+                note=(row.get("Note") or "").strip(),
             )
+        )
     events.sort(key=lambda e: (e.date, _ACTION_ORDER.get(e.action, 1)))
     log.info("loaded %d events from %s", len(events), path)
     return events

@@ -48,9 +48,10 @@ log = logging.getLogger(__name__)
 
 
 def load_book(
-    csv_path: Path, cache_dir: Path, *, online: bool
+    book_path: Path, cache_dir: Path, *, online: bool
 ) -> tuple[list[Event], DerivedState]:
-    """Replay a transaction-log CSV → split-adjusted events + derived holdings.
+    """Replay a transaction book (our CSV or a Ghostfolio JSON export) → split-adjusted
+    events + derived holdings.
 
     The shared book loader for every surface (the CLI brief and the MCP server).
     Split-adjust raw share counts (yfinance prices are split-adjusted) so holdings
@@ -59,7 +60,7 @@ def load_book(
     price-basis-mismatch guard in `compute_prices_returns_risk` stays the net for
     any split we couldn't fetch. The tickers we actually adjusted are logged.
     """
-    events = load_events(csv_path)
+    events = load_events(book_path)
     splits = fetch_splits(
         sorted({ev.ticker for ev in events}), cache_dir=cache_dir, online=online
     )

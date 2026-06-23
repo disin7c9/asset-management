@@ -10,15 +10,16 @@ math. Design invariants (v2.0.0 Phase 1):
 - **Read-only + offline**: tools read already-derived data and the on-disk price
   **cache** (`online=False`), so a call never reaches the network (no egress) and is
   fast + deterministic. A cold cache degrades to `n/a`, never a guess.
-- **Bound to one book** (`ASSET_CSV`): tools take no file-path argument, so a caller
-  can't point the server at an arbitrary file.
+- **Bound to one book** (`ASSET_BOOK`, or `ASSET_CSV` back-compat): tools take no
+  file-path argument, so a caller can't point the server at an arbitrary file.
 
 stdout is the stdio transport, so **all logging goes to stderr** (`setup_logging`);
 nothing here writes to stdout. Tool errors surface as MCP errors, never a crash.
 
 Run:  ``uv run python -m app.mcp_server``  (register with ``claude mcp add``). Config
-via env (.env or the client's env block): ``ASSET_CSV`` (required), ``ASSET_TARGET``
-(for ``rebalance_check``), ``ASSET_CACHE_DIR`` (optional; default ``data/prices``).
+via env (.env or the client's env block): ``ASSET_BOOK`` (required; a Ghostfolio-compatible
+CSV or a Ghostfolio JSON export — ``ASSET_CSV`` still honored), ``ASSET_TARGET`` (for
+``rebalance_check``), ``ASSET_CACHE_DIR`` (optional; default ``data/prices``).
 """
 
 from __future__ import annotations
@@ -82,11 +83,14 @@ mcp: FastMCP = FastMCP(
 # ── config resolution (env-only; no argparse on this surface) ────────────────
 
 
-def _env_csv(var: str, what: str) -> Path:
-    """Resolve a CSV path from an env var (.env convention): ``~`` expanded, a
-    relative path repo-relative. Raises a clear ValueError (→ a clean MCP error)
-    if unset or missing — the server never guesses a path."""
+def _env_path(var: str, what: str, *, fallback: str | None = None) -> Path:
+    """Resolve a book/target path from an env var (.env convention): ``~`` expanded, a
+    relative path repo-relative. ``fallback`` is a back-compat env var read if ``var`` is
+    unset. Raises a clear ValueError (→ a clean MCP error) if unset or missing — the server
+    never guesses a path."""
     raw = os.environ.get(var, "").strip()
+    if not raw and fallback:
+        raw = os.environ.get(fallback, "").strip()
     if not raw:
         raise ValueError(f"{var} is not set — {what}")
     p = Path(raw).expanduser()
@@ -94,6 +98,17 @@ def _env_csv(var: str, what: str) -> Path:
     if not path.exists():
         raise ValueError(f"{var} points at a missing file: {path}")
     return path
+
+
+def _env_book() -> Path:
+    """The bound book path: ``ASSET_BOOK`` (legacy ``ASSET_CSV`` honored). One helper so the
+    var name, help text, and back-compat fallback stay identical across every tool."""
+    return _env_path(
+        "ASSET_BOOK",
+        "point it at your transaction file — a Ghostfolio-compatible CSV or a Ghostfolio "
+        "JSON export (in .env or the MCP client env)",
+        fallback="ASSET_CSV",
+    )
 
 
 def _cache_dir() -> Path:
@@ -133,16 +148,14 @@ class _Build:
 
 
 def _build(*, no_risk: bool, today: date) -> _Build:
-    """Load the ASSET_CSV book and compute prices/returns/(risk) via the SAME core
+    """Load the ASSET_BOOK book and compute prices/returns/(risk) via the SAME core
     path the CLI brief uses (`pipeline.compute_prices_returns_risk`), forced offline. The
     `no_risk` flag skips the bootstrap panel — `portfolio_summary`/`rebalance_check`
     don't need it (fast), `risk_report` does. `today` is resolved ONCE per tool call
     (one clock per request) and threaded through."""
     cache = _cache_dir()
-    csv_path = _env_csv(
-        "ASSET_CSV", "point it at your transaction CSV (in .env or the MCP client env)"
-    )
-    events, state = load_book(csv_path, cache, online=False)
+    book_path = _env_book()
+    events, state = load_book(book_path, cache, online=False)
     run: dict[str, Any] = {
         "status": "ok", "n_prices_fetched": 0, "n_prices_missing": 0,
         "n_series_fetched": 0, "n_series_missing": 0, "fallbacks_used": 0,
@@ -437,7 +450,7 @@ def risk_report() -> RiskReport:
         raise ValueError(
             "risk metrics need cached daily price history, which isn't available offline. "
             "Warm the cache by running the brief online once "
-            "(uv run python -m app --csv <your.csv>), then retry."
+            "(uv run python -m app --book <your-book>), then retry."
         )
     dd = rk.drawdown
     ddd = b.dollar_dd
@@ -488,7 +501,7 @@ def rebalance_check(mode: str = "to_total") -> RebalancePlan:
     today = date.today()
     b = _build(no_risk=True, today=today)
     target = load_target(
-        _env_csv("ASSET_TARGET", "set it to your target-allocation CSV for rebalance_check")
+        _env_path("ASSET_TARGET", "set it to your target-allocation CSV for rebalance_check")
     )
     held = b.state.held()
     price_per_share = {tk: pr.close for tk, pr in b.prices.items()}
@@ -526,10 +539,8 @@ def rebalance_check(mode: str = "to_total") -> RebalancePlan:
 def securities_facts() -> SecuritiesFacts:
     today = date.today()
     cache = _cache_dir()
-    csv_path = _env_csv(
-        "ASSET_CSV", "point it at your transaction CSV (in .env or the MCP client env)"
-    )
-    _events, state = load_book(csv_path, cache, online=False)
+    book_path = _env_book()
+    _events, state = load_book(book_path, cache, online=False)
     held = sorted(state.held())
     meta = fetch_metadata(held, cache_dir=cache, online=False)
     facts = [
@@ -614,7 +625,7 @@ def screen_candidate(ticker: str) -> CandidateVerdict:
         return CandidateVerdict(
             ticker=tk, verdict="N/A", checks=[],
             note=f"{tk} isn't in your price cache. Warm it once online — "
-            f"`uv run python -m app --csv <your.csv> --screen {tk}` — then ask again.",
+            f"`uv run python -m app --book <your-book> --screen {tk}` — then ask again.",
         )
     held = set(b.state.held())
     meta = fetch_metadata(sorted({tk} | held), cache_dir=cache, online=False)

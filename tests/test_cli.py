@@ -52,10 +52,11 @@ def _no_network_splits(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.fixture(autouse=True)
 def _hermetic_env_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
-    # cli reads ASSET_CSV / ASSET_TARGET as personal .env fallbacks. Pin them to ""
-    # (treated as unset; load_dotenv never overrides an existing var) so the
+    # cli reads ASSET_BOOK / ASSET_CSV / ASSET_TARGET as personal .env fallbacks. Pin
+    # them to "" (treated as unset; load_dotenv never overrides an existing var) so the
     # contract tests keep working once the developer's real .env sets them. The
     # env-fallback tests below setenv real values over this.
+    monkeypatch.setenv("ASSET_BOOK", "")
     monkeypatch.setenv("ASSET_CSV", "")
     monkeypatch.setenv("ASSET_TARGET", "")
 
@@ -317,7 +318,7 @@ def test_bare_run_prints_hint_not_a_brief(capsys: pytest.CaptureFixture[str]) ->
     rc = main([])
     out = capsys.readouterr().out
     assert rc == 0
-    assert "No portfolio given" in out and "--csv" in out
+    assert "No portfolio given" in out and "--book" in out
     assert "=== HOLDINGS ===" not in out  # nothing fabricated
 
 
@@ -765,6 +766,45 @@ def test_env_asset_csv_makes_bare_run_a_brief(
     assert "No portfolio given" not in out
 
 
+def test_book_flag_loads_the_book(capsys: pytest.CaptureFixture[str]) -> None:
+    # --book is the canonical flag (--csv/--json are aliases of the same dest).
+    rc = main(["--book", str(SAMPLE), "--no-prices"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "=== HOLDINGS ===" in out
+
+
+def test_json_flag_reads_a_ghostfolio_export(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    # The loader auto-detects format by content, so --json is a label; pointing it at
+    # a real Ghostfolio JSON export must derive a holding through the CLI brief path.
+    export = tmp_path / "ghostfolio-export.json"
+    export.write_text(
+        '{"activities": [{"type": "BUY", "symbol": "VOO", "quantity": 10, '
+        '"unitPrice": 365, "fee": 1, "currency": "USD", "dataSource": "YAHOO", '
+        '"date": "2023-01-04T15:00:00.000Z", "comment": null}]}',
+        encoding="utf-8",
+    )
+    rc = main(["--json", str(export), "--no-prices"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "=== HOLDINGS ===" in out and "VOO" in out
+
+
+def test_env_asset_book_makes_bare_run_a_brief(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    # ASSET_BOOK is the canonical .env default (ASSET_CSV stays honored for back-compat):
+    # a run with no flag uses it instead of printing the usage hint.
+    monkeypatch.setenv("ASSET_BOOK", str(SAMPLE))
+    rc = main(["--no-prices"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "=== HOLDINGS ===" in out
+    assert "No portfolio given" not in out
+
+
 def test_env_asset_csv_does_not_reach_pure_backtest(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -871,7 +911,7 @@ def test_missing_csv_returns_2_and_logs_error(
         rc = main(["--csv", str(tmp_path / "nope.csv")])
     assert rc == 2
     run = _run_summary(caplog)
-    assert run["status"] == "error" and run["error"] == "csv_not_found"
+    assert run["status"] == "error" and run["error"] == "book_not_found"
 
 
 def test_run_summary_counts_prices_on_series_path(
@@ -1449,6 +1489,50 @@ def test_allocate_moderate_preset_keeps_held_funds_and_fills_gaps(
     m = re.search(r"PROPOSED ALLOCATION: moderate \((\d+) holdings\)", out)
     assert m is not None and int(m.group(1)) > 4  # held funds + gap-fills, not just the 4 held
     assert _run_summary(caplog)["allocate"] == "moderate"
+
+
+def _price_held_funds(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Latest prices for the sample's held tickers — a preset anchors on the held fund
+    per role, so it needs them priced."""
+    now = datetime.now(timezone.utc)
+    held = {"BND": 73.0, "IAU": 84.0, "VEA": 72.0, "VOO": 697.0}
+    monkeypatch.setattr(
+        "app.cli.fetch_latest",
+        lambda tickers, *a, **k: PricesResult(
+            rows={
+                tk: PriceRow(tk, date.today(), held[tk], "test", now)
+                for tk in tickers if tk in held
+            },
+            missing=[tk for tk in tickers if tk not in held],
+        ),
+    )
+
+
+def test_allocate_preset_prints_benchmark_handoff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    # A preset is a posture → after writing it, print the ready-to-run validation command
+    # (real path) so the generate → validate loop the design intends isn't left implicit.
+    _price_held_funds(monkeypatch)
+    out_csv = tmp_path / "moderate.csv"
+    rc = main(["--csv", str(SAMPLE), "--allocate", "moderate", "--allocate-out", str(out_csv), "--no-risk"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert f"--backtest --benchmark 60-40 --target {out_csv}" in out
+
+
+def test_allocate_benchmark_handoff_is_preset_and_output_gated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    # The handoff is for strategic presets that wrote a file. A mechanical rule isn't a
+    # posture (no --benchmark line), and a preset with no --allocate-out has no path to run.
+    monkeypatch.setattr("app.cli.fetch_series", _flat_series)
+    rc = main(["--csv", str(SAMPLE), "--allocate", "equal_weight", "--allocate-out", str(tmp_path / "t.csv")])
+    assert rc == 0 and "--benchmark" not in capsys.readouterr().out  # mechanical → no handoff
+
+    _price_held_funds(monkeypatch)
+    rc = main(["--csv", str(SAMPLE), "--allocate", "moderate", "--no-risk"])  # no --allocate-out
+    assert rc == 0 and "--benchmark 60-40 --target" not in capsys.readouterr().out
 
 
 def test_resolve_role_tickers_prefers_a_held_fund_then_the_universe_default() -> None:
