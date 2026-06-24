@@ -40,6 +40,7 @@ from typing import TYPE_CHECKING, Literal, get_args
 import pandas as pd
 
 from app.events import CASH_TICKER
+from app.universe import ROLES, Candidate
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -323,3 +324,46 @@ def preset_target(
     if cap is not None:
         target = apply_caps(target, cap)
     return target
+
+
+def _resolve_role_tickers(
+    universe: list[Candidate], held_values: dict[str, float]
+) -> dict[str, str]:
+    """For each universe role, the ticker that fills it in a preset target: the holder's
+    LARGEST fund in that role (the dominant holding wins), else the universe default (the
+    top-AUM candidate — first in the AUM-ordered file). A held fund whose role the presets
+    zero-weight (e.g. thematic) still maps here; `preset_target` drops it, so a to_total
+    rebalance surfaces it as a sell."""
+    # One pass over the universe: a ticker→role index (to map the holder's funds) and
+    # each role's top-AUM default (first seen — the file is AUM-ordered within a role).
+    role_of: dict[str, str] = {}
+    default_for: dict[str, str] = {}
+    for c in universe:
+        role_of[c.ticker] = c.role
+        default_for.setdefault(c.role, c.ticker)
+    # The holder's LARGEST fund wins its role (ticker breaks an exact-value tie, so the
+    # result is independent of book/row order); a role with no held fund takes the default.
+    held_in_role: dict[str, str] = {}
+    for tk in sorted(held_values, key=lambda t: (-held_values[t], t)):
+        role = role_of.get(tk)
+        if role is not None:
+            held_in_role.setdefault(role, tk)
+    role_tickers: dict[str, str] = {}
+    for role in ROLES:
+        ticker = held_in_role.get(role) or default_for.get(role)
+        if ticker is not None:
+            role_tickers[role] = ticker
+    return role_tickers
+
+
+def build_preset_target(
+    preset: str,
+    universe: list[Candidate],
+    held_values: dict[str, float],
+    *,
+    cap: float | None = None,
+) -> dict[str, float]:
+    """Holdings-aware preset target in one call: resolve each role's ticker from the book +
+    universe, then build the posture template. The shared entry for the CLI `--allocate` and
+    the MCP `propose_allocation` (so both produce identical weights)."""
+    return preset_target(preset, _resolve_role_tickers(universe, held_values), cap=cap)

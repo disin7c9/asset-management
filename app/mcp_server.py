@@ -7,9 +7,14 @@ math. Design invariants (v2.0.0 Phase 1):
 
 - **Every figure comes from the validated core** (`derive`/`returns`/`risk`, via the
   same `pipeline.compute_prices_returns_risk` the brief uses) — the LLM never computes.
-- **Read-only + offline**: tools read already-derived data and the on-disk price
-  **cache** (`online=False`), so a call never reaches the network (no egress) and is
-  fast + deterministic. A cold cache degrades to `n/a`, never a guess.
+- **Read-only + offline (after a one-time core warm)**: tools read already-derived data and
+  the on-disk price **cache** (`online=False`), fast + deterministic. The ONE bounded
+  exception to no-egress: a *cold* cache triggers a one-time online warm of the core set
+  (book tickers + benchmark refs, ~30-60s) so an addon user who never runs the CLI still gets
+  real numbers. Set ``ASSET_MCP_OFFLINE=1`` to keep it strictly airtight (a cold cache then
+  degrades to `n/a`, never a guess) — intended for an *already-warmed* cache (warm once with
+  ``--warm`` first); pointed at a cold cache it simply returns `n/a`. The heavy discovery
+  universe is never auto-warmed.
 - **Bound to one book** (`ASSET_BOOK`, or `ASSET_CSV` back-compat): tools take no
   file-path argument, so a caller can't point the server at an arbitrary file.
 
@@ -19,7 +24,9 @@ nothing here writes to stdout. Tool errors surface as MCP errors, never a crash.
 Run:  ``uv run python -m app.mcp_server``  (register with ``claude mcp add``). Config
 via env (.env or the client's env block): ``ASSET_BOOK`` (required; a Ghostfolio-compatible
 CSV or a Ghostfolio JSON export — ``ASSET_CSV`` still honored), ``ASSET_TARGET`` (for
-``rebalance_check``), ``ASSET_CACHE_DIR`` (optional; default ``data/prices``).
+``rebalance_check``), ``ASSET_CACHE_DIR`` (optional; default ``data/prices``),
+``ASSET_MCP_OFFLINE`` (optional; ``1`` disables the cold-cache auto-warm — intended for an
+already-warmed cache).
 """
 
 from __future__ import annotations
@@ -29,7 +36,8 @@ import math
 import os
 import re
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
+from importlib.metadata import PackageNotFoundError, version as _pkg_version
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -38,10 +46,25 @@ from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel, Field
 
-from app.pipeline import compute_prices_returns_risk, load_book
+from app.pipeline import (
+    HISTORY_DAYS,
+    cache_is_cold,
+    candidate_and_held_facts,
+    compute_prices_returns_risk,
+    held_market_value,
+    load_book,
+    warm_cache,
+)
+from app.allocate import PRESETS, build_preset_target
+from app.backtest import (
+    BENCHMARKS,
+    BenchmarkVerdict as BenchmarkWord,  # the verdict-word Literal; aliased to avoid the model name
+    benchmark_compare,
+    benchmark_weights,
+)
 from app.derive import DerivedState
 from app.discover import find_gaps
-from app.events import CASH_TICKER, load_target
+from app.events import CASH_TICKER, Event, load_events, load_target
 from app.log_config import setup_logging
 from app.metadata import fetch_metadata
 from app.prices import PriceRow, fetch_series
@@ -58,11 +81,30 @@ log = logging.getLogger(__name__)
 
 _REPO_ROOT: Path = Path(__file__).resolve().parents[1]
 
+try:  # advertise the app version (from package metadata → tracks pyproject), not the SDK's
+    _VERSION = _pkg_version("asset-management")
+except PackageNotFoundError:  # a raw checkout, not an installed dist
+    _VERSION = "0+unknown"
+
 _OFFLINE_NOTE = (
-    "Offline/cache-only and read-only: figures are derived from your transaction log "
-    "and the on-disk price cache; a cold cache shows null (n/a), never a guess. "
+    "Read-only: figures are derived from your transaction log and the on-disk price cache. "
+    "Uncached prices are fetched online on demand — a one-time core warm on the first cold "
+    "call, plus any new ticker you ask about (set ASSET_MCP_OFFLINE=1 to keep it strictly "
+    "offline); a value still unavailable shows null (n/a), never a guess. "
     "This is a view, not financial advice."
 )
+
+# Appended to every cold-cache refusal: the tool can't supply the figure, so steer the model
+# away from inventing one in prose (the fence guards tool-sourced numbers, not the model's
+# fallback when a tool errors). Reinforces the same rule stated in the server instructions.
+_NO_ESTIMATE = " Until then, report that it's unavailable — do not estimate it yourself."
+
+
+def _cold_error(msg: str) -> str:
+    """A cold-cache / figure-unavailable message + the anti-fabrication directive. The one funnel
+    every cold path goes through, so a new tool can't ship a 'can't compute' error that forgets to
+    steer the model away from inventing the number."""
+    return msg + _NO_ESTIMATE
 
 # Read-only, closed-world (no external side effects), idempotent — the honest hints
 # for a Claude client (Claude reads readOnlyHint to know the tool only observes).
@@ -74,10 +116,16 @@ mcp: FastMCP = FastMCP(
         "Read-only, offline view of the user's own stock/ETF portfolio. Every number "
         "is computed by a validated deterministic core (reconciled to the cent vs "
         "ghostfolio, 4 decimals vs quantstats) — do not compute or estimate figures "
-        "yourself; call a tool. Lead with drawdown (depth/duration/recovery), report "
-        "confidence intervals where given, and never present output as financial advice."
+        "yourself; call a tool. If a tool returns an error or a null/absent figure, tell "
+        "the user it's unavailable and how to get it (e.g. warm the cache) — never "
+        "substitute your own estimate, reconstruction, or factor-model guess. Lead with "
+        "drawdown (depth/duration/recovery), report confidence intervals where given, and "
+        "never present output as financial advice."
     ),
 )
+# FastMCP doesn't forward a version to its low-level Server, so serverInfo would otherwise
+# advertise the mcp SDK's own version; set ours so the addon reports the app version.
+mcp._mcp_server.version = _VERSION
 
 
 # ── config resolution (env-only; no argparse on this surface) ────────────────
@@ -121,6 +169,43 @@ def _cache_dir() -> Path:
     return _REPO_ROOT / "data" / "prices"
 
 
+def _offline_locked() -> bool:
+    """``ASSET_MCP_OFFLINE`` is a truthy switch: ``1``/``true``/``yes``/``on`` lock the server
+    strictly offline (no cold-call auto-warm). Anything else — unset, ``""``, ``0``, ``false``
+    — leaves auto-warm ON. Value-based, not mere presence, so ``ASSET_MCP_OFFLINE=0`` (a user
+    meaning "not offline") doesn't surprise-disable the warm."""
+    return os.environ.get("ASSET_MCP_OFFLINE", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _load_offline(book_path: Path, cache: Path) -> tuple[list[Event], DerivedState]:
+    """Load the bound book for the offline tools, auto-warming the cache once if it's cold.
+
+    The server is offline / no-egress, with ONE bounded exception: when the cache hasn't been
+    warmed within the TTL, the first tool call does a one-time online warm of the book tickers
+    + benchmark refs (~30-60s) so a Claude-Desktop addon user who never runs the CLI still gets
+    real numbers instead of `n/a`. Set ``ASSET_MCP_OFFLINE=1`` to keep it strictly airtight (a
+    cold cache then stays `n/a`). The heavy `full` universe is never auto-warmed (too slow for a
+    tool call) — `discover_gaps` / `screen_candidate` point the user at `--warm full` instead.
+
+    The coldness check is a cheap marker stat done BEFORE parsing the book, so a warm cache (the
+    common path) parses the book once — only a genuinely cold first call pays the extra parse."""
+    if not _offline_locked() and cache_is_cold(cache):
+        tickers = sorted(
+            {ev.ticker for ev in load_events(book_path) if ev.ticker != CASH_TICKER}
+        )
+        if tickers:
+            log.info(
+                "cold price cache — warming %d tickers online once (~30-60s); "
+                "set ASSET_MCP_OFFLINE=1 to disable",
+                len(tickers),
+            )
+            try:
+                warm_cache(tickers, cache, online=True)
+            except Exception as exc:  # noqa: BLE001 — any warm failure → serve cache, never crash
+                log.warning("auto-warm failed (%s); serving from cache as-is", exc)
+    return load_book(book_path, cache, online=False)
+
+
 def _universe_path() -> Path:
     """The curated ETF universe `discover_gaps` reads. ``ASSET_UNIVERSE`` overrides the
     default ``data/universe.csv`` (mirrors the CLI's override)."""
@@ -155,7 +240,7 @@ def _build(*, no_risk: bool, today: date) -> _Build:
     (one clock per request) and threaded through."""
     cache = _cache_dir()
     book_path = _env_book()
-    events, state = load_book(book_path, cache, online=False)
+    events, state = _load_offline(book_path, cache)
     run: dict[str, Any] = {
         "status": "ok", "n_prices_fetched": 0, "n_prices_missing": 0,
         "n_series_fetched": 0, "n_series_missing": 0, "fallbacks_used": 0,
@@ -355,6 +440,50 @@ class CandidateVerdict(BaseModel):
     note: str = _OFFLINE_NOTE
 
 
+class AllocationWeight(BaseModel):
+    ticker: str
+    weight: float = Field(description="target portfolio weight, 0..1")
+
+
+class BenchmarkVerdict(BaseModel):
+    reference: str = Field(description="the canonical reference compared against (e.g. 60-40)")
+    # backtest.BenchmarkVerdict (imported as BenchmarkWord — the pydantic class owns the name) is
+    # the single source of the verdict vocabulary: pydantic rejects an off-set value, the JSON
+    # schema enumerates the options, and a new word (e.g. an A1 Ulcer verdict) can't silently drift.
+    verdict: BenchmarkWord = Field(
+        description='"shallower" | "deeper" | "inconclusive" | "insufficient" — where the '
+        'preset\'s held-out drawdown lands vs the reference. NEVER "beats"; usually '
+        '"inconclusive" on a short history.'
+    )
+    reason: str
+    oos_dd_diff_low: float | None = Field(
+        None, description="95% CI low of (preset − reference) out-of-sample max-drawdown depth"
+    )
+    oos_dd_diff_high: float | None = None
+
+
+class ProposedAllocation(BaseModel):
+    asof: date
+    preset: str = Field(description="conservative | moderate | aggressive")
+    weights: list[AllocationWeight]
+    benchmark: str | None = Field(
+        None, description="reference requested for validation, or null when skipped"
+    )
+    verdict: BenchmarkVerdict | None = Field(
+        None,
+        description="walk-forward held-out drawdown comparison; null when the reference "
+        "history isn't cached (see validation_note) or validation was skipped",
+    )
+    validation_note: str
+    unpriced_holdings: list[str] = Field(
+        default_factory=list,
+        description="held tickers with no cached price — the target was built over the "
+        "priced subset, so a role's fund may differ from your actual dominant holding; "
+        "warm the cache for the full picture",
+    )
+    note: str = _OFFLINE_NOTE
+
+
 # ── serialization helpers ────────────────────────────────────────────────────
 
 
@@ -447,11 +576,11 @@ def risk_report() -> RiskReport:
     b = _build(no_risk=False, today=today)
     rk = b.risk
     if rk is None:
-        raise ValueError(
-            "risk metrics need cached daily price history, which isn't available offline. "
-            "Warm the cache by running the brief online once "
-            "(uv run python -m app --book <your-book>), then retry."
-        )
+        raise ValueError(_cold_error(
+            "risk metrics need cached daily price history. The cache looks cold and the "
+            "auto-warm is off or failed — warm it once with "
+            "`uv run python -m app --book <your-book> --warm`, then retry."
+        ))
     dd = rk.drawdown
     ddd = b.dollar_dd
     return RiskReport(
@@ -513,9 +642,12 @@ def rebalance_check(mode: str = "to_total") -> RebalancePlan:
         # confidently-wrong trades. Refuse with an explanation, never fabricate.
         return RebalancePlan(
             asof=today, mode=mode, suggestions=[], unpriced=unpriced,
-            note="Can't size a rebalance offline: held tickers lack a cached price "
-            f"({', '.join(unpriced_held)}) — the plan would be over a partial book. "
-            "Warm the cache (run the brief online), then retry.",
+            note=_cold_error(
+                "Can't size a rebalance offline: held tickers lack a cached price "
+                f"({', '.join(unpriced_held)}) — the plan would be over a partial book. "
+                "Warm the cache once with `uv run python -m app --book <your-book> --warm`, "
+                "then retry."
+            ),
         )
     held_value = {tk: held[tk].shares * price_per_share[tk] for tk in held}
     sugg = suggest(cast("Mode", mode), held_value, price_per_share, target)
@@ -540,7 +672,7 @@ def securities_facts() -> SecuritiesFacts:
     today = date.today()
     cache = _cache_dir()
     book_path = _env_book()
-    _events, state = load_book(book_path, cache, online=False)
+    _events, state = _load_offline(book_path, cache)
     held = sorted(state.held())
     meta = fetch_metadata(held, cache_dir=cache, online=False)
     facts = [
@@ -571,10 +703,11 @@ def discover_gaps() -> DiscoveryGaps:
     today = date.today()
     b = _build(no_risk=True, today=today)
     if not b.prices:
-        raise ValueError(
+        raise ValueError(_cold_error(
             "discovery needs your holdings priced from the cache, which is empty offline. "
-            "Warm the cache (run the brief online once), then retry."
-        )
+            "Warm the cache once with `uv run python -m app --book <your-book> --warm full` "
+            "(`full` also fetches the discovery universe), then retry."
+        ))
     universe = load_universe(_universe_path())
     if not universe:
         raise ValueError(f"the curated universe is empty or missing at {_universe_path()}.")
@@ -599,8 +732,8 @@ def discover_gaps() -> DiscoveryGaps:
     description="Judge a NEW ticker against the user's book (offline, read-only, propose-only): "
     "cost, liquidity, age, concentration, overlap with what they hold, and whether it diversified "
     "their past drawdowns — each with a reason and the figures behind it. Use to answer 'is "
-    "TICKER a good fit'. Needs TICKER's price history in the cache; if it isn't there, returns "
-    "an N/A verdict with how to warm it. Never a buy recommendation or a return forecast.",
+    "TICKER a good fit'. Fetches TICKER's price history on demand if it isn't cached (unless "
+    "ASSET_MCP_OFFLINE is set). Never a buy recommendation or a return forecast.",
 )
 def screen_candidate(ticker: str) -> CandidateVerdict:
     today = date.today()
@@ -614,25 +747,36 @@ def screen_candidate(ticker: str) -> CandidateVerdict:
         raise ValueError(f"{ticker!r} is not a valid ticker symbol.")
     b = _build(no_risk=False, today=today)
     if b.daily is None or b.daily.empty:
-        raise ValueError(
+        raise ValueError(_cold_error(
             "screening compares against your portfolio's return series, which needs a warm "
-            "price cache. Run the brief online once, then retry."
-        )
+            "price cache. Warm it once with `uv run python -m app --book <your-book> --warm`, "
+            "then retry."
+        ))
     cache = _cache_dir()
     start = b.daily.index[0].date()
-    cand_series = fetch_series([tk], start, today, cache_dir=cache, online=False)
+    # Fetch the candidate on demand (it's the one ticker the user asked about) unless the
+    # server is locked strictly offline — then stay cache-only. The held set already comes
+    # from the warmed book; only the candidate's own series/metadata may need the network.
+    online = not _offline_locked()
+    cand_series = fetch_series([tk], start, today, cache_dir=cache, online=online)
     if tk not in cand_series.rows:
-        return CandidateVerdict(
-            ticker=tk, verdict="N/A", checks=[],
-            note=f"{tk} isn't in your price cache. Warm it once online — "
-            f"`uv run python -m app --book <your-book> --screen {tk}` — then ask again.",
+        note = (
+            f"Couldn't fetch price history for {tk} — check the symbol "
+            "(it may be delisted or temporarily unavailable)."
+            if online
+            else f"{tk} isn't cached and the server is strictly offline (ASSET_MCP_OFFLINE). "
+            f"Warm it once — `uv run python -m app --book <your-book> --screen {tk}` "
+            "(or `--warm full`) — then ask again."
         )
+        return CandidateVerdict(ticker=tk, verdict="N/A", checks=[], note=note)
     held = set(b.state.held())
-    meta = fetch_metadata(sorted({tk} | held), cache_dir=cache, online=False)
-    held_meta = {t: m for t, m in meta.rows.items() if t in held}
-    cand_meta = {t: m for t, m in meta.rows.items() if t == tk}
+    # Held facts stay cache-only (already warmed); only the candidate may need the network, so an
+    # on-demand fetch doesn't fan out across every holding (the held/candidate online split).
+    cand_meta, held_facts, _ = candidate_and_held_facts(
+        [tk], held, cache, online_candidate=online, online_held=False,
+    )
     results = screen_candidates(
-        [tk], cand_series.rows, b.daily, cand_meta, held_meta, held, asof=today, role=None
+        [tk], cand_series.rows, b.daily, cand_meta, held_facts, held, asof=today, role=None
     )
     r = results[0]
     checks = [
@@ -644,6 +788,105 @@ def screen_candidate(ticker: str) -> CandidateVerdict:
         for c in r.checks
     ]
     return CandidateVerdict(ticker=tk, verdict=r.verdict.upper(), checks=checks)
+
+
+
+
+def _benchmark_verdict(
+    target: dict[str, float], benchmark: str, today: date, cache: Path
+) -> tuple[BenchmarkVerdict | None, str]:
+    """Validate a proposed target against a canonical reference over their common history.
+    The proposed target includes universe-fill tickers outside the core warm set (held ∪ refs);
+    fetch any cold ones on demand (same `ASSET_MCP_OFFLINE` gate as `screen_candidate`) so the
+    verdict judges the FULL target — never a renormalized subset. The verdict is drawdown-first
+    and held-out, never 'beats'."""
+    if benchmark == "none":
+        return None, "Validation skipped (benchmark='none')."
+    ref_weights = benchmark_weights(benchmark)
+    tickers = sorted(set(target) | set(ref_weights))
+    start = today - timedelta(days=HISTORY_DAYS)
+    online = not _offline_locked()
+    series = fetch_series(tickers, start, today, cache_dir=cache, online=online)
+    result = benchmark_compare(
+        series.rows, target, ref_weights, reference=benchmark, provenance=series.provenance,
+    )
+    warm_hint = (
+        ". Warm it once with `uv run python -m app --book <your-book> --warm full` "
+        "(covers both the references and the universe defaults), then ask again."
+    )
+    if result is None:
+        cold = sorted(set(tickers) - set(series.rows))
+        return None, (
+            f"Couldn't validate vs {benchmark} — the common price history isn't available"
+            + (f" (missing {', '.join(cold)})" if cold else "")
+            + warm_hint
+        )
+    # Honesty guard: any still-cold ticker (server locked offline, or an unfetchable symbol)
+    # means benchmark_compare renormalized that leg down to its priced subset — the verdict
+    # would then describe a different portfolio than the weights shown. Null it rather than
+    # mislead (mirrors backtest's own "refusing to judge a renormalized target").
+    if result.missing:
+        return None, (
+            f"Couldn't validate vs {benchmark} — these tickers aren't priced "
+            f"({', '.join(result.missing)}), so the comparison would judge a renormalized "
+            "portfolio rather than the proposed weights" + warm_hint
+        )
+    lo, hi = result.dd_diff_ci
+    # benchmark_compare returns (0.0, 0.0) as a PLACEHOLDER when no paired bootstrap ran
+    # (the inconclusive / insufficient verdicts) — surfacing it as a real CI would read as
+    # "the difference is exactly zero", so null it unless it's a measured interval (mirrors
+    # backtest's own `if ci != (0.0, 0.0)` guard).
+    has_ci = (lo, hi) != (0.0, 0.0) and math.isfinite(lo) and math.isfinite(hi)
+    verdict = BenchmarkVerdict(
+        reference=benchmark, verdict=result.verdict, reason=result.reason,
+        oos_dd_diff_low=lo if has_ci else None,
+        oos_dd_diff_high=hi if has_ci else None,
+    )
+    return verdict, f"Walk-forward held-out drawdown comparison vs {benchmark}."
+
+
+@mcp.tool(
+    annotations=_READ_ONLY,
+    description="Propose a strategic target allocation for a risk posture (conservative / "
+    "moderate / aggressive) over the user's book + the curated universe, and validate it "
+    "against a canonical reference (60-40 / all-weather / permanent) with a walk-forward "
+    "held-out drawdown verdict. Use to answer 'what should a moderate portfolio look like for "
+    "me, and is it sound'. Propose-only: never trades, never a recommendation or return "
+    "forecast — every weight comes from the deterministic core. The weights are always "
+    "returned; the verdict needs the reference tickers cached, else it's null with a warm note. "
+    "Pass benchmark='none' to skip validation.",
+)
+def propose_allocation(preset: str = "moderate", benchmark: str = "60-40") -> ProposedAllocation:
+    today = date.today()
+    pset = preset.strip().lower()
+    if pset not in PRESETS:
+        raise ValueError(f"unknown preset {preset!r}; valid: {sorted(PRESETS)}.")
+    bench = benchmark.strip().lower()
+    if bench != "none" and bench not in BENCHMARKS:
+        raise ValueError(f"unknown benchmark {benchmark!r}; valid: {sorted(BENCHMARKS)} or 'none'.")
+    b = _build(no_risk=True, today=today)
+    if not b.prices:
+        raise ValueError(_cold_error(
+            "proposing an allocation needs your holdings priced from the cache, which is empty. "
+            "Warm it once with `uv run python -m app --book <your-book> --warm`, then retry."
+        ))
+    universe = load_universe(_universe_path())
+    if not universe:
+        raise ValueError(f"the curated universe is empty or missing at {_universe_path()}.")
+    target = build_preset_target(pset, universe, held_market_value(b.state, b.prices))
+    if not target:
+        raise ValueError(f"couldn't build a {pset} target from your book + the universe.")
+    weights = [
+        AllocationWeight(ticker=tk, weight=w)
+        for tk, w in sorted(target.items(), key=lambda kv: (-kv[1], kv[0]))
+    ]
+    verdict, validation_note = _benchmark_verdict(target, bench, today, _cache_dir())
+    return ProposedAllocation(
+        asof=today, preset=pset, weights=weights,
+        benchmark=None if bench == "none" else bench,
+        verdict=verdict, validation_note=validation_note,
+        unpriced_holdings=sorted(b.missing),
+    )
 
 
 def run() -> None:

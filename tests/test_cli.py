@@ -59,6 +59,8 @@ def _hermetic_env_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ASSET_BOOK", "")
     monkeypatch.setenv("ASSET_CSV", "")
     monkeypatch.setenv("ASSET_TARGET", "")
+    monkeypatch.setenv("ASSET_UNIVERSE", "")  # --warm full reads it; pin so a real .env can't leak
+    monkeypatch.setenv("ASSET_CACHE_DIR", "")  # --cache-dir falls back to it; pin so .env can't leak
 
 
 def _today() -> str:
@@ -393,7 +395,7 @@ def test_screen_panel_renders_with_verdicts(
         }
         return MetadataResult(rows=rows)
 
-    monkeypatch.setattr("app.cli.fetch_metadata", fake_meta)
+    monkeypatch.setattr("app.pipeline.fetch_metadata", fake_meta)
     with caplog.at_level(logging.INFO):
         rc = main(["--csv", str(SAMPLE), "--screen", "QQQM"])
     out = capsys.readouterr().out
@@ -417,7 +419,7 @@ def test_screen_with_target_adds_role_row(
 
     monkeypatch.setattr("app.cli.fetch_series", _flat_series)
     monkeypatch.setattr("app.pipeline.price_basis_mismatches", lambda *a, **k: [])
-    monkeypatch.setattr("app.cli.fetch_metadata", lambda tickers, **k: MetadataResult())
+    monkeypatch.setattr("app.pipeline.fetch_metadata", lambda tickers, **k: MetadataResult())
     with caplog.at_level(logging.INFO):
         rc = main(["--csv", str(SAMPLE), "--screen", "QQQM", "--target", str(TARGET)])
     out = capsys.readouterr().out
@@ -497,7 +499,7 @@ def test_discover_panel_renders(
     monkeypatch.setattr("app.cli.fetch_series", _flat_series)
     monkeypatch.setattr("app.pipeline.price_basis_mismatches", lambda *a, **k: [])
     monkeypatch.setattr(
-        "app.cli.fetch_metadata",
+        "app.pipeline.fetch_metadata",
         lambda tickers, **k: MetadataResult(
             rows={
                 tk: SecurityMeta(
@@ -542,7 +544,7 @@ def test_discover_with_target_runs_the_role_check(
     monkeypatch.setattr("app.cli.fetch_series", _flat_series)
     monkeypatch.setattr("app.pipeline.price_basis_mismatches", lambda *a, **k: [])
     monkeypatch.setattr(
-        "app.cli.fetch_metadata",
+        "app.pipeline.fetch_metadata",
         lambda tickers, **k: MetadataResult(
             rows={
                 tk: SecurityMeta(
@@ -597,7 +599,10 @@ def test_metadata_not_double_fetched_with_screen(monkeypatch: pytest.MonkeyPatch
             }
         )
 
+    # The --metadata handler fetches held via app.cli; the screen's candidate fetch goes through
+    # pipeline — patch both with the one counter so reuse (no held re-fetch) is provable + hermetic.
     monkeypatch.setattr("app.cli.fetch_metadata", counting_meta)
+    monkeypatch.setattr("app.pipeline.fetch_metadata", counting_meta)
     rc = main(["--csv", str(SAMPLE), "--metadata", "--screen", "QQQM"])
     assert rc == 0
     assert any("VOO" in c for c in calls)              # held facts were fetched
@@ -627,7 +632,7 @@ def test_discover_narrate_leads_the_panel(
     monkeypatch.setattr("app.cli.fetch_series", _flat_series)
     monkeypatch.setattr("app.pipeline.price_basis_mismatches", lambda *a, **k: [])
     monkeypatch.setattr(
-        "app.cli.fetch_metadata",
+        "app.pipeline.fetch_metadata",
         lambda tickers, **k: MetadataResult(
             rows={
                 tk: SecurityMeta(
@@ -1536,7 +1541,7 @@ def test_allocate_benchmark_handoff_is_preset_and_output_gated(
 
 
 def test_resolve_role_tickers_prefers_a_held_fund_then_the_universe_default() -> None:
-    from app.cli import _resolve_role_tickers
+    from app.allocate import _resolve_role_tickers  # moved here from cli (shared by mcp too)
     from app.universe import Candidate
 
     universe = [
@@ -1589,3 +1594,148 @@ def test_backtest_benchmark_compares_target_vs_reference(
     assert "BENCHMARK (preset vs 60-40" in out      # the comparison panel, not BACKTEST
     assert "Walk-forward (held-out):" in out         # the held-out verdict row
     assert "vs 60-40:" in _run_summary(caplog)["backtest"]
+
+
+# ── --warm (offline-cache onboarding) ────────────────────────────────────────
+
+_REFS = {"VOO", "BND", "VTI", "TLT", "IEI", "GLD", "DBC", "BIL"}
+
+
+def _record_warm_fetchers(monkeypatch: pytest.MonkeyPatch) -> dict[str, set[str]]:
+    """Mock the pipeline fetch adapters `warm_cache` calls; record which tickers each is
+    asked for (never the network). Overrides the autouse no-network fixture for this run."""
+    from app.metadata import MetadataResult
+
+    seen: dict[str, set[str]] = {}
+
+    def series(tickers: object, start: object, end: object, **k: object) -> SeriesResult:
+        seen["series"] = set(tickers)  # type: ignore[arg-type]
+        return SeriesResult()
+
+    def latest(tickers: object, **k: object) -> PricesResult:
+        seen["latest"] = set(tickers)  # type: ignore[arg-type]
+        return PricesResult()
+
+    def splits(tickers: object, **k: object) -> dict[str, list[object]]:
+        seen["splits"] = set(tickers)  # type: ignore[arg-type]
+        return {}
+
+    def meta(tickers: object, **k: object) -> "MetadataResult":
+        seen["meta"] = set(tickers)  # type: ignore[arg-type]
+        return MetadataResult()
+
+    monkeypatch.setattr("app.pipeline.fetch_series", series)
+    monkeypatch.setattr("app.pipeline.fetch_latest", latest)
+    monkeypatch.setattr("app.pipeline.fetch_splits", splits)
+    monkeypatch.setattr("app.pipeline.fetch_metadata", meta)
+    return seen
+
+
+def test_warm_core_fetches_book_and_refs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    seen = _record_warm_fetchers(monkeypatch)
+    with caplog.at_level(logging.INFO):
+        rc = main(["--book", str(SAMPLE), "--warm", "--cache-dir", str(tmp_path)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert seen["series"] == {"VOO", "BND", "VEA", "IAU"} | _REFS  # book ∪ refs
+    assert seen["latest"] == {"VOO", "BND", "VEA", "IAU"}          # book only, refs excluded
+    assert "Warmed the offline cache (core)" in out
+    assert _run_summary(caplog)["warm"].startswith("core:")
+
+
+def test_warm_full_adds_the_universe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen = _record_warm_fetchers(monkeypatch)
+    rc = main(["--book", str(SAMPLE), "--warm", "full", "--cache-dir", str(tmp_path)])
+    assert rc == 0
+    assert {"VOO", "BND", "VEA", "IAU"} | _REFS <= seen["series"]
+    assert "QQQM" in seen["series"] and "SCHD" in seen["series"]  # real universe tickers landed
+    assert len(seen["series"]) > 100
+
+
+def test_warm_without_a_book_warms_refs_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    seen = _record_warm_fetchers(monkeypatch)
+    rc = main(["--warm", "--cache-dir", str(tmp_path)])  # ASSET_BOOK pinned "" by the fixture
+    capsys.readouterr()
+    assert rc == 0
+    assert seen["series"] == _REFS         # just the references
+    assert set(seen) == {"series"}         # no book → no latest/splits/metadata fetch at all
+
+
+def test_warm_rejects_offline(monkeypatch: pytest.MonkeyPatch) -> None:
+    _record_warm_fetchers(monkeypatch)
+    with pytest.raises(SystemExit):  # parser.error → SystemExit(2)
+        main(["--book", str(SAMPLE), "--warm", "--offline"])
+
+
+def _record_warm_cache_dir(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
+    """Record the cache_dir the warm fetch was handed (never the network)."""
+    from app.metadata import MetadataResult
+
+    seen: dict[str, object] = {}
+
+    def series(tickers: object, start: object, end: object, **k: object) -> SeriesResult:
+        seen["cache_dir"] = k.get("cache_dir")
+        return SeriesResult()
+
+    monkeypatch.setattr("app.pipeline.fetch_series", series)
+    monkeypatch.setattr("app.pipeline.fetch_latest", lambda *a, **k: PricesResult())
+    monkeypatch.setattr("app.pipeline.fetch_splits", lambda *a, **k: {})
+    monkeypatch.setattr("app.pipeline.fetch_metadata", lambda *a, **k: MetadataResult())
+    return seen
+
+
+def test_warm_nonzero_when_the_whole_book_fails_even_if_refs_succeed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    # The refs are liquid and usually cache; the book is the point of warming. If every book
+    # ticker fails to price (delisted / partial outage) while refs succeed, --warm must surface a
+    # non-zero exit and an honest message — not a false "Warmed the offline cache".
+    from app.metadata import MetadataResult
+
+    book = {"VOO", "BND", "VEA", "IAU"}  # SAMPLE's holdings
+
+    def series(tickers: object, start: object, end: object, **k: object) -> SeriesResult:
+        miss = [t for t in tickers if t in book]  # the whole book comes back unpriced; refs land
+        return SeriesResult(missing=miss)
+
+    monkeypatch.setattr("app.pipeline.fetch_series", series)
+    monkeypatch.setattr("app.pipeline.fetch_latest", lambda *a, **k: PricesResult())
+    monkeypatch.setattr("app.pipeline.fetch_splits", lambda *a, **k: {})
+    monkeypatch.setattr("app.pipeline.fetch_metadata", lambda *a, **k: MetadataResult())
+    rc = main(["--book", str(SAMPLE), "--warm", "--cache-dir", str(tmp_path)])
+    out = capsys.readouterr().out
+    assert rc == 2                                   # not a false success
+    assert "warm failed" in out.lower() and "could be priced" in out.lower()
+    assert "Warmed the offline cache" not in out     # the success headline is suppressed
+
+
+def test_cache_dir_falls_back_to_asset_cache_dir_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    # No --cache-dir → honor ASSET_CACHE_DIR, so a CLI `--warm` and the MCP server (which reads
+    # the same var) share ONE cache instead of silently warming different directories.
+    monkeypatch.setenv("ASSET_CACHE_DIR", str(tmp_path))
+    seen = _record_warm_cache_dir(monkeypatch)
+    rc = main(["--book", str(SAMPLE), "--warm"])
+    capsys.readouterr()
+    assert rc == 0
+    assert seen["cache_dir"] == tmp_path  # not the data/prices default
+
+
+def test_explicit_cache_dir_wins_over_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    explicit = tmp_path / "explicit"
+    monkeypatch.setenv("ASSET_CACHE_DIR", str(tmp_path / "env"))
+    seen = _record_warm_cache_dir(monkeypatch)
+    rc = main(["--book", str(SAMPLE), "--warm", "--cache-dir", str(explicit)])
+    capsys.readouterr()
+    assert rc == 0
+    assert seen["cache_dir"] == explicit  # an explicit flag still beats the env var

@@ -1,6 +1,6 @@
 [project]
 name = "asset-management"
-version = "2.5.0"
+version = "2.6.0"
 description = "Personal asset-management tool: transaction-log holdings, drawdown-first reporting with confidence bands, multi-source price provenance."
 requires-python = ">=3.12,<3.13"
 dependencies = [

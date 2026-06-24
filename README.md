@@ -23,6 +23,8 @@ uv run python -m app --book path/to/your.csv  # your own book: holdings + return
 uv run python -m app --book your.csv --no-risk    # skip the holdings drawdown/risk panel (a --backtest still shows its own)
 uv run python -m app --book your.csv --no-prices  # holdings + realized P&L only (no network)
 uv run python -m app --book your.csv --offline    # serve from on-disk cache; no network (latest falls back to the series cache)
+uv run python -m app --book your.csv --warm        # ONE-TIME after clone: fill the offline cache (your tickers + benchmark refs), then --offline / the MCP server work
+uv run python -m app --book your.csv --warm full   # also fetch the ~375-ETF discovery universe (slow) so --discover / discover_gaps work offline
 uv run python -m app --book your.csv --cache-dir /some/dir   # override the default cache location
 uv run python -m app --book your.csv --save       # also write reports/<asof>.md (markdown)
 uv run python -m app --book your.csv --send       # also email the brief as HTML via Resend
@@ -158,11 +160,15 @@ Confidence bands come from a moving-block bootstrap. Drawdown is *investment* (t
 
 ## MCP server (read-only, for AI assistants)
 
-Expose your portfolio to an AI assistant (Claude Desktop, Claude Code, …) as **read-only tools** it can call — so you can "chat with your portfolio" while every number still comes from the validated core, not the model. The server is **local, offline, and read-only**: it serves from the on-disk cache (no network), exposes **no write tools**, and is bound to your `ASSET_BOOK` book (it takes no file paths). Three tools:
+Expose your portfolio to an AI assistant (Claude Desktop, Claude Code, …) as **read-only tools** it can call — so you can "chat with your portfolio" while every number still comes from the validated core, not the model. The server is **read-only and offline** — **no write tools**, bound to your `ASSET_BOOK` book (no file-path args), serving from the on-disk cache. The one bounded exception to no-egress: a **cold cache auto-warms the core set once** (your tickers + benchmark refs, ~30–60s) so an addon user who never runs the CLI still gets real numbers; set `ASSET_MCP_OFFLINE=1` (in `.env`) to keep it strictly airtight for an *already-warmed* cache (pointed at a cold cache it just degrades to `n/a`, and a missing candidate isn't fetched). Seven tools:
 
 - **`portfolio_summary`** — holdings, P&L, and annualized returns.
 - **`risk_report`** — drawdown-first risk: max drawdown (depth/dates/recovery), Ulcer, CDaR, Sharpe/Sortino/Calmar, all with bootstrap confidence intervals.
 - **`rebalance_check`** — buy/sell/hold suggestions toward your `ASSET_TARGET` (it suggests, never trades; refuses to size over a partially-cached book).
+- **`securities_facts`** — published fund facts per holding (expense ratio, AUM, volume, age, category).
+- **`discover_gaps`** — suggest NEW ETFs for the roles you hold ≤3% of (propose-only; needs `--warm full`).
+- **`screen_candidate`** — judge a NEW candidate ticker against your book (diversifier/cost/liquidity/age/overlap, each with a reason); fetches the ticker on demand if it isn't cached (unless `ASSET_MCP_OFFLINE`).
+- **`propose_allocation`** — a strategic target for a posture (`conservative`/`moderate`/`aggressive`) over your book + the universe, validated against a reference (`60-40`/`all-weather`/`permanent`) with a walk-forward held-out drawdown verdict — propose-only, numbers from the core, never a recommendation.
 
 Run it directly, or register it with Claude Code:
 
@@ -171,7 +177,7 @@ uv run python -m app.mcp_server                                    # serve over 
 claude mcp add asset-management -- uv run python -m app.mcp_server  # register, then /mcp to use it
 ```
 
-Warm the cache first (run the brief online once) so the offline tools have prices. The server runs no LLM itself — an assistant calls it; this is not financial advice.
+On a fresh clone the cache is empty: the first cold tool call **auto-warms the core set once** (~30–60s), or warm it yourself with `uv run python -m app --book your.csv --warm` (add `full` to also enable offline discovery). The server runs no LLM itself — an assistant calls it; this is not financial advice.
 
 ## Narration (optional plain-language summary)
 
@@ -243,7 +249,7 @@ asset-management/
 │   ├── llm.py        optional narrator backend (OpenAI-compatible + Anthropic); fail-closed, opt-in
 │   ├── email.py      send the HTML brief via Resend (--send)
 │   ├── cli.py        argparse + entry composition + delivery routing + structured run log
-│   ├── mcp_server.py read-only stdio MCP server: 3 tools over the core (offline, no network)
+│   ├── mcp_server.py read-only stdio MCP server: 7 tools over the core (offline; one-time cold-call auto-warm, ASSET_MCP_OFFLINE=1 opts out)
 │   ├── universe.py   curated ETF universe loader (Candidate + roles); data/universe.csv, auto-built
 │   ├── discover.py   book → role gaps → top-by-AUM candidates for the screen (--discover, propose-only)
 │   ├── log_config.py logging setup

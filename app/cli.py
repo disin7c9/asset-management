@@ -20,7 +20,7 @@ from dotenv import load_dotenv
 
 from app.derive import DerivedState
 from app.email import send_report
-from app.events import CASH_TICKER, Event, load_target
+from app.events import CASH_TICKER, Event, load_events, load_target
 from app.log_config import setup_logging
 from app.metadata import MetadataResult, fetch_metadata
 from app.screen import CandidateScreen, screen_candidates
@@ -49,10 +49,13 @@ from app.universe import ROLES, Candidate, load_universe
 from app.returns import ReturnsSummary
 from app.risk import DollarDrawdown, RiskSummary
 from app.pipeline import (
+    HISTORY_DAYS,
+    candidate_and_held_facts,
     compute_prices_returns_risk,
     held_market_value,
     load_book,
     record_series_fetch,
+    warm_cache,
 )
 from app.allocate import (
     PRESETS,
@@ -60,8 +63,8 @@ from app.allocate import (
     UnvalidatedEdgeError,
     allocate,
     allocation_kind,
+    build_preset_target,
     needs_series,
-    preset_target,
 )
 from app.backtest import (
     BENCHMARKS,
@@ -118,8 +121,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--cache-dir",
         type=Path,
-        default=_DEFAULT_CACHE,
-        help=f"on-disk price cache directory (default: {_DEFAULT_CACHE})",
+        # Honor ASSET_CACHE_DIR (the MCP server reads the same var) so a CLI `--warm` and the
+        # addon share ONE cache — otherwise a user who sets ASSET_CACHE_DIR warms data/prices
+        # while the server reads elsewhere, and stays cold. Explicit --cache-dir still wins.
+        default=_env_path("ASSET_CACHE_DIR") or _DEFAULT_CACHE,
+        help=f"on-disk price cache directory (default: ASSET_CACHE_DIR in .env, else {_DEFAULT_CACHE})",
     )
     parser.add_argument(
         "--no-prices",
@@ -130,6 +136,16 @@ def main(argv: list[str] | None = None) -> int:
         "--offline",
         action="store_true",
         help="serve from cache only; do not reach the network on a cache miss",
+    )
+    parser.add_argument(
+        "--warm",
+        nargs="?",
+        const="core",
+        choices=("core", "full"),
+        default=None,
+        help="pre-fetch the offline cache once (after clone), then exit — so --offline runs "
+        "and the read-only MCP server work without the network. 'core' (default) = your book "
+        "+ the benchmark references; 'full' = + the ~375-ETF discovery universe (slow).",
     )
     parser.add_argument(
         "--no-risk",
@@ -368,7 +384,13 @@ def main(argv: list[str] | None = None) -> int:
         "discover": None,
         "discover_narrate": None,
         "benchmark_narrate": None,
+        "warm": None,
     }
+
+    # One-shot cache warm: pre-fetch online, then exit (an onboarding action, not a brief).
+    # Placed after .env resolution so a bare `--warm` still picks up ASSET_BOOK.
+    if args.warm is not None:
+        return _warm_cache(args, run, parser)
 
     # Nothing to do: no book and no notional backtest → guide, don't fabricate a brief.
     if args.book is None and not args.backtest:
@@ -758,6 +780,68 @@ def _print_proposed_allocation(
     sys.stdout.write("\n".join(lines) + "\n\n")
 
 
+def _warm_cache(
+    args: argparse.Namespace, run: dict[str, Any], parser: argparse.ArgumentParser
+) -> int:
+    """`--warm`: pre-fetch the offline cache online, then exit (a one-time onboarding step).
+
+    'core' warms your book tickers + the benchmark references; 'full' also warms the discovery
+    universe. Online by definition — refuses --offline/--no-prices. Idempotent (a fresh cache is
+    reused), so a re-run after a rate-limited 'full' fills only the gaps."""
+    if args.offline or args.no_prices:
+        parser.error(
+            "--warm fetches prices online; it can't be combined with --offline/--no-prices"
+        )
+    book_tickers: list[str] = []
+    if args.book is not None:
+        if not args.book.exists():
+            log.error("transaction file not found: %s", args.book)
+            run["status"] = "error"
+            run["error"] = "book_not_found"
+            _log_run_summary(run)
+            return 2
+        book_tickers = sorted(
+            {ev.ticker for ev in load_events(args.book) if ev.ticker != CASH_TICKER}
+        )
+    extra: list[str] = []
+    scope = args.warm
+    if args.warm == "full":
+        universe = _load_universe("warm", run)
+        if universe is not None:
+            extra = [c.ticker for c in universe]
+        else:  # universe failed to load (already logged) → degrade honestly, don't claim 'full'
+            scope = "core (full requested; universe unavailable)"
+
+    counts = warm_cache(book_tickers, args.cache_dir, extra_tickers=extra, online=True)
+    run["warm"] = f"{scope}: {counts['tickers']} tickers, {counts['series_missing']} missing"
+    # Success hinges on YOUR holdings when a book was warmed: the benchmark refs are liquid and
+    # almost always land, so "got something" isn't "got your book". A refs-only warm (no book)
+    # falls back to "did anything land". A book wholly unpriced → a non-zero, honest failure.
+    book_total, book_missing = counts["book_total"], counts["book_missing"]
+    if book_total:
+        warmed = book_missing < book_total
+    else:
+        warmed = not (counts["tickers"] and counts["series_missing"] == counts["tickers"])
+    if not warmed:
+        n, what = (book_total, "holdings") if book_total else (counts["tickers"], "tickers")
+        sys.stdout.write(
+            f"Warm failed ({scope}): none of your {n} {what} could be priced — "
+            "check your network/symbols and retry.\n"
+        )
+        run["status"] = "error"
+        _log_run_summary(run)
+        return 2
+    holdings_note = f" ({book_missing} of your holdings)" if book_missing else ""
+    sys.stdout.write(
+        f"Warmed the offline cache ({scope}): {counts['tickers']} tickers fetched, "
+        f"{counts['series_missing']} price-history misses{holdings_note}, "
+        f"{counts['meta_missing']} metadata misses.\n"
+        "Your --offline runs and the read-only MCP server can now serve from the cache.\n"
+    )
+    _log_run_summary(run)
+    return 0
+
+
 def _load_universe(status_key: str, run: dict[str, Any]) -> list[Candidate] | None:
     """Load the curated universe — `ASSET_UNIVERSE` overrides (like `ASSET_BOOK`), else the
     bundled `data/universe.csv`. On failure: log, set ``run[status_key]``, return None.
@@ -772,36 +856,6 @@ def _load_universe(status_key: str, run: dict[str, Any]) -> list[Candidate] | No
         log.error("cannot load the universe (%s): %s", universe_path, exc)
         run[status_key] = "skipped: universe unavailable"
         return None
-
-
-def _resolve_role_tickers(
-    universe: list[Candidate], held_values: dict[str, float]
-) -> dict[str, str]:
-    """For each universe role, the ticker that fills it in a preset target: the holder's
-    LARGEST fund in that role (the dominant holding wins), else the universe default (the
-    top-AUM candidate — first in the AUM-ordered file). A held fund whose role the presets
-    zero-weight (e.g. thematic) still maps here; `preset_target` drops it, so a to_total
-    rebalance surfaces it as a sell."""
-    # One pass over the universe: a ticker→role index (to map the holder's funds) and
-    # each role's top-AUM default (first seen — the file is AUM-ordered within a role).
-    role_of: dict[str, str] = {}
-    default_for: dict[str, str] = {}
-    for c in universe:
-        role_of[c.ticker] = c.role
-        default_for.setdefault(c.role, c.ticker)
-    # The holder's LARGEST fund wins its role (ticker breaks an exact-value tie, so the
-    # result is independent of book/row order); a role with no held fund takes the default.
-    held_in_role: dict[str, str] = {}
-    for tk in sorted(held_values, key=lambda t: (-held_values[t], t)):
-        role = role_of.get(tk)
-        if role is not None:
-            held_in_role.setdefault(role, tk)
-    role_tickers: dict[str, str] = {}
-    for role in ROLES:
-        ticker = held_in_role.get(role) or default_for.get(role)
-        if ticker is not None:
-            role_tickers[role] = ticker
-    return role_tickers
 
 
 def _compute_allocation(
@@ -849,9 +903,8 @@ def _compute_allocation(
         universe = _load_universe("allocate", run)
         if universe is None:
             return
-        role_tickers = _resolve_role_tickers(universe, values)
         try:
-            target = preset_target(rule, role_tickers, cap=args.allocate_cap)
+            target = build_preset_target(rule, universe, values, cap=args.allocate_cap)
         except ValueError as exc:  # infeasible --allocate-cap (cap * n < 1)
             log.error("--allocate-cap: %s", exc)
             run["allocate"] = "skipped: bad cap"
@@ -956,20 +1009,14 @@ def _screen_tickers(
     record_series_fetch(run, cand_series)
     held = set(state.held())
     tickers_set = set(tickers)
-    # Candidate facts always; held facts reuse the run's --metadata fetch when present (so
-    # the held set isn't re-fetched), else fetch them here. The overlap check compares the
-    # candidate's look-through holdings against the held funds'.
-    cand_res = fetch_metadata(sorted(tickers_set), cache_dir=args.cache_dir, online=online)
-    if held_meta is not None:
-        held_facts = {tk: m for tk, m in held_meta.rows.items() if tk in held}
-        meta_missing = cand_res.missing
-    else:
-        held_res = fetch_metadata(sorted(held), cache_dir=args.cache_dir, online=online)
-        held_facts = held_res.rows
-        meta_missing = [*cand_res.missing, *held_res.missing]
+    # Candidate facts + held facts (held reuses the run's --metadata fetch when present, so the
+    # held set isn't re-fetched); the overlap check compares look-through holdings against held.
+    cand_meta, held_facts, meta_missing = candidate_and_held_facts(
+        tickers_set, held, args.cache_dir,
+        online_candidate=online, online_held=online, held_meta=held_meta,
+    )
     if meta_missing and run["status"] == "ok":
         run["status"] = "partial"
-    cand_meta = {tk: m for tk, m in cand_res.rows.items() if tk in tickers_set}
 
     role: dict[str, RoleCheck] | None = None
     if with_role and args.target is not None:
@@ -1057,7 +1104,7 @@ def _load_target_series(
         log.error("--backtest: %s", exc)
         run["backtest"] = "skipped: bad target"
         return None
-    lookback = args.backtest_start or (today - timedelta(days=3653))  # ~10y of history
+    lookback = args.backtest_start or (today - timedelta(days=HISTORY_DAYS))  # ~10y of history
     series = fetch_series(
         sorted(set(target) | set(extra)), lookback, today,
         cache_dir=args.cache_dir, online=not args.offline,

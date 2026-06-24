@@ -12,22 +12,26 @@ one named market-data adapter, so it adds no new I/O concern, it just orchestrat
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta, timezone
+import time
+from collections.abc import Iterable
+from datetime import date, datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from datetime import date
     from pathlib import Path
 
     import pandas as pd
 
+from app.backtest import BENCHMARKS, benchmark_weights
 from app.corporate_actions import adjust_for_splits
 from app.derive import DerivedState, derive
 from app.events import CASH_TICKER, Event, load_events
+from app.metadata import MetadataResult, SecurityMeta, fetch_metadata
 from app.prices import (
     PriceRow,
     PricesResult,
     SeriesResult,
+    ensure_cache_dir,
     fetch_latest,
     fetch_series,
     fetch_splits,
@@ -82,6 +86,35 @@ def record_series_fetch(run: dict[str, Any], series: SeriesResult) -> None:
     run["fallbacks_used"] += series.fallbacks_used
     if series.missing and run["status"] == "ok":
         run["status"] = "partial"
+
+
+def candidate_and_held_facts(
+    candidates: Iterable[str],
+    held: set[str],
+    cache_dir: Path | None,
+    *,
+    online_candidate: bool,
+    online_held: bool,
+    held_meta: MetadataResult | None = None,
+) -> tuple[dict[str, SecurityMeta], dict[str, SecurityMeta], list[str]]:
+    """Fetch the per-security facts the overlap/structure screen needs, as
+    ``(candidate_facts, held_facts, missing)``. Candidate facts are always fetched (gated by
+    ``online_candidate``); held facts reuse a prior ``MetadataResult`` when given, else are
+    fetched (gated by ``online_held``). The split is the one shared by ``--screen``/``--discover``
+    and the MCP ``screen_candidate``: the CLI fetches both online, while the MCP on-demand path
+    fetches only the candidate online so the warmed held set stays cache-only — one new ticker
+    can't fan a network call out across every holding."""
+    cand_set = set(candidates)
+    cand_res = fetch_metadata(sorted(cand_set), cache_dir=cache_dir, online=online_candidate)
+    cand_facts = {tk: m for tk, m in cand_res.rows.items() if tk in cand_set}
+    if held_meta is not None:
+        held_facts = {tk: m for tk, m in held_meta.rows.items() if tk in held}
+        missing = list(cand_res.missing)
+    else:
+        held_res = fetch_metadata(sorted(held), cache_dir=cache_dir, online=online_held)
+        held_facts = dict(held_res.rows)
+        missing = [*cand_res.missing, *held_res.missing]
+    return cand_facts, held_facts, missing
 
 
 def held_market_value(
@@ -228,3 +261,82 @@ def compute_prices_returns_risk(
         events, mkt_value, asof_date=today, true_twr=true_twr, fully_priced=not missing
     )
     return prices, returns, risk, missing, twr_excluded, dollar_dd, series, daily
+
+
+# ── cache warming (shared by the CLI --warm flag and the MCP cold-call auto-warm) ──
+
+HISTORY_DAYS = 3653  # ~10y; the shared lookback so a warm covers the backtest/benchmark window
+_WARM_MARKER = ".warmed"  # touched after each warm; throttles the MCP cold-call re-warm
+_WARM_TTL_SECONDS = 6 * 3600  # re-attempt the cold-call warm at most ~4×/day
+
+
+def benchmark_ref_tickers() -> list[str]:
+    """The reference-portfolio tickers a benchmark validation needs priced (VOO, BND, …) —
+    the union of every canonical reference in `backtest.BENCHMARKS`."""
+    return sorted({tk for name in BENCHMARKS for tk in benchmark_weights(name)})
+
+
+def cache_is_cold(cache_dir: Path) -> bool:
+    """True when the offline cache hasn't been warmed within the TTL — the MCP cold-call
+    auto-warm signal. Keyed on the `.warmed` marker's age, NOT per-ticker file existence:
+    a book ticker that can never be fetched (delisted/typo) leaves no series file, so an
+    existence check would read 'cold' forever and re-warm online on EVERY call. The marker
+    makes warm one-time-per-TTL (a missing ref / cold metadata rides the same signal) and
+    self-heals each TTL. A pre-existing series cache with no marker reads cold once, then
+    the first warm stamps it."""
+    try:
+        age = time.time() - (cache_dir / _WARM_MARKER).stat().st_mtime
+    except OSError:
+        return True  # no marker yet → never warmed → cold
+    return age > _WARM_TTL_SECONDS
+
+
+def warm_cache(
+    book_tickers: Iterable[str],
+    cache_dir: Path | None,
+    *,
+    extra_tickers: Iterable[str] = (),
+    online: bool = True,
+) -> dict[str, int]:
+    """Pre-fetch the offline cache so the brief / backtest / MCP tools work without network.
+
+    Always warms the book tickers + the benchmark references (the 'core' set). `extra_tickers`
+    (the ~375-ETF universe, for `--warm full`) is layered on for offline discovery. Fetches
+    ~10y of daily history for every ticker, plus latest + splits for the book (held positions
+    need a spot price) and metadata for book + extras (the securities / screen panels). Reuses
+    the named price/metadata adapters, so a fresh cache is left untouched — re-running fills
+    only the gaps. Returns counts including `book_total`/`book_missing` (YOUR holdings
+    specifically) so a caller can tell a book-wide failure from a stray reference miss."""
+    book = sorted({tk for tk in book_tickers if tk != CASH_TICKER})
+    extras = sorted({tk for tk in extra_tickers if tk != CASH_TICKER})
+    series_tickers = sorted(set(book) | set(benchmark_ref_tickers()) | set(extras))
+
+    today = date.today()
+    start = today - timedelta(days=HISTORY_DAYS)
+    series = fetch_series(series_tickers, start, today, cache_dir=cache_dir, online=online)
+    if book:  # held positions need a spot price + split history; refs/universe need only series
+        fetch_latest(book, cache_dir=cache_dir, online=online)
+        fetch_splits(book, cache_dir=cache_dir, online=online)
+    meta_tickers = sorted(set(book) | set(extras))  # refs are price-only, no metadata needed
+    meta = (
+        fetch_metadata(meta_tickers, cache_dir=cache_dir, online=online)
+        if meta_tickers
+        else None
+    )
+
+    cdir = ensure_cache_dir(cache_dir)
+    if cdir is not None:
+        (cdir / _WARM_MARKER).touch()  # record the attempt → throttles the cold-call re-warm
+
+    counts = {
+        "tickers": len(series_tickers),
+        "series_missing": len(series.missing),
+        "book_total": len(book),
+        "book_missing": len(set(book) & set(series.missing)),
+        "meta_missing": len(meta.missing) if meta is not None else 0,
+    }
+    log.info(
+        "warm_cache: %d tickers (%d series missing, %d metadata missing)",
+        counts["tickers"], counts["series_missing"], counts["meta_missing"],
+    )
+    return counts

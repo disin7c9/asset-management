@@ -21,6 +21,7 @@ from mcp.types import CallToolResult, ListToolsResult
 
 from app import prices as prices_mod
 from app.mcp_server import mcp
+from app.pipeline import _WARM_MARKER
 
 
 def _warm_series_cache(cache: Path, ticker: str, base: float, n: int = 320) -> None:
@@ -44,12 +45,16 @@ def _warm_series_cache(cache: Path, ticker: str, base: float, n: int = 320) -> N
 
 @pytest.fixture(autouse=True)
 def _hermetic_mcp_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    # The server reads ASSET_BOOK / ASSET_CSV / ASSET_TARGET from os.environ. Pin them to
-    # "" (treated as unset) so a developer's real .env can't leak a book into the suite —
-    # the original 14-failure class. Tests that need a value setenv a real one over this.
+    # The server reads ASSET_BOOK / ASSET_CSV / ASSET_TARGET / ASSET_MCP_OFFLINE from
+    # os.environ. Pin book vars to "" (treated as unset) so a developer's real .env can't
+    # leak into the suite — the original 14-failure class. ASSET_MCP_OFFLINE is pinned to
+    # "1" so the suite stays hermetic (the cold-cache auto-warm — ON in production — would
+    # otherwise reach the network); the auto-warm tests opt back in with setenv("").
     monkeypatch.setenv("ASSET_BOOK", "")
     monkeypatch.setenv("ASSET_CSV", "")
     monkeypatch.setenv("ASSET_TARGET", "")
+    monkeypatch.setenv("ASSET_UNIVERSE", "")  # propose_allocation/discover read it → bundled default
+    monkeypatch.setenv("ASSET_MCP_OFFLINE", "1")
 
 
 @pytest.fixture
@@ -65,6 +70,7 @@ def warm_book(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     cache.mkdir()
     _warm_series_cache(cache, "AAA", 100.0)
     _warm_series_cache(cache, "BBB", 50.0)
+    (cache / _WARM_MARKER).touch()  # a genuinely-warmed cache → cache_is_cold False
     monkeypatch.delenv("ASSET_CSV", raising=False)
     monkeypatch.setenv("ASSET_BOOK", str(csv))
     monkeypatch.setenv("ASSET_CACHE_DIR", str(cache))
@@ -267,7 +273,11 @@ def _canned_meta(monkeypatch: pytest.MonkeyPatch) -> None:
             }
         )
 
+    # securities_facts calls app.mcp_server.fetch_metadata directly; screen_candidate reaches
+    # metadata via app.pipeline.candidate_and_held_facts → app.pipeline.fetch_metadata. Patch
+    # BOTH so the canned facts actually drive every consumer (and nothing leaks to the network).
     monkeypatch.setattr("app.mcp_server.fetch_metadata", canned)
+    monkeypatch.setattr("app.pipeline.fetch_metadata", canned)
 
 
 def test_securities_facts(warm_book: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -335,3 +345,235 @@ def test_screen_candidate_rejects_path_like_ticker(warm_book: Path) -> None:
     res = _call("screen_candidate", {"ticker": "../../etc/passwd"})
     assert res.isError
     assert "valid ticker" in _error_text(res).lower()
+
+
+# ── cold-cache auto-warm (ASSET_MCP_OFFLINE opts out) ─────────────────────────
+
+
+def _cold_book(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A bound book over an EMPTY cache dir (cold) — the addon-user-never-ran-the-CLI case."""
+    csv = tmp_path / "txn.csv"
+    csv.write_text(
+        "Date,Code,Action,Quantity,Price,Fee\n2024-01-02,AAA,buy,10,100,0\n",
+        encoding="utf-8",
+    )
+    cache = tmp_path / "cache"
+    cache.mkdir()  # empty → cold
+    monkeypatch.delenv("ASSET_CSV", raising=False)
+    monkeypatch.setenv("ASSET_BOOK", str(csv))
+    monkeypatch.setenv("ASSET_CACHE_DIR", str(cache))
+    monkeypatch.delenv("ASSET_TARGET", raising=False)
+    return cache
+
+
+def test_cold_cache_auto_warms_core(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _cold_book(tmp_path, monkeypatch)
+    monkeypatch.setenv("ASSET_MCP_OFFLINE", "")  # opt into auto-warm (suite default is off)
+    calls: list[list[str]] = []
+
+    def fake_warm(tickers: object, cdir: Path, **k: object) -> dict[str, int]:
+        tks = sorted(tickers)  # type: ignore[type-var]
+        calls.append(tks)
+        for tk in tks:
+            _warm_series_cache(cdir, tk, 100.0)  # populate so the offline read then succeeds
+        return {"tickers": len(tks), "series_missing": 0, "meta_missing": 0}
+
+    monkeypatch.setattr("app.mcp_server.warm_cache", fake_warm)
+    res = _call("portfolio_summary")
+    assert not res.isError, _error_text(res)
+    assert calls == [["AAA"]]  # auto-warmed once, with the book's tickers
+    sc = res.structuredContent
+    assert sc is not None and {h["ticker"] for h in sc["holdings"]} == {"AAA"}
+
+
+def test_asset_mcp_offline_disables_auto_warm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _cold_book(tmp_path, monkeypatch)
+    monkeypatch.setenv("ASSET_MCP_OFFLINE", "1")  # opt out → strictly airtight
+    called: list[int] = []
+    monkeypatch.setattr("app.mcp_server.warm_cache", lambda *a, **k: called.append(1))
+    res = _call("portfolio_summary")
+    assert not called  # never reaches the network
+    assert not res.isError, _error_text(res)  # cold cache → unpriced holdings, not a crash
+    sc = res.structuredContent
+    assert sc is not None and sc["unpriced_tickers"] == ["AAA"]
+
+
+def test_no_rewarm_when_cache_is_warm(
+    warm_book: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ASSET_MCP_OFFLINE", "")  # auto-warm ON, but the cache is already warm
+    called: list[int] = []
+    monkeypatch.setattr("app.mcp_server.warm_cache", lambda *a, **k: called.append(1))
+    res = _call("portfolio_summary")
+    assert not res.isError, _error_text(res)
+    assert not called  # warm cache → cache_is_cold False → no auto-warm
+
+
+# ── screen_candidate on-demand fetch (gated by ASSET_MCP_OFFLINE) ──────────────
+
+
+def _synthetic_series(n: int = 320, base: float = 70.0) -> "pd.Series[float]":
+    idx = pd.bdate_range(end=pd.Timestamp.today().normalize(), periods=n)
+    return pd.Series([base * (1.0 + 0.02 * math.sin(i / 5.0) + 0.0003 * i) for i in range(n)], index=idx)
+
+
+def test_screen_candidate_fetches_on_demand_when_not_locked(
+    warm_book: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.metadata import MetadataResult
+
+    monkeypatch.setenv("ASSET_MCP_OFFLINE", "")  # default: fetch a missing candidate online
+    seen: dict[str, bool] = {}
+
+    def fake_series(tickers: object, start: object, end: object, **k: object) -> object:
+        seen["online"] = bool(k.get("online"))
+        return prices_mod.SeriesResult(rows={t: _synthetic_series() for t in tickers})  # type: ignore[union-attr]
+
+    monkeypatch.setattr("app.mcp_server.fetch_series", fake_series)
+    # screen reaches metadata via pipeline, not mcp_server — patch the real lookup point so the
+    # candidate's online metadata fetch is intercepted (else it hits the live network).
+    monkeypatch.setattr("app.pipeline.fetch_metadata", lambda tickers, **k: MetadataResult())
+    res = _call("screen_candidate", {"ticker": "CCC"})  # CCC not in the warm cache
+    assert not res.isError, _error_text(res)
+    assert seen["online"] is True  # fetched on demand rather than punting to the user
+    assert res.structuredContent is not None
+    assert res.structuredContent["verdict"] in {"PASS", "WARN", "FAIL"}  # actually screened
+
+
+def test_screen_candidate_offline_locked_is_na(
+    warm_book: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ASSET_MCP_OFFLINE", "1")  # strictly offline → no on-demand fetch
+    seen: dict[str, bool] = {}
+
+    def spy(tickers: object, start: object, end: object, **k: object) -> object:
+        seen["online"] = bool(k.get("online"))
+        return prices_mod.SeriesResult()  # ZZZZ not found → N/A
+
+    monkeypatch.setattr("app.mcp_server.fetch_series", spy)
+    res = _call("screen_candidate", {"ticker": "ZZZZ"})  # not cached
+    assert not res.isError, _error_text(res)
+    sc = res.structuredContent
+    assert sc is not None and sc["verdict"] == "N/A"
+    assert "offline" in sc["note"].lower()
+    assert seen["online"] is False  # proves no network reach, not just the message
+
+
+# ── propose_allocation (generate offline; validate cache-gated) ────────────────
+
+
+def test_propose_allocation_generates_weights(warm_book: Path) -> None:
+    res = _call("propose_allocation", {"preset": "moderate", "benchmark": "none"})
+    assert not res.isError, _error_text(res)
+    sc = res.structuredContent
+    assert sc is not None
+    assert sc["preset"] == "moderate" and len(sc["weights"]) > 0
+    assert sum(w["weight"] for w in sc["weights"]) == pytest.approx(1.0)  # normalized
+    assert sc["benchmark"] is None and sc["verdict"] is None  # validation skipped
+    # The preset arg actually drives the posture: a different preset → different weights
+    # (not just "some normalized weights" — catches a preset→bucket mix-up).
+    agg = _call("propose_allocation", {"preset": "aggressive", "benchmark": "none"})
+    mod_w = {w["ticker"]: w["weight"] for w in sc["weights"]}
+    agg_w = {w["ticker"]: w["weight"] for w in agg.structuredContent["weights"]}  # type: ignore[index]
+    assert mod_w != agg_w
+
+
+def test_propose_allocation_verdict_null_when_refs_cold(warm_book: Path) -> None:
+    # The book (AAA/BBB) doesn't cache the 60-40 refs, so the verdict degrades to null with
+    # a warm note — while the weights (the generate half) are still returned.
+    res = _call("propose_allocation", {"preset": "moderate", "benchmark": "60-40"})
+    assert not res.isError, _error_text(res)
+    sc = res.structuredContent
+    assert sc is not None and len(sc["weights"]) > 0
+    assert sc["verdict"] is None and "warm" in sc["validation_note"].lower()
+
+
+def test_propose_allocation_maps_a_benchmark_result(
+    warm_book: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import types
+
+    monkeypatch.setattr(
+        "app.mcp_server.benchmark_compare",
+        lambda *a, **k: types.SimpleNamespace(
+            verdict="shallower", reason="held-out: a shallower drawdown",
+            dd_diff_ci=(-0.08, -0.01), missing=(),
+        ),
+    )
+    res = _call("propose_allocation", {"preset": "conservative", "benchmark": "60-40"})
+    assert not res.isError, _error_text(res)
+    v = res.structuredContent["verdict"]  # type: ignore[index]
+    assert v is not None and v["verdict"] == "shallower" and v["reference"] == "60-40"
+    assert v["oos_dd_diff_low"] == pytest.approx(-0.08)
+
+
+def test_propose_allocation_unknown_preset_is_clean_error(warm_book: Path) -> None:
+    res = _call("propose_allocation", {"preset": "momentum"})
+    assert res.isError and "momentum" in _error_text(res)
+
+
+def test_propose_allocation_nulls_placeholder_ci(
+    warm_book: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # benchmark_compare returns dd_diff_ci=(0.0, 0.0) as a placeholder for inconclusive/
+    # insufficient verdicts (no paired bootstrap ran) — it must not surface as a real CI.
+    import types
+
+    monkeypatch.setattr(
+        "app.mcp_server.benchmark_compare",
+        lambda *a, **k: types.SimpleNamespace(
+            verdict="inconclusive", reason="within the noise margin",
+            dd_diff_ci=(0.0, 0.0), missing=(),
+        ),
+    )
+    res = _call("propose_allocation", {"preset": "moderate", "benchmark": "60-40"})
+    assert not res.isError, _error_text(res)
+    v = res.structuredContent["verdict"]  # type: ignore[index]
+    assert v is not None and v["verdict"] == "inconclusive"
+    assert v["oos_dd_diff_low"] is None and v["oos_dd_diff_high"] is None  # placeholder nulled
+
+
+def test_propose_allocation_validate_fetches_on_demand_when_unlocked(
+    warm_book: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Unlocked (the default), the validate path fetches its universe-fill tickers ONLINE on
+    # demand (same gate as screen_candidate), so it can judge the full target rather than a
+    # renormalized subset. Spy on the validate fetch and assert it asked to go online.
+    import types
+
+    monkeypatch.setenv("ASSET_MCP_OFFLINE", "")  # opt back into egress (autouse pins "1")
+    seen: list[bool] = []
+
+    def _spy(tickers: object, start: object, end: object, **k: object) -> object:
+        seen.append(bool(k.get("online")))
+        return types.SimpleNamespace(rows={}, missing=(), provenance={})
+
+    monkeypatch.setattr("app.mcp_server.fetch_series", _spy)
+    res = _call("propose_allocation", {"preset": "moderate", "benchmark": "60-40"})
+    assert not res.isError, _error_text(res)
+    assert seen and all(seen)  # the validate fetch asked to go online, not cache-only
+
+
+def test_propose_allocation_nulls_verdict_when_target_renormalized(
+    warm_book: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A still-cold proposed-target ticker means benchmark_compare renormalized that leg — the
+    # verdict would describe a different portfolio than the weights shown, so null it (don't
+    # report a number about the wrong basket), while the weights themselves still return.
+    import types
+
+    monkeypatch.setattr(
+        "app.mcp_server.benchmark_compare",
+        lambda *a, **k: types.SimpleNamespace(
+            verdict="shallower", reason="held-out: shallower",
+            dd_diff_ci=(-0.05, -0.01), missing=("VWO",),
+        ),
+    )
+    res = _call("propose_allocation", {"preset": "moderate", "benchmark": "60-40"})
+    assert not res.isError, _error_text(res)
+    sc = res.structuredContent
+    assert sc is not None and len(sc["weights"]) > 0  # generate half still returns weights
+    assert sc["verdict"] is None
+    assert "VWO" in sc["validation_note"] and "renormal" in sc["validation_note"].lower()
