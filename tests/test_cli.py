@@ -1606,6 +1606,205 @@ def test_resolve_role_tickers_prefers_a_held_fund_then_the_universe_default() ->
     assert rt["bond-aggregate"] == "BND"  # a gap role → the universe default (top-AUM)
 
 
+def _answer_with(monkeypatch: pytest.MonkeyPatch, answers: list[str]) -> None:
+    """Feed the --onboard interactive prompts a scripted sequence of answers."""
+    it = iter(answers)
+    monkeypatch.setattr("builtins.input", lambda *_a: next(it))
+
+
+def test_onboard_maps_cautious_answers_to_conservative_and_proposes(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str],
+) -> None:
+    # The full step-0 path: 3 cautious answers → conservative posture → the SAME preset
+    # allocation --allocate conservative would build (holdings-aware, propose-only).
+    _price_held_funds(monkeypatch)
+    _answer_with(monkeypatch, ["1", "1", "1"])  # under_3_years / sell / no
+    with caplog.at_level(logging.INFO):
+        rc = main(["--csv", str(SAMPLE), "--onboard", "--no-risk"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "Matched posture: CONSERVATIVE" in out
+    assert "PROPOSED ALLOCATION: conservative" in out
+    assert _run_summary(caplog)["onboard"] == "conservative"
+
+
+def test_onboard_accepts_option_keys_and_maps_to_aggressive(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str],
+) -> None:
+    # Answers may be the option key, not just the number; growth-tolerant → aggressive.
+    _price_held_funds(monkeypatch)
+    _answer_with(monkeypatch, ["over_10_years", "buy_more", "comfortably"])
+    with caplog.at_level(logging.INFO):
+        rc = main(["--csv", str(SAMPLE), "--onboard", "--no-risk"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "Matched posture: AGGRESSIVE" in out
+    assert _run_summary(caplog)["onboard"] == "aggressive"
+
+
+def test_onboard_reprompts_on_a_bad_line(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    _price_held_funds(monkeypatch)
+    # "9" and "maybe" are invalid for the first question → re-prompt, then accept "2".
+    _answer_with(monkeypatch, ["9", "maybe", "2", "2", "2"])
+    rc = main(["--csv", str(SAMPLE), "--onboard", "--no-risk"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "enter 1-3" in out  # the re-prompt hint fired
+    assert "Matched posture: MODERATE" in out
+
+
+def test_onboard_writes_target_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    _price_held_funds(monkeypatch)
+    _answer_with(monkeypatch, ["2", "2", "2"])
+    out_csv = tmp_path / "starter.csv"
+    rc = main(["--csv", str(SAMPLE), "--onboard", "--allocate-out", str(out_csv), "--no-risk"])
+    capsys.readouterr()
+    assert rc == 0
+    w = _weights_from(out_csv)
+    assert abs(sum(w.values()) - 100.0) < 0.1  # a normalized target was written
+
+
+def test_onboard_aborts_cleanly_on_eof(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Piped/closed stdin (no answers) must not loop — it errors out via parser.error.
+    def _raise_eof(*_a: object) -> str:
+        raise EOFError
+
+    monkeypatch.setattr("builtins.input", _raise_eof)
+    with pytest.raises(SystemExit):
+        main(["--csv", str(SAMPLE), "--onboard", "--no-risk"])
+
+
+def test_onboard_rejects_explicit_allocate() -> None:
+    # --onboard chooses the rule; passing --allocate too is contradictory.
+    with pytest.raises(SystemExit):
+        main(["--csv", str(SAMPLE), "--onboard", "--allocate", "moderate"])
+
+
+def test_onboard_is_propose_only() -> None:
+    with pytest.raises(SystemExit):
+        main(["--csv", str(SAMPLE), "--onboard", "--rebalance", "to_total", "--target", str(SAMPLE)])
+
+
+def test_onboard_rejected_with_screen_or_discover() -> None:
+    # --onboard resolves to an --allocate proposal at runtime, so the screen/discover
+    # propose-only guard must reject it too (parse-time), exactly like --screen --allocate.
+    with pytest.raises(SystemExit):
+        main(["--csv", str(SAMPLE), "--screen", "QQQM", "--onboard"])
+    with pytest.raises(SystemExit):
+        main(["--csv", str(SAMPLE), "--discover", "--onboard"])
+
+
+def test_onboard_matches_the_equivalent_allocate_preset(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    # The 'no second code path' guarantee on the CLI: onboarding with cautious answers must
+    # write the SAME target file as `--allocate conservative` (not just the same header).
+    _price_held_funds(monkeypatch)
+    _answer_with(monkeypatch, ["1", "1", "1"])  # → conservative
+    onb = tmp_path / "onb.csv"
+    main(["--csv", str(SAMPLE), "--onboard", "--allocate-out", str(onb), "--no-risk"])
+    capsys.readouterr()
+    alloc = tmp_path / "alloc.csv"
+    main(["--csv", str(SAMPLE), "--allocate", "conservative", "--allocate-out", str(alloc), "--no-risk"])
+    capsys.readouterr()
+    assert _weights_from(onb) == _weights_from(alloc)
+
+
+def test_onboard_on_a_holdingless_book_builds_a_universe_starter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str],
+) -> None:
+    # The core onboarding audience: a brand-new book with nothing held yet (deposits only).
+    # A preset is a prior, so it must still produce a universe-default starter — not skip
+    # with a misleading '--no-prices' message.
+    book = tmp_path / "cash.csv"
+    book.write_text("Date,Code,Action,Quantity,Price,Fee\n2024-01-02,CASH,deposit,0,1000,0\n", encoding="utf-8")
+    _answer_with(monkeypatch, ["1", "1", "1"])
+    with caplog.at_level(logging.INFO):
+        rc = main(["--csv", str(book), "--onboard", "--offline"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "PROPOSED ALLOCATION: conservative" in out  # universe defaults, no holdings needed
+    assert _run_summary(caplog)["allocate"] == "conservative"
+
+
+def test_dry_run_previews_the_book_without_fetching(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str],
+) -> None:
+    # --dry-run reads the file and reports; it must fetch nothing. Make any fetch explode
+    # to PROVE no network path runs, then assert the preview content.
+    def _boom(*_a: object, **_k: object) -> None:
+        raise AssertionError("--dry-run must not fetch prices")
+
+    monkeypatch.setattr("app.cli.fetch_series", _boom)
+    monkeypatch.setattr("app.cli.fetch_latest", _boom)
+    with caplog.at_level(logging.INFO):
+        rc = main(["--csv", str(SAMPLE), "--dry-run"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "format: csv" in out
+    assert "derives to 4 holding(s)" in out  # the sample's 4 held tickers
+    assert "before split-adjustment" in out  # raw-shares honesty label
+    assert "import would succeed" in out
+    assert _run_summary(caplog)["dry_run"].startswith("ok: csv")
+
+
+def test_dry_run_reports_a_row_level_error_and_exits_2(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str],
+) -> None:
+    # Not just a missing-column (parse-level) error: a well-formed header with a bad row
+    # (unknown action) raises inside _rows_to_events and must still funnel to rc 2 cleanly.
+    bad = tmp_path / "badrow.csv"
+    bad.write_text("Date,Code,Action,Quantity,Price,Fee\n2024-01-02,VOO,teleport,1,100,0\n", encoding="utf-8")
+    with caplog.at_level(logging.INFO):
+        rc = main(["--csv", str(bad), "--dry-run"])
+    out = capsys.readouterr().out
+    assert rc == 2
+    assert "cannot import" in out
+    assert _run_summary(caplog)["dry_run"] == "invalid"
+
+
+def test_dry_run_reports_a_malformed_file_and_exits_2(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str],
+) -> None:
+    bad = tmp_path / "bad.csv"
+    bad.write_text("Date,Code,Nope\n2024-01-01,VOO,x\n", encoding="utf-8")
+    with caplog.at_level(logging.INFO):
+        rc = main(["--csv", str(bad), "--dry-run"])
+    out = capsys.readouterr().out
+    assert rc == 2
+    assert "cannot import" in out
+    assert _run_summary(caplog)["dry_run"] == "invalid"
+
+
+def test_dry_run_surfaces_ghostfolio_skips(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    import json
+
+    p = tmp_path / "export.json"
+    p.write_text(json.dumps({"activities": [
+        {"symbol": "VOO", "currency": "USD", "unitPrice": 400, "quantity": 10,
+         "type": "BUY", "fee": 0, "dataSource": "YAHOO", "date": "2024-01-02T00:00:00Z"},
+        {"symbol": "SAP.DE", "currency": "EUR", "unitPrice": 120, "quantity": 3,
+         "type": "BUY", "fee": 0, "dataSource": "YAHOO", "date": "2024-01-03T00:00:00Z"},
+    ]}), encoding="utf-8")
+    rc = main(["--book", str(p), "--dry-run"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "format: ghostfolio-json" in out
+    assert "skipped 1 row(s)" in out and "EUR" in out
+
+
 def test_benchmark_needs_backtest() -> None:
     # --benchmark compares --target against a reference; the contract requires --backtest.
     with pytest.raises(SystemExit):

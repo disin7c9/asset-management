@@ -73,6 +73,8 @@ uv run python -m app --book your.csv --screen QQQM,SCHD  # judge NEW candidate t
 uv run python -m app --book your.csv --screen SCHD --target target.csv  # + walk-forward ROLE check (held-out evidence)
 uv run python -m app --book your.csv --discover   # + DISCOVERY panel: screened NEW ETFs for roles you're light in
 uv run python -m app --book your.csv --narrate    # + a plain-language SUMMARY (opt-in; bring your own LLM key in .env)
+uv run python -m app --demo --onboard                                           # NEW? answer 3 risk questions → a starting allocation
+uv run python -m app --book your.csv --dry-run                                   # preview an import (format, skips, holdings) — fetches nothing
 uv run python -m app --book your.csv --dump-target target.csv                    # write current allocation to edit
 uv run python -m app --book your.csv --allocate inverse_vol --allocate-out t.csv  # PROPOSE a target (re-weight holdings)
 uv run python -m app --book your.csv --allocate moderate --allocate-out t.csv     # PROPOSE a strategic preset (conservative|moderate|aggressive)
@@ -90,6 +92,8 @@ The report is **composable panels**, not exclusive modes — combine flags and t
 | status brief (default) | `--book` | your holdings + returns + drawdown/risk |
 | `--rebalance MODE` | `--book` + `--target` | buy/sell suggestions toward the target (`--new-cash` sizes a deposit) |
 | `--allocate RULE` | `--book` | propose a target — re-weight your holdings (`equal_weight`/`inverse_vol`) or build a strategic role template (`conservative`/`moderate`/`aggressive`); write it with `--allocate-out` |
+| `--onboard` | `--book` (or `--demo`) | step 0 for a new user: answer 3 plain risk questions in the terminal → the matched posture builds its `--allocate` preset automatically (propose-only; save with `--allocate-out`) |
+| `--dry-run` | `--book` (or `--demo`) | preview an import before trusting it: detected format, events parsed, rows skipped/flagged with reasons, and the holdings they derive to — fetches nothing, computes no brief |
 | `--metadata` | `--book` | published fund facts per holding (expense ratio, AUM, volume, age, category), cached 7 days |
 | `--screen TICKERS` | `--book` + prices | judge NEW candidates vs your book: diversifier (incl. your red days + worst drawdown), cost, liquidity, age, concentration, leveraged/inverse auto-reject, holdings-overlap dedup — each verdict with its reason. Add `--target` for the **walk-forward role check**: did a 5% sleeve improve drawdown/vol on a held-out window? (paired-bootstrap honesty gate; "inconclusive" when inside the noise band). Propose-only; a PASS is "sane, cheap, liquid, genuinely different", never a prediction |
 | `--discover [roles]` | `--book` + prices | suggest **new** ETFs for the roles you hold ≤3% of, run through the same screen — propose-only (see Discovery, below) |
@@ -219,8 +223,8 @@ price-cache folder, an optional target CSV, and a strict-offline toggle. Nothing
 install — Claude Desktop's `uv` runtime resolves Python and the locked dependencies itself.
 
 **In chat:** open the **+** menu for ready-made starters — *Portfolio checkup*, *What's my
-drawdown?*, *Should I rebalance?*, *Fill my gaps*, *Propose a posture* — each one pre-loads
-the figures-only framing. The server also publishes `portfolio://guarantees` (its four
+drawdown?*, *Should I rebalance?*, *Fill my gaps*, *Find my starting allocation*, *Propose a
+posture* — each one pre-loads the figures-only framing. The server also publishes `portfolio://guarantees` (its four
 enforced guarantees, versioned, shipped with the code): attach it from the same **+** menu —
 or, in clients that let the model read resources itself, just ask "can I trust these
 numbers?" and it answers from the manifest instead of improvising.
@@ -316,7 +320,8 @@ asset-management/
 │   ├── returns.py    events + prices → equity curve, true TWR, MWR (XIRR), Modified Dietz
 │   ├── risk.py       drawdown family + Sharpe/Sortino/Calmar with bootstrap CIs
 │   ├── strategy.py   holdings + target → named buy/sell suggestions (rebalance modes) + edge gate
-│   ├── allocate.py   choose a target: equal_weight / inverse_vol + per-asset caps
+│   ├── allocate.py   choose a target: equal_weight / inverse_vol + risk-posture presets + per-asset caps
+│   ├── onboard.py    step-0 risk quiz (pure): 3 questions → a conservative / moderate / aggressive posture
 │   ├── screen.py     judge NEW candidate tickers (diversifier / cost / liquidity / age / overlap)
 │   ├── backtest.py   notional rebalanced-vs-buy-and-hold simulation
 │   ├── pipeline.py   the shared book→prices→returns→risk bundle (cli + mcp_server) + cache warm + the --demo book
@@ -325,7 +330,7 @@ asset-management/
 │   ├── llm.py        optional narrator backend (OpenAI-compatible + Anthropic); fail-closed, opt-in
 │   ├── email.py      send the HTML brief via Resend (--send)
 │   ├── cli.py        argparse + entry composition + delivery routing + structured run log
-│   ├── mcp_server.py read-only stdio MCP server: 7 tools over the core (offline; one-time cold-call auto-warm, ASSET_MCP_OFFLINE=1 opts out)
+│   ├── mcp_server.py read-only stdio MCP server: 8 tools over the core (offline; one-time cold-call auto-warm, ASSET_MCP_OFFLINE=1 opts out)
 │   ├── universe.py   curated ETF universe loader (Candidate + roles); data/universe.csv, auto-built
 │   ├── discover.py   book → role gaps → top-by-AUM candidates for the screen (--discover, propose-only)
 │   ├── log_config.py logging setup

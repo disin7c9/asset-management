@@ -139,7 +139,7 @@ def _read_resource(uri: str) -> ReadResourceResult:
 
 
 def test_prompts_cover_the_tool_surface() -> None:
-    # The chat front door: 5 conversation starters in the client's "+" menu, each with a
+    # The chat front door: 6 conversation starters in the client's "+" menu, each with a
     # description a non-finance user can pick from (blank-box problem).
     res = _list_prompts()
     names = {p.name for p in res.prompts}
@@ -148,6 +148,7 @@ def test_prompts_cover_the_tool_surface() -> None:
         "whats_my_drawdown",
         "should_i_rebalance",
         "fill_my_gaps",
+        "find_my_starting_allocation",
         "propose_a_posture",
     }
     assert all(p.description for p in res.prompts)
@@ -162,6 +163,7 @@ def test_every_prompt_carries_the_figures_rule() -> None:
         ("whats_my_drawdown", None),
         ("should_i_rebalance", None),
         ("fill_my_gaps", None),
+        ("find_my_starting_allocation", None),
         ("propose_a_posture", {"posture": "aggressive"}),
     ]
     for name, args in cases:
@@ -183,6 +185,24 @@ def test_every_prompt_carries_the_figures_rule() -> None:
     while isinstance(err, BaseExceptionGroup):  # anyio wraps the McpError in a TaskGroup
         err = err.exceptions[0]
     assert "conservative" in str(err)  # the error names the menu
+
+
+def test_onboarding_answer_tokens_are_in_sync_with_the_rubric() -> None:
+    # The find_my_starting_allocation prompt and the starter_allocation tool description
+    # re-list the answer tokens (horizon/loss_response/cash_buffer) as prose. If someone
+    # renames an Option.key in app.onboard, the model would be told to send a token the
+    # rubric rejects — so pin that EVERY live token appears verbatim in both surfaces.
+    from app.onboard import QUESTIONS
+
+    prompt_text = getattr(
+        _get_prompt("find_my_starting_allocation").messages[0].content, "text", ""
+    )
+    tool = next(t for t in _list_tools().tools if t.name == "starter_allocation")
+    desc = tool.description or ""
+    for q in QUESTIONS:
+        for opt in q.options:
+            assert opt.key in prompt_text, f"{opt.key} missing from the onboarding prompt"
+            assert opt.key in desc, f"{opt.key} missing from starter_allocation description"
 
 
 def test_env_path_treats_template_residue_as_unset(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -221,6 +241,7 @@ def test_tools_registered_and_read_only() -> None:
     assert {
         "portfolio_summary", "risk_report", "rebalance_check",
         "securities_facts", "discover_gaps", "screen_candidate",
+        "propose_allocation", "starter_allocation",
     } <= names
     for t in res.tools:
         assert t.annotations is not None, f"{t.name} missing annotations"
@@ -578,6 +599,96 @@ def test_screen_candidate_offline_locked_is_na(
     assert seen["online"] is False  # proves no network reach, not just the message
 
 
+# ── provenance receipts (item 7): what source, how fresh ───────────────────────
+
+
+def test_portfolio_summary_carries_provenance(warm_book: Path) -> None:
+    res = _call("portfolio_summary")
+    assert not res.isError, _error_text(res)
+    p = res.structuredContent["provenance"]  # type: ignore[index]
+    assert p["sources"] == ["cache"]  # served offline from the warmed cache
+    assert p["price_asof"] is not None
+    assert p["stalest_fetch_hours"] is not None and p["stalest_fetch_hours"] >= 0.0
+
+
+def test_risk_report_carries_provenance(warm_book: Path) -> None:
+    # The gap item 7 closes: the risk panel now says what its numbers are sourced from.
+    res = _call("risk_report")
+    assert not res.isError, _error_text(res)
+    p = res.structuredContent["provenance"]  # type: ignore[index]
+    assert p["sources"] == ["cache"]
+    assert p["price_asof"] is not None
+
+
+def test_provenance_price_asof_matches_holdings(warm_book: Path) -> None:
+    # The rollup's newest close date equals the latest per-holding price date — one
+    # honest 'as of' for the whole tool, derived from the same prices.
+    res = _call("portfolio_summary")
+    sc = res.structuredContent
+    assert sc is not None
+    # every holding priced from the same fresh cache → the rollup asof is that date
+    assert sc["provenance"]["price_asof"] == sc["returns"]["asof"]
+
+
+def test_provenance_stalest_is_the_max_age_not_the_min(
+    warm_book: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Pin the 'stalest' semantics: with two holdings fetched at DIFFERENT times, the rollup
+    # must report the OLDER fetch's age (max), not the fresher one — a max→min inversion
+    # would silently understate staleness. (warm_book alone fetches both at ~the same instant,
+    # so min==max there and can't catch the swap.)
+    from datetime import date, datetime, timedelta, timezone
+
+    from app.derive import DerivedState
+    from app.mcp_server import DataProvenance, _Build, _data_provenance
+    from app.prices import PriceRow
+
+    now = datetime.now(timezone.utc)
+    fresh = PriceRow("AAA", date.today(), 100.0, "cache", now - timedelta(hours=2))
+    stale = PriceRow("BBB", date.today(), 50.0, "cache", now - timedelta(hours=50))
+    b = _Build(
+        state=DerivedState(), prices={"AAA": fresh, "BBB": stale},
+        returns=None, risk=None, missing=[], dollar_dd=None,
+    )
+    prov: DataProvenance = _data_provenance(b)
+    assert prov.stalest_fetch_hours == pytest.approx(50.0, abs=0.2)  # the older fetch wins
+
+
+def test_provenance_falls_back_to_series_when_no_current_holdings() -> None:
+    # A fully-exited book: risk_report computes real numbers from the price HISTORY while
+    # b.prices (current holdings) is empty. Provenance must stamp the series, not return an
+    # all-null receipt beside real numbers (the honesty gap item 7 exists to prevent).
+    from datetime import datetime, timedelta, timezone
+
+    from app.derive import DerivedState
+    from app.mcp_server import _Build, _data_provenance
+    from app.prices import SeriesResult
+
+    idx = pd.bdate_range(end=pd.Timestamp.today().normalize(), periods=5)
+    series = SeriesResult(
+        rows={"AAA": pd.Series([1.0] * 5, index=idx)},
+        missing=[],
+        provenance={"AAA": ("cache", datetime.now(timezone.utc) - timedelta(hours=3))},
+    )
+    b = _Build(
+        state=DerivedState(), prices={}, returns=None, risk=None,
+        missing=[], dollar_dd=None, series=series,
+    )
+    prov = _data_provenance(b)
+    assert prov.sources == ["cache"]  # stamped from the series, not all-null
+    assert prov.price_asof == idx[-1].date()
+    assert prov.stalest_fetch_hours == pytest.approx(3.0, abs=0.2)
+
+
+def test_provenance_empty_when_no_data_at_all() -> None:
+    from app.derive import DerivedState
+    from app.mcp_server import _Build, _data_provenance
+
+    b = _Build(state=DerivedState(), prices={}, returns=None, risk=None, missing=[], dollar_dd=None)
+    prov = _data_provenance(b)
+    assert prov.price_asof is None and prov.sources == [] and prov.stalest_fetch_hours is None
+
+
 # ── propose_allocation (generate offline; validate cache-gated) ────────────────
 
 
@@ -694,3 +805,57 @@ def test_propose_allocation_nulls_verdict_when_target_renormalized(
     assert sc is not None and len(sc["weights"]) > 0  # generate half still returns weights
     assert sc["verdict"] is None
     assert "VWO" in sc["validation_note"] and "renormal" in sc["validation_note"].lower()
+
+
+# ── starter_allocation (onboarding: answers → posture → the same proposal) ──────
+
+
+def test_starter_allocation_maps_answers_and_embeds_the_proposal(warm_book: Path) -> None:
+    res = _call("starter_allocation", {
+        "horizon": "over_10_years", "loss_response": "buy_more",
+        "cash_buffer": "comfortably", "benchmark": "none",
+    })
+    assert not res.isError, _error_text(res)
+    sc = res.structuredContent
+    assert sc is not None
+    assert sc["posture"] == "aggressive" and sc["score"] == 6
+    assert sc["rationale"] and any("→ aggressive" in line for line in sc["rationale"])
+    # The embedded proposal is a full ProposedAllocation for that posture, weights normalized.
+    prop = sc["proposal"]
+    assert prop["preset"] == "aggressive" and len(prop["weights"]) > 0
+    assert sum(w["weight"] for w in prop["weights"]) == pytest.approx(1.0)
+
+
+def test_starter_allocation_matches_propose_allocation_for_the_same_posture(
+    warm_book: Path,
+) -> None:
+    # Onboarding must not be a second allocation code path: cautious answers → conservative,
+    # and its weights must equal propose_allocation('conservative') exactly.
+    starter = _call("starter_allocation", {
+        "horizon": "under_3_years", "loss_response": "sell",
+        "cash_buffer": "no", "benchmark": "none",
+    }).structuredContent
+    direct = _call("propose_allocation", {
+        "preset": "conservative", "benchmark": "none",
+    }).structuredContent
+    assert starter is not None and direct is not None
+    assert starter["posture"] == "conservative"
+    assert starter["proposal"]["weights"] == direct["weights"]
+
+
+def test_starter_allocation_short_horizon_caps_conservative(warm_book: Path) -> None:
+    # Growth-tolerant answers but a sub-3y horizon → capped at conservative (the safety rail).
+    res = _call("starter_allocation", {
+        "horizon": "under_3_years", "loss_response": "buy_more",
+        "cash_buffer": "comfortably", "benchmark": "none",
+    })
+    sc = res.structuredContent
+    assert sc is not None and sc["posture"] == "conservative"
+    assert any("capped at conservative" in line for line in sc["rationale"])
+
+
+def test_starter_allocation_unknown_answer_is_clean_error(warm_book: Path) -> None:
+    res = _call("starter_allocation", {
+        "horizon": "someday", "loss_response": "hold", "cash_buffer": "partly",
+    })
+    assert res.isError and "someday" in _error_text(res)

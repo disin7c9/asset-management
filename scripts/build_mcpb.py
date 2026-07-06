@@ -188,6 +188,12 @@ def _manifest(version: str) -> dict[str, object]:
                 "and validate it against a benchmark with a walk-forward held-out "
                 "verdict (propose-only).",
             },
+            {
+                "name": "starter_allocation",
+                "description": "New user onboarding: map 3 risk answers to a posture and "
+                "return that starting allocation, validated against a benchmark "
+                "(propose-only).",
+            },
         ],
         # Our 5 conversation starters are runtime-registered (FastMCP decorators), not
         # static manifest templates. Without this flag Claude Desktop LISTS them in the

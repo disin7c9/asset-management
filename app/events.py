@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from collections.abc import Sequence
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Literal, get_args
+from typing import Any, Literal, get_args
 
 Action = Literal["buy", "sell", "dividend", "fee", "interest", "deposit", "withdraw"]
 VALID_ACTIONS: frozenset[str] = frozenset(get_args(Action))
@@ -242,16 +242,38 @@ def load_events(path: Path) -> list[Event]:
     Ordering: by date, then by action (buy → div/fee/interest → sell) so a
     same-day SELL listed before its BUY in the CSV doesn't crash.
     """
+    rows, skipped, _fmt = _parse_rows(path)
+    for msg in skipped:
+        log.warning("%s: ghostfolio import — %s", path, msg)
+    events = _rows_to_events(rows)
+    log.info("loaded %d events from %s", len(events), path)
+    return events
+
+
+def load_events_report(path: Path) -> tuple[list[Event], list[str], str]:
+    """Like `load_events`, but RETURNS the per-row skip warnings and the detected format
+    label (``"csv"`` | ``"ghostfolio-json"``) instead of only logging them — so `--dry-run`
+    can show the user exactly what an import would accept and drop before they trust it.
+    Still raises the same clear errors on a malformed file / unknown column / bad date."""
+    rows, skipped, fmt = _parse_rows(path)
+    return _rows_to_events(rows), skipped, fmt
+
+
+def _parse_rows(path: Path) -> tuple[list[dict[str, Any]], list[str], str]:
+    """Read the file into raw row dicts + skip warnings + a format label. The single parse
+    seam shared by `load_events` and `load_events_report` (no drift between the real load and
+    the dry-run preview)."""
     raw = path.read_text(encoding="utf-8-sig")  # utf-8-sig strips a leading BOM
     if raw.lstrip()[:1] in ("{", "["):  # a Ghostfolio JSON activities export
         rows, skipped = _rows_from_ghostfolio_json(raw, path)
-        for msg in skipped:
-            log.warning("%s: ghostfolio import — %s", path, msg)
-    else:
-        reader = csv.DictReader(io.StringIO(raw))
-        _validate_columns(reader.fieldnames, path)
-        rows = list(reader)
+        return rows, skipped, "ghostfolio-json"
+    reader = csv.DictReader(io.StringIO(raw))
+    _validate_columns(reader.fieldnames, path)
+    return list(reader), [], "csv"
 
+
+def _rows_to_events(rows: list[dict[str, Any]]) -> list[Event]:
+    """Map raw row dicts (native CSV or normalized Ghostfolio) → ordered Events."""
     events: list[Event] = []
     for row in rows:
         action = _parse_action(row["Action"])
@@ -287,7 +309,6 @@ def load_events(path: Path) -> list[Event]:
             )
         )
     events.sort(key=lambda e: (e.date, _ACTION_ORDER.get(e.action, 1)))
-    log.info("loaded %d events from %s", len(events), path)
     return events
 
 

@@ -18,9 +18,9 @@ if TYPE_CHECKING:
 
 from dotenv import load_dotenv
 
-from app.derive import DerivedState
+from app.derive import DerivedState, derive
 from app.email import send_report
-from app.events import CASH_TICKER, Event, load_events, load_target
+from app.events import CASH_TICKER, Event, load_events, load_events_report, load_target
 from app.log_config import setup_logging
 from app.metadata import MetadataResult, fetch_metadata
 from app.screen import CandidateScreen, screen_candidates
@@ -78,6 +78,7 @@ from app.backtest import (
     benchmark_weights,
     role_check,
 )
+from app.onboard import QUESTIONS, Question, posture_from_answers
 from app.strategy import VALID_MODES, Suggestion, may_suggest, suggest
 
 log = logging.getLogger(__name__)
@@ -129,6 +130,14 @@ def main(argv: list[str] | None = None) -> int:
         "the first priced run fetches online, then it's cached like any book. The demo "
         "book is (re)written to <cache-dir>/demo_book.csv on each run; .env defaults "
         "(ASSET_BOOK/ASSET_TARGET) are ignored so personal data can't mix in.",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="preview what importing --book would accept before you trust it: the detected "
+        "format (native CSV / Ghostfolio JSON), how many events parse, any rows skipped or "
+        "flagged (with reasons), and the holdings they derive to. Fetches nothing, computes "
+        "no brief — just reads the file and reports. Pair with --demo to preview the example.",
     )
     parser.add_argument(
         "--cache-dir",
@@ -294,6 +303,14 @@ def main(argv: list[str] | None = None) -> int:
         "--backtest / --rebalance against the file in a SEPARATE command.",
     )
     parser.add_argument(
+        "--onboard",
+        action="store_true",
+        help="step 0: answer 3 plain-language risk questions in the terminal and get a "
+        "starting allocation matched to your answers (the conservative/moderate/aggressive "
+        "preset engine picks itself). Interactive — combine with --demo to try it on the "
+        "bundled example book, and --allocate-out FILE to save the result. Propose-only.",
+    )
+    parser.add_argument(
         "--allocate-out",
         type=Path,
         default=None,
@@ -327,29 +344,39 @@ def main(argv: list[str] | None = None) -> int:
         # A fraction, not a percent: "30" (meaning 30%) would make the cap never bind
         # (cap*n ≥ 1 always) and silently do nothing — reject it loudly instead.
         parser.error("--allocate-cap must be a fraction in (0, 1] (e.g. 0.30 for 30%)")
-    if args.allocate and (args.rebalance or args.backtest):
+    if args.onboard and args.allocate:
+        # --onboard CHOOSES the allocate rule from your answers — passing one too is
+        # contradictory. Run the quiz, or pass a rule directly; not both.
+        parser.error("--onboard picks the allocation rule from your answers; drop --allocate")
+    if (args.allocate or args.onboard) and (args.rebalance or args.backtest):
         # propose ≠ act/simulate: keep them separate so you never emit orders or a
         # simulation against a target you haven't reviewed. Do it in two commands.
         parser.error(
-            "--allocate is propose-only; run it first (optionally with --allocate-out FILE), "
-            "then --backtest / --rebalance --target FILE in a SEPARATE command"
+            "--allocate/--onboard is propose-only; run it first (optionally with "
+            "--allocate-out FILE), then --backtest / --rebalance --target FILE in a "
+            "SEPARATE command"
         )
-    if (args.screen or args.discover is not None) and (args.rebalance or args.backtest or args.allocate):
+    if (args.screen or args.discover is not None) and (
+        args.rebalance or args.backtest or args.allocate or args.onboard
+    ):
         # Same discipline: judge candidates first, decide/simulate in a separate run.
+        # --onboard is included because it resolves to an --allocate proposal at runtime —
+        # without it, `--screen X --onboard` would slip past this parse-time guard.
         parser.error(
             "--screen/--discover are propose-only; review the verdicts, then act "
-            "(--allocate / --rebalance / --backtest) in a SEPARATE command"
+            "(--allocate / --onboard / --rebalance / --backtest) in a SEPARATE command"
         )
-    if args.allocate_out is not None and not args.allocate:
-        parser.error("--allocate-out has no effect without --allocate")
+    if args.allocate_out is not None and not (args.allocate or args.onboard):
+        parser.error("--allocate-out has no effect without --allocate or --onboard")
     if args.benchmark is not None and not args.backtest:
         parser.error("--benchmark compares --target against a reference; it needs --backtest")
     # No silent sample fallback: book-dependent actions operate on YOUR holdings, so
     # they require your transaction log. --backtest is notional (target-only) and is
     # exempt; the bundled example is opt-in via an explicit --demo.
     needs_book = bool(
-        args.rebalance or args.allocate or args.dump_target or args.save or args.send
-        or args.metadata or args.screen or args.narrate or args.discover is not None
+        args.rebalance or args.allocate or args.onboard or args.dump_target or args.save
+        or args.send or args.metadata or args.screen or args.narrate or args.discover is not None
+        or args.dry_run
     )
     # Personal defaults from .env (gitignored; loaded above). ASSET_BOOK (or ASSET_CSV,
     # back-compat) fills --book for runs that want a book; a pure `--backtest --target` run
@@ -402,6 +429,7 @@ def main(argv: list[str] | None = None) -> int:
         "rebalance": None,
         "backtest": None,
         "allocate": None,
+        "onboard": None,
         "dump_target": None,
         "metadata": None,
         "screen": None,
@@ -410,12 +438,18 @@ def main(argv: list[str] | None = None) -> int:
         "discover_narrate": None,
         "benchmark_narrate": None,
         "warm": None,
+        "dry_run": None,
     }
 
     # One-shot cache warm: pre-fetch online, then exit (an onboarding action, not a brief).
     # Placed after .env resolution so a bare `--warm` still picks up ASSET_BOOK.
     if args.warm is not None:
         return _warm_cache(args, run, parser)
+
+    # Import preview: read the book and report what it contains, then exit (no prices, no
+    # brief). Placed here so --book / --demo / .env resolution has already run.
+    if args.dry_run:
+        return _dry_run(args, run)
 
     # Nothing to do: no book and no notional backtest → guide, don't fabricate a brief.
     if args.book is None and not args.backtest:
@@ -482,6 +516,13 @@ def main(argv: list[str] | None = None) -> int:
             _compute_prices_returns_risk(events, state, args, run, today)
         )
 
+    if args.onboard:
+        # Step 0: ask the 3 risk questions, then hand the chosen posture to the SAME
+        # --allocate preset path below (holdings-aware + propose-only for free). A quiz
+        # that can't get answers (EOF) hard-exits inside _onboarding_posture, so reaching
+        # here means we have a posture.
+        args.allocate = _onboarding_posture(parser)
+        run["onboard"] = args.allocate
     if args.dump_target:
         _dump_target(state, prices, args.dump_target, run)
     if args.allocate:
@@ -805,6 +846,64 @@ def _print_proposed_allocation(
     sys.stdout.write("\n".join(lines) + "\n\n")
 
 
+def _dry_run(args: argparse.Namespace, run: dict[str, Any]) -> int:
+    """`--dry-run`: parse the book and report what an import would accept, then exit.
+
+    Reads the file only — no prices, no split-adjust, no brief. Prints the detected format,
+    the parsed event count, any skipped/flagged rows with reasons (Ghostfolio imports drop
+    non-USD/crypto/ITEM/LIABILITY), and the holdings they derive to — so the user can eyeball
+    a new book before trusting it. Returns 0 on a clean read; 2 (with a clear message) when
+    the file can't be parsed or violates an importer contract."""
+    book = args.book
+    assert book is not None  # needs_book guaranteed it upstream
+    if not book.exists():
+        log.error("transaction file not found: %s", book)
+        run["status"] = "error"
+        run["error"] = "book_not_found"
+        _log_run_summary(run)
+        return 2
+    try:
+        events, skipped, fmt = load_events_report(book)
+        state = derive(events)  # raw derive (no split-adjust): a faithful file preview
+    except (ValueError, KeyError) as exc:
+        # A malformed file / unknown column / bad date / importer-contract violation. The
+        # whole point of --dry-run is to surface this cleanly instead of mid-brief.
+        log.error("dry-run: %s can't be imported: %s", book, exc)
+        sys.stdout.write(f"\nDRY RUN — {book}\n  ✗ cannot import: {exc}\n")
+        run["status"] = "error"
+        run["error"] = str(exc)
+        run["dry_run"] = "invalid"
+        _log_run_summary(run)
+        return 2
+
+    held = state.held()
+    out = [f"\nDRY RUN — {book}", f"  format: {fmt}", f"  parsed: {len(events)} events"]
+    if skipped:
+        out.append(f"  skipped {len(skipped)} row(s) (not imported):")
+        out.extend(f"    - {msg}" for msg in skipped)
+    else:
+        out.append("  skipped: none")
+    if held:
+        # Raw share counts straight from the file — NOT split-adjusted. The real brief runs
+        # these through corporate_actions.adjust_for_splits (needs price/split history), so a
+        # ticker that split during the holding period will show more shares there. This is an
+        # import preview ("what's in the file"), so raw is the honest number to show.
+        out.append(f"  derives to {len(held)} holding(s) (raw shares, before split-adjustment):")
+        for tk in sorted(held):
+            pos = held[tk]
+            out.append(f"    {tk:<8} {pos.shares:>12,.3f} shares   cost basis ${pos.cost_basis:,.2f}")
+    else:
+        out.append("  derives to 0 holdings (nothing currently held)")
+    realized = state.total_realized()
+    if realized:
+        out.append(f"  realized P&L (sells + dividends, net of fees): ${realized:+,.2f}")
+    out.append("  ✓ import would succeed — run without --dry-run for the full brief")
+    sys.stdout.write("\n".join(out) + "\n")
+    run["dry_run"] = f"ok: {fmt}, {len(events)} events, {len(held)} holdings, {len(skipped)} skipped"
+    _log_run_summary(run)
+    return 0
+
+
 def _warm_cache(
     args: argparse.Namespace, run: dict[str, Any], parser: argparse.ArgumentParser
 ) -> int:
@@ -883,6 +982,49 @@ def _load_universe(status_key: str, run: dict[str, Any]) -> list[Candidate] | No
         return None
 
 
+def _onboarding_posture(parser: argparse.ArgumentParser) -> str:
+    """Ask the 3 risk questions on the terminal and return the matched preset posture.
+    Pure scoring lives in `app.onboard`; this only does the I/O. Accepts either the number
+    (1-3) or the option key; re-prompts on a bad line; treats EOF (piped/closed stdin) as an
+    abort that hard-exits via `parser.error` (so this never returns without a posture)."""
+    sys.stdout.write(
+        "\nStarting-allocation setup — 3 quick questions about risk. Your answers pick a "
+        "conservative / moderate / aggressive posture; nothing is bought.\n"
+    )
+    answers: dict[str, str] = {}
+    for q in QUESTIONS:
+        sys.stdout.write(f"\n{q.text}\n")
+        for i, opt in enumerate(q.options, start=1):
+            sys.stdout.write(f"  {i}) {opt.label}\n")
+        answers[q.key] = _ask_option(q, parser)
+    result = posture_from_answers(answers["horizon"], answers["loss_response"], answers["cash_buffer"])
+    sys.stdout.write(f"\nMatched posture: {result.posture.upper()}\n")
+    for line in result.rationale:
+        sys.stdout.write(f"  - {line}\n")
+    sys.stdout.write(
+        f"\nProposing a {result.posture} starting allocation below (propose-only — review "
+        "it, then backtest or rebalance toward it in a separate command).\n"
+    )
+    return result.posture
+
+
+def _ask_option(q: Question, parser: argparse.ArgumentParser) -> str:
+    """Read one answer for question `q`: a 1-based number or the option key. Re-prompts on
+    an invalid line; aborts the whole program cleanly on EOF (so a scripted empty stdin
+    doesn't loop forever)."""
+    keys = [o.key for o in q.options]
+    while True:
+        try:
+            raw = input(f"Your answer [1-{len(q.options)}]: ").strip()
+        except EOFError:
+            parser.error("--onboard needs interactive answers; run it in a terminal")
+        if raw.isdigit() and 1 <= int(raw) <= len(q.options):
+            return keys[int(raw) - 1]
+        if raw in keys:
+            return raw
+        sys.stdout.write(f"  (enter 1-{len(q.options)}, or one of: {', '.join(keys)})\n")
+
+
 def _compute_allocation(
     state: DerivedState,
     prices: dict[str, PriceRow] | None,
@@ -913,18 +1055,19 @@ def _compute_allocation(
         )
         run["allocate"] = f"refused: {rule} unvalidated edge"
         return
-    if not prices:
-        log.warning("--allocate needs prices; remove --no-prices")
-        run["allocate"] = "skipped: --no-prices"
-        return
-    values = held_market_value(state, prices)
-    priced = sorted(values)  # CASH never reaches here (not held); allocate() also guards
-    if not priced:
-        log.warning("--allocate: no priced holdings to allocate over")
-        run["allocate"] = "skipped: no prices"
-        return
-
-    if rule in PRESETS:  # a strategic role-bucket template, not a reweight of holdings
+    if rule in PRESETS:  # a strategic role-bucket template — holdings-OPTIONAL (a prior)
+        # A preset fills each role with the holder's fund or a universe default, so it works
+        # even for a brand-new book with nothing held yet (→ pure universe defaults — the
+        # step-0 / --onboard case). But a book that HAS holdings which just aren't priced
+        # (cold/offline cache) would silently ignore them, so warn instead of pretending.
+        values = held_market_value(state, prices) if prices else {}
+        if state.held() and not values:
+            log.warning(
+                "--allocate: your holdings aren't priced (cold cache?) — warm the cache so "
+                "the preset can anchor on the fund you already hold per role"
+            )
+            run["allocate"] = "skipped: holdings unpriced"
+            return
         universe = _load_universe("allocate", run)
         if universe is None:
             return
@@ -935,6 +1078,18 @@ def _compute_allocation(
             run["allocate"] = "skipped: bad cap"
             return
     else:
+        # Mechanical rules (equal_weight / inverse_vol) REWEIGHT current holdings — they
+        # need priced holdings to operate over.
+        if not prices:
+            log.warning("--allocate needs prices; remove --no-prices")
+            run["allocate"] = "skipped: --no-prices"
+            return
+        values = held_market_value(state, prices)
+        priced = sorted(values)  # CASH never reaches here (not held); allocate() also guards
+        if not priced:
+            log.warning("--allocate: no priced holdings to allocate over")
+            run["allocate"] = "skipped: no prices"
+            return
         rows = None
         if needs_series(rule):  # rule weighs on return history (inverse_vol)
             src = series  # reuse the history already fetched for the brief (no refetch)

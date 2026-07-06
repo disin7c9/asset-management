@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from app.events import VALID_ACTIONS, load_events, load_target
+from app.events import VALID_ACTIONS, load_events, load_events_report, load_target
 
 _HEADER = "Date,Code,DataSource,Currency,Price,Quantity,Action,Fee,Note\n"
 
@@ -183,6 +183,38 @@ def test_loads_a_ghostfolio_json_export(tmp_path: Path) -> None:
 
 def test_ghostfolio_json_accepts_a_bare_activities_list(tmp_path: Path) -> None:
     assert load_events(_gf_json(tmp_path, [_act()], wrap=False))[0].ticker == "VOO"
+
+
+def test_load_events_report_returns_warnings_and_format(tmp_path: Path) -> None:
+    # The dry-run seam: same events as load_events, PLUS the skip reasons and the format
+    # label (which load_events only logs). A non-USD activity is dropped with a reason.
+    p = _gf_json(tmp_path, [_act(), _act(symbol="SAP.DE", currency="EUR")])
+    events, warnings, fmt = load_events_report(p)
+    assert fmt == "ghostfolio-json"
+    assert [e.ticker for e in events] == ["VOO"]  # the EUR row was skipped
+    assert len(warnings) == 1 and "EUR" in warnings[0] and "SAP.DE" in warnings[0]
+    # It agrees with load_events on the accepted events (no drift between the two paths).
+    assert [e.ticker for e in load_events(p)] == [e.ticker for e in events]
+
+
+def test_load_events_report_csv_has_no_skips(tmp_path: Path) -> None:
+    p = _csv(tmp_path, _HEADER + "2024-01-02,VOO,YAHOO,USD,400,10,buy,0,\n")
+    events, warnings, fmt = load_events_report(p)
+    assert fmt == "csv" and warnings == [] and len(events) == 1
+
+
+def test_load_events_report_still_raises_on_malformed(tmp_path: Path) -> None:
+    p = _csv(tmp_path, "Date,Code,Nope\n2024-01-01,VOO,x\n")
+    with pytest.raises(ValueError, match="missing required column"):
+        load_events_report(p)
+
+
+def test_load_events_report_raises_on_a_bad_row(tmp_path: Path) -> None:
+    # A well-formed header but a row-level violation (unknown action) must raise through the
+    # report seam too — not just parse-level column errors (the --dry-run rc-2 path relies on it).
+    p = _csv(tmp_path, _HEADER + "2024-01-02,VOO,YAHOO,USD,400,1,teleport,0,\n")
+    with pytest.raises(ValueError):
+        load_events_report(p)
 
 
 def test_ghostfolio_dividend_is_quantity_times_unitprice(tmp_path: Path) -> None:

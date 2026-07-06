@@ -40,7 +40,7 @@ import math
 import os
 import re
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from importlib.metadata import PackageNotFoundError, version as _pkg_version
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
@@ -61,6 +61,7 @@ from app.pipeline import (
     warm_cache,
 )
 from app.allocate import PRESETS, build_preset_target
+from app.onboard import posture_from_answers
 from app.backtest import (
     BENCHMARKS,
     BenchmarkVerdict as BenchmarkWord,  # the verdict-word Literal; aliased to avoid the model name
@@ -72,7 +73,7 @@ from app.discover import find_gaps
 from app.events import CASH_TICKER, Event, load_events, load_target
 from app.log_config import setup_logging
 from app.metadata import fetch_metadata
-from app.prices import PriceRow, fetch_series
+from app.prices import PriceRow, SeriesResult, fetch_series
 from app.returns import ReturnsSummary
 from app.risk import DollarDrawdown, MetricCI, RiskSummary
 from app.screen import screen_candidates
@@ -242,6 +243,7 @@ class _Build:
     missing: list[str]            # held tickers with no usable cached price
     dollar_dd: DollarDrawdown | None
     daily: "pd.Series[float] | None" = None  # the book's daily return series (for screen_candidate)
+    series: SeriesResult | None = None  # the price history behind the risk panel (for provenance)
 
 
 def _build(*, no_risk: bool, today: date) -> _Build:
@@ -257,7 +259,7 @@ def _build(*, no_risk: bool, today: date) -> _Build:
         "status": "ok", "n_prices_fetched": 0, "n_prices_missing": 0,
         "n_series_fetched": 0, "n_series_missing": 0, "fallbacks_used": 0,
     }
-    prices, returns, risk, missing, _twr_excluded, dollar_dd, _series, daily = (
+    prices, returns, risk, missing, _twr_excluded, dollar_dd, series, daily = (
         compute_prices_returns_risk(
             events, state, no_risk=no_risk, offline=True,
             cache_dir=cache, today=today, run=run,
@@ -266,7 +268,7 @@ def _build(*, no_risk: bool, today: date) -> _Build:
     log.info("mcp build (offline, no_risk=%s): %s", no_risk, run)
     return _Build(
         state=state, prices=prices or {}, returns=returns, risk=risk,
-        missing=missing, dollar_dd=dollar_dd, daily=daily,
+        missing=missing, dollar_dd=dollar_dd, daily=daily, series=series,
     )
 
 
@@ -308,12 +310,32 @@ class Returns(BaseModel):
     modified_dietz_annualized: float | None
 
 
+class DataProvenance(BaseModel):
+    """A receipt for the price data underlying these numbers: what source, how fresh.
+    ``asof`` on a tool is the request date; THIS says when the prices are actually from
+    and how stale the cache is — so a reader can weigh 'computed today' against 'from a
+    close 6 days old, last fetched 40h ago'. (No 'offline' flag: a one-time cold-start
+    warm may fetch on the first call, so ``sources`` — cache vs yfinance/stooq — is the
+    honest signal, not a blanket 'no network' claim.)"""
+
+    price_asof: date | None = Field(
+        None, description="date of the latest close underlying these numbers (null if unpriced)"
+    )
+    sources: list[str] = Field(
+        default_factory=list, description="distinct price providers used: cache | yfinance | stooq"
+    )
+    stalest_fetch_hours: float | None = Field(
+        None, description="age of the STALEST price used — how long since it was last fetched"
+    )
+
+
 class PortfolioSummary(BaseModel):
     asof: date
     offline: bool = True
     holdings: list[Holding]
     totals: Totals
     returns: Returns
+    provenance: DataProvenance
     unpriced_tickers: list[str] = Field(description="held tickers with no usable cached price")
     note: str = _OFFLINE_NOTE
 
@@ -360,6 +382,7 @@ class RiskReport(BaseModel):
     sortino: CI | None = Field(None, description="null with no downside days (undefined)")
     calmar: CI | None = Field(None, description="null when there's no drawdown (undefined)")
     dollar_drawdown: DollarDD | None
+    provenance: DataProvenance
     note: str = _OFFLINE_NOTE
 
 
@@ -529,10 +552,7 @@ def _holdings_and_totals(b: _Build) -> tuple[list[Holding], Totals]:
                 realized_pnl=b.state.realized.get(tk, 0.0),
                 weight=(mv / total) if (mv is not None and total > 0) else None,
                 price_source=pr.source if pr is not None else None,
-                price_age_hours=(
-                    round(pr.cache_age.total_seconds() / 3600.0, 1)
-                    if pr is not None else None
-                ),
+                price_age_hours=_age_hours(pr.cache_age) if pr is not None else None,
             )
         )
     unreal = sum(mv - held[tk].cost_basis for tk, mv in value.items())
@@ -546,6 +566,40 @@ def _holdings_and_totals(b: _Build) -> tuple[list[Holding], Totals]:
         net_pnl=unreal + realized,
     )
     return rows, totals
+
+
+def _age_hours(age: timedelta) -> float:
+    """A timedelta → hours, 1 decimal, clamped ≥ 0 (clock-skew safe). One definition for
+    the per-holding `price_age_hours` and the provenance rollup, so they can't drift."""
+    return round(max(age, timedelta(0)).total_seconds() / 3600.0, 1)
+
+
+def _data_provenance(b: _Build) -> DataProvenance:
+    """A provenance receipt for the data behind the numbers: newest close date, the distinct
+    providers, and the STALEST fetch age. Prefers the priced holdings (`b.prices`, what
+    portfolio_summary values). Falls back to the risk panel's price *history* (`b.series`)
+    when nothing is currently held but risk was still computed from past holdings — a
+    fully-exited book — so risk_report never shows numbers next to an all-null receipt.
+    Empty only when there is genuinely no price data to stamp."""
+    rows = list(b.prices.values())
+    if rows:
+        return DataProvenance(
+            price_asof=max(pr.asof_date for pr in rows),
+            sources=sorted({pr.source for pr in rows}),
+            stalest_fetch_hours=max(_age_hours(pr.cache_age) for pr in rows),
+        )
+    series = b.series
+    if series is not None and series.rows:
+        now = datetime.now(timezone.utc)
+        prov = series.provenance
+        return DataProvenance(
+            price_asof=max(s.index[-1].date() for s in series.rows.values()),
+            sources=sorted({src for src, _ in prov.values()}),
+            stalest_fetch_hours=(
+                max(_age_hours(now - fetched) for _, fetched in prov.values()) if prov else None
+            ),
+        )
+    return DataProvenance(price_asof=None, sources=[], stalest_fetch_hours=None)
 
 
 # ── tools ────────────────────────────────────────────────────────────────────
@@ -572,6 +626,7 @@ def portfolio_summary() -> PortfolioSummary:
             money_weighted_annualized=r.money_weighted_annualized if r is not None else None,
             modified_dietz_annualized=r.modified_dietz_annualized if r is not None else None,
         ),
+        provenance=_data_provenance(b),
         unpriced_tickers=sorted(b.missing),
     )
 
@@ -626,6 +681,7 @@ def risk_report() -> RiskReport:
             )
             if ddd is not None else None
         ),
+        provenance=_data_provenance(b),
     )
 
 
@@ -873,6 +929,14 @@ def propose_allocation(preset: str = "moderate", benchmark: str = "60-40") -> Pr
     pset = preset.strip().lower()
     if pset not in PRESETS:
         raise ValueError(f"unknown preset {preset!r}; valid: {sorted(PRESETS)}.")
+    return _build_proposal(pset, benchmark, today)
+
+
+def _build_proposal(pset: str, benchmark: str, today: date) -> ProposedAllocation:
+    """Build a preset target over the book + universe and validate it against a benchmark.
+    The shared body of `propose_allocation` and `starter_allocation` — both must produce
+    IDENTICAL weights for a given posture, so there is exactly one build path. `pset` is a
+    validated preset; `benchmark` is validated here."""
     bench = benchmark.strip().lower()
     if bench != "none" and bench not in BENCHMARKS:
         raise ValueError(f"unknown benchmark {benchmark!r}; valid: {sorted(BENCHMARKS)} or 'none'.")
@@ -901,10 +965,50 @@ def propose_allocation(preset: str = "moderate", benchmark: str = "60-40") -> Pr
     )
 
 
+class StarterAllocation(BaseModel):
+    """The onboarding answer: the matched posture, WHY it was matched (the rubric's plain
+    reasons), and the full preset proposal for that posture — so a new user goes from three
+    answers to a reviewable starting allocation in one call."""
+
+    posture: str = Field(description="conservative | moderate | aggressive — from the answers")
+    score: int = Field(description="rubric score 0-6 (higher = more growth-tolerant)")
+    rationale: list[str] = Field(
+        description="one plain-language reason per answer, plus the scoring line — the "
+        "explainable trail from answers to posture; relay it, don't invent your own"
+    )
+    proposal: ProposedAllocation
+
+
+@mcp.tool(
+    annotations=_READ_ONLY,
+    description="Turn a new user's risk answers into a starting allocation. Pass the three "
+    "onboarding answers — horizon ('under_3_years' | '3_to_10_years' | 'over_10_years'), "
+    "loss_response ('sell' | 'hold' | 'buy_more'), cash_buffer ('no' | 'partly' | "
+    "'comfortably') — and it maps them to a conservative/moderate/aggressive posture (a "
+    "fixed, explainable rubric — never your guess) and returns that preset allocation "
+    "validated against a benchmark, same as propose_allocation. Ask the three questions in "
+    "plain language first, then call this with the chosen answer tokens. Propose-only: a "
+    "hand-designed starting posture, never a recommendation or a return forecast.",
+)
+def starter_allocation(
+    horizon: str, loss_response: str, cash_buffer: str, benchmark: str = "60-40"
+) -> StarterAllocation:
+    # Pure rubric (app.onboard) picks the posture; ValueError names the valid tokens for a
+    # bad answer, so the fence's honesty carries to onboarding too.
+    result = posture_from_answers(
+        horizon.strip().lower(), loss_response.strip().lower(), cash_buffer.strip().lower()
+    )
+    proposal = _build_proposal(result.posture, benchmark, date.today())
+    return StarterAllocation(
+        posture=result.posture, score=result.score,
+        rationale=list(result.rationale), proposal=proposal,
+    )
+
+
 # --- The chat front door: prompts + the trust manifest ------------------------------
 #
 # Prompts are user-controlled conversation starters (surfaced in the client's "+" menu):
-# they turn a blank chat box into a guided menu of what the 7 tools can actually answer,
+# they turn a blank chat box into a guided menu of what the 8 tools can actually answer,
 # and inject the honesty framing into the very FIRST user turn. The resource makes the
 # server's guarantees a *fetchable artifact* the model can cite verbatim when the user
 # asks "can I trust this?" — instructions steer the model; this one the USER can read.
@@ -963,6 +1067,28 @@ def fill_my_gaps() -> str:
         "Report each verdict with its named reasons (cost, liquidity, overlap, "
         "diversification), keeping WARN/FAIL reasons honest. These are candidates to "
         "research, never instructions to buy. " + _FIGURES_RULE
+    )
+
+
+@mcp.prompt(title="Find my starting allocation")
+def find_my_starting_allocation() -> str:
+    """New here? Answer 3 risk questions and get a starting allocation matched to them."""
+    return (
+        "Help me find a starting allocation. Ask me these three questions ONE AT A TIME, in "
+        "plain language, and wait for each answer:\n"
+        "1. When do I expect to spend most of this money? (within 3 years / in 3-10 years / "
+        "10+ years away)\n"
+        "2. If a $10,000 holding fell to $8,500 in a bad month, would I sell, hold, or buy "
+        "more?\n"
+        "3. Could I cover a surprise expense WITHOUT selling these investments? (no / partly "
+        "/ comfortably)\n"
+        "Then map my answers to the tokens and call starter_allocation "
+        "(horizon=under_3_years|3_to_10_years|over_10_years, "
+        "loss_response=sell|hold|buy_more, cash_buffer=no|partly|comfortably). Show the "
+        "matched posture with the rubric's rationale, then the proposed weights and each "
+        "holding's role, and relay the benchmark verdict exactly as returned. Be clear this "
+        "is a hand-designed starting posture, not an optimized or predicted-best portfolio. "
+        + _FIGURES_RULE
     )
 
 
