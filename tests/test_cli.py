@@ -324,6 +324,58 @@ def test_bare_run_prints_hint_not_a_brief(capsys: pytest.CaptureFixture[str]) ->
     assert "=== HOLDINGS ===" not in out  # nothing fabricated
 
 
+def test_demo_runs_the_brief_with_zero_setup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # The try-before-you-trust path: no --book, no repo checkout — the bundled example
+    # book is materialized from a package constant into the cache dir and run as-is.
+    # Fetchers stubbed as a belt: --no-prices skips them today, but this test must stay
+    # network-proof even if someone later exercises the priced demo path here.
+    monkeypatch.setattr("app.cli.fetch_latest", lambda *a, **k: PricesResult())
+    monkeypatch.setattr("app.cli.fetch_series", lambda *a, **k: SeriesResult())
+    with caplog.at_level(logging.INFO):
+        rc = main(["--demo", "--no-prices", "--cache-dir", str(tmp_path)])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "=== HOLDINGS ===" in out and "VOO" in out
+    assert (tmp_path / "demo_book.csv").exists()
+    assert _run_summary(caplog)["source"].endswith("demo_book.csv")
+
+
+def test_demo_conflicts_with_an_explicit_book() -> None:
+    with pytest.raises(SystemExit):  # parser.error → exit 2: --demo brings its own book
+        main(["--demo", "--book", str(SAMPLE)])
+
+
+def test_demo_ignores_a_personal_env_book(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A personal ASSET_BOOK must never leak into a demo run: --demo fills the book slot
+    # before the .env fallback, so the bogus path below would explode if it were read.
+    monkeypatch.setenv("ASSET_BOOK", "/nonexistent/personal.csv")
+    rc = main(["--demo", "--no-prices", "--cache-dir", str(tmp_path)])
+    assert rc == 0
+    assert "=== HOLDINGS ===" in capsys.readouterr().out
+
+
+def test_demo_ignores_a_personal_env_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The other half of demo insulation: a personal ASSET_TARGET must not silently steer
+    # a demo rebalance ("sell the demo book, buy MY tickers" is not a demo). With the env
+    # fallback skipped, --demo --rebalance without an explicit --target hits the normal
+    # "requires --target" contract error instead of the personal file.
+    monkeypatch.setenv("ASSET_TARGET", str(SAMPLE))  # a real, loadable file — must be ignored
+    with pytest.raises(SystemExit):
+        main(["--demo", "--no-prices", "--cache-dir", str(tmp_path),
+              "--rebalance", "to_total"])
+    # And the refused run left no demo residue: the hook runs AFTER the contract errors.
+    assert not (tmp_path / "demo_book.csv").exists()
+
+
 def _mock_backtest_series(monkeypatch: pytest.MonkeyPatch) -> None:
     """Patch fetch_series with 120 business days of gently rising sample-ticker prices."""
     import pandas as pd

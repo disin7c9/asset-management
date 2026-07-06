@@ -17,10 +17,18 @@ import anyio
 import pandas as pd
 import pytest
 from mcp.shared.memory import create_connected_server_and_client_session as client_session
-from mcp.types import CallToolResult, ListToolsResult
+from mcp.types import (
+    CallToolResult,
+    GetPromptResult,
+    ListPromptsResult,
+    ListResourcesResult,
+    ListToolsResult,
+    ReadResourceResult,
+)
+from pydantic import AnyUrl
 
 from app import prices as prices_mod
-from app.mcp_server import mcp
+from app.mcp_server import _VERSION, mcp
 from app.pipeline import _WARM_MARKER
 
 
@@ -96,6 +104,115 @@ def _list_tools() -> ListToolsResult:
 
 def _error_text(res: CallToolResult) -> str:
     return " ".join(getattr(c, "text", "") for c in res.content)
+
+
+def _get_prompt(name: str, arguments: dict[str, str] | None = None) -> GetPromptResult:
+    async def _go() -> GetPromptResult:
+        async with client_session(mcp) as client:
+            return await client.get_prompt(name, arguments)
+
+    return anyio.run(_go)
+
+
+def _list_prompts() -> ListPromptsResult:
+    async def _go() -> ListPromptsResult:
+        async with client_session(mcp) as client:
+            return await client.list_prompts()
+
+    return anyio.run(_go)
+
+
+def _list_resources() -> ListResourcesResult:
+    async def _go() -> ListResourcesResult:
+        async with client_session(mcp) as client:
+            return await client.list_resources()
+
+    return anyio.run(_go)
+
+
+def _read_resource(uri: str) -> ReadResourceResult:
+    async def _go() -> ReadResourceResult:
+        async with client_session(mcp) as client:
+            return await client.read_resource(AnyUrl(uri))
+
+    return anyio.run(_go)
+
+
+def test_prompts_cover_the_tool_surface() -> None:
+    # The chat front door: 5 conversation starters in the client's "+" menu, each with a
+    # description a non-finance user can pick from (blank-box problem).
+    res = _list_prompts()
+    names = {p.name for p in res.prompts}
+    assert names == {
+        "portfolio_checkup",
+        "whats_my_drawdown",
+        "should_i_rebalance",
+        "fill_my_gaps",
+        "propose_a_posture",
+    }
+    assert all(p.description for p in res.prompts)
+
+
+def test_every_prompt_carries_the_figures_rule() -> None:
+    # Each starter injects the honesty framing into the FIRST user turn: tool figures
+    # only, unavailable ≠ estimate, describe-don't-advise. One funnel (_FIGURES_RULE),
+    # so assert it survived into every rendered prompt, args included.
+    cases: list[tuple[str, dict[str, str] | None]] = [
+        ("portfolio_checkup", None),
+        ("whats_my_drawdown", None),
+        ("should_i_rebalance", None),
+        ("fill_my_gaps", None),
+        ("propose_a_posture", {"posture": "aggressive"}),
+    ]
+    for name, args in cases:
+        res = _get_prompt(name, args)
+        text = getattr(res.messages[0].content, "text", "")
+        assert "do not estimate" in text, name
+        assert "don't advise" in text, name
+    # The parameterized starter threads its argument through (checked on its OWN render,
+    # not a loop-leaked variable) — and validates it: an off-menu posture must error at
+    # prompt time, not open the conversation on a guaranteed tool failure.
+    posture_text = getattr(
+        _get_prompt("propose_a_posture", {"posture": "aggressive"}).messages[0].content,
+        "text", "",
+    )
+    assert "'aggressive'" in posture_text
+    with pytest.raises(BaseException) as ei:
+        _get_prompt("propose_a_posture", {"posture": "balanced"})
+    err: BaseException = ei.value
+    while isinstance(err, BaseExceptionGroup):  # anyio wraps the McpError in a TaskGroup
+        err = err.exceptions[0]
+    assert "conservative" in str(err)  # the error names the menu
+
+
+def test_env_path_treats_template_residue_as_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    # An MCPB host may substitute an UNSET optional user_config as the literal
+    # "${user_config.x}" string. That must route to the "not set" guidance, never to
+    # "points at a missing file: …/${user_config.x}".
+    from app.mcp_server import _env_path
+
+    monkeypatch.setenv("ASSET_TARGET", "${user_config.target}")
+    with pytest.raises(ValueError, match="is not set"):
+        _env_path("ASSET_TARGET", "point it at your target CSV")
+
+
+def test_guarantees_resource_is_the_trust_manifest() -> None:
+    # The four locks as a fetchable artifact (instructions steer the model; this one the
+    # USER can read) — listed, readable, versioned, and stating each guarantee.
+    listed = _list_resources()
+    assert any(str(r.uri) == "portfolio://guarantees" for r in listed.resources)
+    res = _read_resource("portfolio://guarantees")
+    text = getattr(res.contents[0], "text", "")
+    for must in (
+        "Read-only",
+        "never uploaded",
+        "Descriptions, not advice",
+        "financial advice",
+        "shallower",
+        "confidence interval",
+        _VERSION,
+    ):
+        assert must in text, must
 
 
 def test_tools_registered_and_read_only() -> None:

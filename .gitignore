@@ -43,3 +43,4 @@ reconcile/ghostfolio/ghostfolio-export-*.json
 .vscode/
 .idea/
 
+dist/

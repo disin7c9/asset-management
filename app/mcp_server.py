@@ -18,6 +18,10 @@ math. Design invariants (v2.0.0 Phase 1):
 - **Bound to one book** (`ASSET_BOOK`, or `ASSET_CSV` back-compat): tools take no
   file-path argument, so a caller can't point the server at an arbitrary file.
 
+The chat front door: 5 **prompts** (conversation starters in the client's "+" menu, each
+carrying the tool-figures-only framing) and a ``portfolio://guarantees`` **resource** —
+the four guarantees as a fetchable trust manifest the model can cite verbatim.
+
 stdout is the stdio transport, so **all logging goes to stderr** (`setup_logging`);
 nothing here writes to stdout. Tool errors surface as MCP errors, never a crash.
 
@@ -51,6 +55,7 @@ from app.pipeline import (
     cache_is_cold,
     candidate_and_held_facts,
     compute_prices_returns_risk,
+    default_cache_dir,
     held_market_value,
     load_book,
     warm_cache,
@@ -120,7 +125,9 @@ mcp: FastMCP = FastMCP(
         "the user it's unavailable and how to get it (e.g. warm the cache) — never "
         "substitute your own estimate, reconstruction, or factor-model guess. Lead with "
         "drawdown (depth/duration/recovery), report confidence intervals where given, and "
-        "never present output as financial advice."
+        "never present output as financial advice. If the user asks what this server can "
+        "do, or whether to trust it, read the portfolio://guarantees resource and answer "
+        "from it."
     ),
 )
 # FastMCP doesn't forward a version to its low-level Server, so serverInfo would otherwise
@@ -139,7 +146,10 @@ def _env_path(var: str, what: str, *, fallback: str | None = None) -> Path:
     raw = os.environ.get(var, "").strip()
     if not raw and fallback:
         raw = os.environ.get(fallback, "").strip()
-    if not raw:
+    # An MCPB host may substitute an UNSET optional user_config as the literal
+    # "${user_config.x}" placeholder (spec-undefined) — treat template residue as unset
+    # so the user gets the "not set" guidance, not a bogus missing-file path.
+    if not raw or raw.startswith("${"):
         raise ValueError(f"{var} is not set — {what}")
     p = Path(raw).expanduser()
     path = p if p.is_absolute() else _REPO_ROOT / p
@@ -161,12 +171,14 @@ def _env_book() -> Path:
 
 def _cache_dir() -> Path:
     """The price cache the tools read (offline). ``ASSET_CACHE_DIR`` overrides the
-    default ``data/prices`` (used by tests to point at a warmed temp cache)."""
+    default (checkout: ``data/prices``; installed/bundle: ``~/.asset-management/prices``
+    — never inside a host-managed extension dir, which updates wipe). Template residue
+    from an MCPB host (``${user_config...}``) is treated as unset."""
     raw = os.environ.get("ASSET_CACHE_DIR", "").strip()
-    if raw:
+    if raw and not raw.startswith("${"):
         p = Path(raw).expanduser()
         return p if p.is_absolute() else _REPO_ROOT / p
-    return _REPO_ROOT / "data" / "prices"
+    return default_cache_dir(_REPO_ROOT)
 
 
 def _offline_locked() -> bool:
@@ -887,6 +899,128 @@ def propose_allocation(preset: str = "moderate", benchmark: str = "60-40") -> Pr
         verdict=verdict, validation_note=validation_note,
         unpriced_holdings=sorted(b.missing),
     )
+
+
+# --- The chat front door: prompts + the trust manifest ------------------------------
+#
+# Prompts are user-controlled conversation starters (surfaced in the client's "+" menu):
+# they turn a blank chat box into a guided menu of what the 7 tools can actually answer,
+# and inject the honesty framing into the very FIRST user turn. The resource makes the
+# server's guarantees a *fetchable artifact* the model can cite verbatim when the user
+# asks "can I trust this?" — instructions steer the model; this one the USER can read.
+
+# Every starter ends with the same rule so no prompt can ship without the fence framing
+# (the prompt-level twin of _cold_error: one funnel, not five copies drifting apart).
+_FIGURES_RULE = (
+    "Use only figures the tools return, and quote confidence intervals where given. If a "
+    "figure is unavailable or a tool errors, say so and relay the tool's fix (e.g. warming "
+    "the cache) — do not estimate it. Plain language: explain any finance term in one "
+    "clause. Describe my portfolio; don't advise me what to do."
+)
+
+
+@mcp.prompt(title="Portfolio checkup")
+def portfolio_checkup() -> str:
+    """The full picture: holdings + returns + drawdown-first risk, in plain words."""
+    return (
+        "Give me a drawdown-first checkup of my portfolio. Call portfolio_summary and "
+        "risk_report, then: lead with the worst drawdown (depth, duration, recovery) and "
+        "what the Ulcer index / CDaR say about how the ride actually felt; then returns "
+        "(time-weighted vs money-weighted — note if they disagree and what that means); "
+        "then the holdings that drive the picture. " + _FIGURES_RULE
+    )
+
+
+@mcp.prompt(title="What's my drawdown?")
+def whats_my_drawdown() -> str:
+    """How deep my portfolio fell, how long it stayed down, and what that felt like."""
+    return (
+        "Call risk_report and explain my drawdown in plain words: how deep was the worst "
+        "fall (max drawdown, with its confidence interval), how long under water (peak → "
+        "trough → recovery, and the share of days spent below a previous high), and what "
+        "the Ulcer index and CDaR capture that a single worst-fall number misses. "
+        + _FIGURES_RULE
+    )
+
+
+@mcp.prompt(title="Should I rebalance?")
+def should_i_rebalance() -> str:
+    """Whether my own target bands say to act — each suggestion paired to its rule."""
+    return (
+        "Call rebalance_check and tell me whether my rebalance policy says to act. For "
+        "each suggested action, name the RULE that produced it and the drift figure "
+        "behind it; if nothing fires, say so plainly. These are descriptions of my own "
+        "configured policy — not recommendations. " + _FIGURES_RULE
+    )
+
+
+@mcp.prompt(title="Fill my gaps")
+def fill_my_gaps() -> str:
+    """Portfolio roles I'm light in + screened candidate ETFs for each (propose-only)."""
+    return (
+        "Call discover_gaps to find the portfolio roles I'm light in, then run "
+        "screen_candidate on the leading candidate for each gap (a handful at most). "
+        "Report each verdict with its named reasons (cost, liquidity, overlap, "
+        "diversification), keeping WARN/FAIL reasons honest. These are candidates to "
+        "research, never instructions to buy. " + _FIGURES_RULE
+    )
+
+
+@mcp.prompt(title="Propose a posture")
+def propose_a_posture(posture: str = "moderate") -> str:
+    """A starting allocation for a risk posture (conservative / moderate / aggressive) and how it held up vs a benchmark."""
+    p = posture.strip().lower()
+    if p not in PRESETS:  # validate at prompt time — a starter must not open on a tool error
+        raise ValueError(
+            f"unknown posture {posture!r} — pick one of: {', '.join(sorted(PRESETS))}"
+        )
+    return (
+        f"Call propose_allocation with preset '{p}'. Show the proposed weights and "
+        "what each holding is for (its role), then report the benchmark verdict exactly "
+        "as returned — the vocabulary is 'shallower/deeper/inconclusive/insufficient' by "
+        "design, never 'beats'; if the verdict is null, relay the tool's note on why. Be "
+        "clear this is a hand-designed posture prior, not an optimized or predicted-best "
+        "portfolio. " + _FIGURES_RULE
+    )
+
+
+@mcp.resource("portfolio://guarantees", mime_type="text/markdown")
+def guarantees() -> str:
+    """The trust manifest: what this server will and won't do — four guarantees enforced in code and pinned by tests."""
+    return f"""\
+# What this portfolio server will — and won't — do
+
+Version {_VERSION}. These are properties **enforced in code and pinned by the test
+suite**, not promises.
+
+**1. Read-only.** No tool can place a trade, move money, or edit your transaction log.
+There are no write tools; every tool is annotated read-only. The ledger is append-only,
+and only you write to it.
+
+**2. Every number is computed, never generated.** Figures come from a deterministic
+Python core — reconciled to the cent against a real brokerage export, and to 4 decimal
+places against quantstats. The AI assistant narrating this chat cannot compute, alter,
+or estimate a figure: when a value is unavailable, the tools say so (and how to fix it)
+rather than guessing, and the assistant is instructed to do the same.
+
+**3. Your data stays on your machine.** The server runs locally over stdio; there is no
+telemetry. The only network use is downloading public market data — price history (a
+one-time warm of a cold cache, plus any new ticker you ask it to screen) and published
+fund facts (expense ratio, fund size) for those tickers. Your transactions, holdings,
+and account values are never uploaded anywhere. Set `ASSET_MCP_OFFLINE=1` to forbid even
+those downloads.
+
+**4. Descriptions, not advice — structurally.** Every rebalance suggestion is paired to
+the named rule that produced it (e.g. "5/25 band breached"), every risk metric carries a
+confidence interval, and benchmark verdicts only ever say `shallower` / `deeper` /
+`inconclusive` / `insufficient` (too little data) — never "beats" or "buy this". A
+strategy claiming an *edge* must pass a walk-forward (out-of-sample) gate before it may
+even surface. You learn the rule; you decide.
+
+*How to verify: the source is open — the tests pin each property (read-only annotations,
+the number fence that rejects any model-authored digit, the walk-forward gate). Nothing
+in this chat is financial advice.*
+"""
 
 
 def run() -> None:

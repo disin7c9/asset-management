@@ -15,10 +15,13 @@ import pytest
 from app.metadata import MetadataResult, SecurityMeta
 from app.pipeline import (
     _WARM_MARKER,
+    DEMO_BOOK_CSV,
     benchmark_ref_tickers,
     cache_is_cold,
     candidate_and_held_facts,
+    default_cache_dir,
     warm_cache,
+    write_demo_book,
 )
 from app.prices import PricesResult, SeriesResult
 
@@ -77,6 +80,42 @@ def test_warm_cache_set_composition(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     assert counts["book_total"] == 2 and counts["book_missing"] == 0  # VOO/FOO (CASH dropped), none missing
     assert (tmp_path / _WARM_MARKER).exists()                 # stamps the marker → cache no longer cold
     assert cache_is_cold(tmp_path) is False
+
+
+def test_demo_book_is_byte_identical_to_the_committed_sample() -> None:
+    # --demo ships the book as a package constant (works for a no-checkout install);
+    # data/sample_data/transactions.csv is the browsable repo copy. Pin them so the
+    # README's example file and the demo can never drift apart.
+    sample = Path(__file__).resolve().parents[1] / "data" / "sample_data" / "transactions.csv"
+    assert DEMO_BOOK_CSV == sample.read_text(encoding="utf-8")
+
+
+def test_write_demo_book_materializes_into_the_cache_dir(tmp_path: Path) -> None:
+    path = write_demo_book(tmp_path / "fresh")  # the dir need not pre-exist
+    assert path == tmp_path / "fresh" / "demo_book.csv"
+    assert path.read_text(encoding="utf-8") == DEMO_BOOK_CSV
+
+
+def test_default_cache_dir_checkout_vs_installed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A repo checkout (.git present) keeps the historical data/prices; an INSTALLED
+    # root (site-packages under uvx, or the unpacked .mcpb dir) must NOT be written
+    # into — it's ephemeral (uv cache clean / extension updates) — so the default
+    # falls back to a stable per-user dir. The marker is .git, NOT pyproject.toml:
+    # the .mcpb bundle ships pyproject.toml and must still route to the user dir.
+    checkout = tmp_path / "repo"
+    (checkout / ".git").mkdir(parents=True)
+    assert default_cache_dir(checkout) == checkout / "data" / "prices"
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    for installed_name in ("site-packages", "bundle-with-pyproject"):
+        installed = tmp_path / installed_name
+        installed.mkdir()
+        (installed / "pyproject.toml").touch()  # the bundle case ships pyproject.toml
+        assert default_cache_dir(installed) == (
+            tmp_path / "home" / ".asset-management" / "prices"
+        )
 
 
 def _meta(tk: str) -> SecurityMeta:

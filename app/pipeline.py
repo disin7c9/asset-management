@@ -17,9 +17,9 @@ from collections.abc import Iterable
 from datetime import date, datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 
-if TYPE_CHECKING:
-    from pathlib import Path
+from pathlib import Path
 
+if TYPE_CHECKING:
     import pandas as pd
 
 from app.backtest import BENCHMARKS, benchmark_weights
@@ -49,6 +49,54 @@ from app.returns import (
 from app.risk import DollarDrawdown, RiskSummary, dollar_drawdown, summarize_risk
 
 log = logging.getLogger(__name__)
+
+def default_cache_dir(repo_root: Path) -> Path:
+    """The price-cache default for a surface rooted at ``repo_root``.
+
+    A repo checkout keeps the historical ``data/prices``. But when the package runs
+    INSTALLED (uvx / pip / the Claude-Desktop bundle), ``repo_root`` is site-packages or
+    the unpacked extension dir — writable-ish, but ephemeral (wiped by ``uv cache clean``
+    or an extension update) and invisible to the user. Fall back to a stable per-user
+    location instead. The checkout marker is ``.git``, NOT ``pyproject.toml`` — the
+    .mcpb bundle ships pyproject.toml, so that test would misroute the bundle's cache
+    into the host-managed extension dir.
+    """
+    if (repo_root / ".git").exists():  # a checkout, not an installed dist
+        return repo_root / "data" / "prices"
+    return Path.home() / ".asset-management" / "prices"
+
+
+# The bundled example book (--demo): a package constant rather than a repo data file, so
+# an installed / `uvx` run with no checkout can still materialize it. Kept byte-identical
+# to data/sample_data/transactions.csv (the browsable copy) — pinned by a test.
+DEMO_BOOK_CSV = """\
+Date,Code,DataSource,Currency,Price,Quantity,Action,Fee,Note
+2023-01-05,VOO,YAHOO,USD,365.00,10,buy,1.00,initial position
+2023-03-15,BND,YAHOO,USD,72.50,30,buy,1.00,
+2023-06-01,VOO,YAHOO,USD,395.00,5,buy,1.00,adding on dip
+2023-09-20,VOO,YAHOO,USD,22.40,0,dividend,0.00,quarterly dividend
+2024-02-10,IAU,YAHOO,USD,37.20,40,buy,1.00,gold hedge
+2024-04-01,VOO,YAHOO,USD,460.00,3,sell,1.00,trim winner
+2024-07-15,VOO,YAHOO,USD,19.80,0,dividend,0.00,
+2024-11-05,BND,YAHOO,USD,71.80,20,buy,1.00,
+2025-01-20,BND,YAHOO,USD,45.10,0,dividend,0.00,
+2025-05-10,IAU,YAHOO,USD,52.00,15,sell,1.00,take some profit
+2025-06-21,VEA,YAHOO,USD,40.2,15,buy,1.00,"""
+
+
+def write_demo_book(cache_dir: Path) -> Path:
+    """Materialize the bundled example book into the cache dir and return its path.
+
+    Rewritten on every call so the demo always matches the installed version. Raises
+    OSError when the cache dir can't be used — a demo has no book to degrade to, so
+    unlike the price caches it must fail loudly rather than run without a file.
+    """
+    resolved = ensure_cache_dir(cache_dir)
+    if resolved is None:
+        raise OSError(f"cache dir {cache_dir} is not writable")
+    path = resolved / "demo_book.csv"
+    path.write_text(DEMO_BOOK_CSV, encoding="utf-8")
+    return path
 
 
 def load_book(

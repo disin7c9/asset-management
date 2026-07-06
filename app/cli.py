@@ -52,10 +52,12 @@ from app.pipeline import (
     HISTORY_DAYS,
     candidate_and_held_facts,
     compute_prices_returns_risk,
+    default_cache_dir,
     held_market_value,
     load_book,
     record_series_fetch,
     warm_cache,
+    write_demo_book,
 )
 from app.allocate import (
     PRESETS,
@@ -83,7 +85,7 @@ log = logging.getLogger(__name__)
 # Paths resolved against the repo root (parent of the `app/` package), so the CLI
 # works no matter the current working directory.
 _REPO_ROOT: Path = Path(__file__).resolve().parents[1]
-_DEFAULT_CACHE: Path = _REPO_ROOT / "data" / "prices"
+_DEFAULT_CACHE: Path = default_cache_dir(_REPO_ROOT)  # checkout: data/prices; installed: ~/.asset-management
 _DEFAULT_REPORTS: Path = _REPO_ROOT / "reports"
 
 
@@ -114,9 +116,19 @@ def main(argv: list[str] | None = None) -> int:
         metavar="PATH",
         help="path to YOUR transaction file — a Ghostfolio-compatible CSV or a Ghostfolio JSON "
         "export (format auto-detected; --csv/--json are aliases). Required for the brief and for "
-        "--rebalance/--allocate/--dump-target/--save/--send. The bundled example is opt-in: "
-        "--book data/sample_data/transactions.csv. (--backtest --target works without it.) Set "
+        "--rebalance/--allocate/--dump-target/--save/--send. The bundled example is opt-in "
+        "via --demo. (--backtest --target works without it.) Set "
         "ASSET_BOOK in .env to make your book the default for book runs.",
+    )
+    parser.add_argument(
+        "--demo",
+        action="store_true",
+        help="run on a bundled example portfolio (VOO/BND/IAU/VEA) instead of your own "
+        "--book — a zero-setup taste of the brief before you trust the tool with your "
+        "data. Composes with the other panels (--metadata, --screen, --backtest, …); "
+        "the first priced run fetches online, then it's cached like any book. The demo "
+        "book is (re)written to <cache-dir>/demo_book.csv on each run; .env defaults "
+        "(ASSET_BOOK/ASSET_TARGET) are ignored so personal data can't mix in.",
     )
     parser.add_argument(
         "--cache-dir",
@@ -334,7 +346,7 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--benchmark compares --target against a reference; it needs --backtest")
     # No silent sample fallback: book-dependent actions operate on YOUR holdings, so
     # they require your transaction log. --backtest is notional (target-only) and is
-    # exempt; the bundled example is opt-in via an explicit --book path.
+    # exempt; the bundled example is opt-in via an explicit --demo.
     needs_book = bool(
         args.rebalance or args.allocate or args.dump_target or args.save or args.send
         or args.metadata or args.screen or args.narrate or args.discover is not None
@@ -342,10 +354,10 @@ def main(argv: list[str] | None = None) -> int:
     # Personal defaults from .env (gitignored; loaded above). ASSET_BOOK (or ASSET_CSV,
     # back-compat) fills --book for runs that want a book; a pure `--backtest --target` run
     # stays notional (book-free) by contract — pass --book explicitly to include your book.
-    # ASSET_TARGET fills --target only when a rule needs one. Explicit flags win.
-    if args.book is None and (needs_book or not args.backtest):
-        args.book = _env_path("ASSET_BOOK") or _env_path("ASSET_CSV")
-    if args.target is None and (args.rebalance or args.backtest or args.screen):
+    # ASSET_TARGET fills --target only when a rule needs one. Explicit flags win. A --demo
+    # run skips BOTH fallbacks: a demo must never mix the bundled book with a personal
+    # target (or vice versa) — "sell the demo, buy my real tickers" is not a demo.
+    if args.target is None and (args.rebalance or args.backtest or args.screen) and not args.demo:
         args.target = _env_path("ASSET_TARGET")  # screen: enables the role check row
     if (args.rebalance or args.backtest) and args.target is None:
         parser.error(
@@ -353,11 +365,24 @@ def main(argv: list[str] | None = None) -> int:
             "with --dump-target PATH, or pass data/sample_data/target.csv for the example; "
             "or set ASSET_TARGET in .env)"
         )
+    # --demo: materialize the bundled example book and run on it. The book ships as a
+    # package constant (not a repo file), so an installed/uvx run with no checkout works
+    # too. Placed AFTER the contract errors above (a refused run leaves no file behind)
+    # and BEFORE the ASSET_BOOK fallback below (a personal book can't leak into a demo).
+    if args.demo:
+        if args.book is not None:
+            parser.error("--demo runs the bundled example book — drop --book (or drop --demo)")
+        try:
+            args.book = write_demo_book(args.cache_dir)
+        except OSError as exc:
+            parser.error(f"--demo needs a writable cache dir: {exc}")
+    if args.book is None and (needs_book or not args.backtest):
+        args.book = _env_path("ASSET_BOOK") or _env_path("ASSET_CSV")
     if args.book is None and needs_book:
         parser.error(
             "this run needs your transaction file — pass --book PATH (a Ghostfolio-compatible "
-            "CSV or a Ghostfolio JSON export; or the bundled example: "
-            "--book data/sample_data/transactions.csv; or set ASSET_BOOK in .env). "
+            "CSV or a Ghostfolio JSON export; or try the bundled example via --demo; "
+            "or set ASSET_BOOK in .env). "
             "Only '--backtest --target FILE' runs without --book."
         )
     today = date.today()  # one as-of date for the title, the filename, and the log
@@ -398,8 +423,8 @@ def main(argv: list[str] | None = None) -> int:
             "No portfolio given. Pass --book PATH (a Ghostfolio-compatible CSV or a Ghostfolio "
             "JSON export) to see your brief, e.g.\n"
             "  uv run python -m app --book your_transactions.csv\n"
-            "or try the bundled example:\n"
-            "  uv run python -m app --book data/sample_data/transactions.csv\n"
+            "or test-drive a bundled example portfolio first (no setup needed):\n"
+            "  uv run python -m app --demo\n"
             "or set ASSET_BOOK=path/to/your-book in .env to make it the default.\n"
             "(to backtest a target without a book: --backtest --target FILE; "
             "see --help for all options)\n"

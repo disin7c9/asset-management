@@ -1,8 +1,47 @@
 # asset-management
 
-A small Python tool for tracking a personal portfolio of stocks and ETFs.
+[![gate](https://github.com/disin7c9/asset-management/actions/workflows/ci.yml/badge.svg)](https://github.com/disin7c9/asset-management/actions/workflows/ci.yml)
 
-Reads an append-only CSV transaction log (date, ticker, action, quantity, price, fee per row), replays it, and prints a **drawdown-first** brief: how far the portfolio fell from its peak (with a bootstrap confidence band), risk-adjusted ratios, time- and money-weighted returns, and current holdings. Holdings are *derived* from the log — never stored — so the same input always produces the same output. Prices are fetched from multiple sources with fallback and an on-disk cache; every displayed number is traceable to its source, and figures that can't be computed honestly (too-short a window, no real solution) print `n/a` rather than a fabricated number. **Stock splits are adjusted automatically** (share counts are reconciled with the split-adjusted price history), so a split during your holding period doesn't distort the returns.
+**Track a personal stock/ETF portfolio and get suggestions you can audit. Python computes every number; the optional AI narrates — and is structurally unable to write a figure of its own.**
+
+Most AI finance tools let the model produce the numbers. Here the model may only place `{{token}}` placeholders: a deterministic renderer substitutes figures from the validated core and **refuses the entire narration if the model typed even one digit itself**. Watch the fence catch a fabricated number:
+
+![the number fence refusing a fabricated figure](assets/fence.gif)
+
+Run that yourself — it drives the real production fence, no API key needed: `uv run python scripts/demo_fence.py`
+
+## What you get
+
+- A **drawdown-first brief** of your real holdings — how far you fell from your peak, how long underwater, what came back — with a bootstrap confidence band on every sampled risk statistic (returns are accounting identities, so they honestly carry none).
+- **Deterministic buy/sell suggestions** toward a target you choose, each line paired to the **named rule** that produced it — you learn the rule rather than trust a bot.
+- Optional, fenced **AI narration**, and a read-only **Claude Desktop addon** ("chat with your portfolio") over the same validated core.
+
+Holdings are *derived* from an append-only transaction log (date, ticker, action, quantity, price, fee per row) — never stored — so the same input always produces the same output. Prices are fetched from multiple sources with fallback and an on-disk cache; every displayed number is traceable to its source, and figures that can't be computed honestly (too short a window, no real solution) print `n/a` rather than a fabricated number. **Stock splits are adjusted automatically** (share counts are reconciled with the split-adjusted price history), so a split during your holding period doesn't distort the returns.
+
+## Try it in 60 seconds (bundled fake portfolio, no setup)
+
+```bash
+uvx --from git+https://github.com/disin7c9/asset-management asset-management --demo
+```
+
+or from a clone: `uv sync && uv run python -m app --demo`. When the output earns your trust, point it at your own data: `--book your.csv` (the CSV format, and reading a Ghostfolio JSON export directly, are documented below).
+
+## Not financial advice — structurally, not as fine print
+
+The *shape* of the output is what makes this a description rather than advice:
+
+- every suggestion is paired to the **named rule** that fired ("5/25 band breached — trim X"), never a bare "buy X";
+- every sampled risk metric carries a **confidence interval**, and too-little-data says so (`inconclusive`, `insufficient`, `n/a`) instead of pretending;
+- benchmark verdicts only say **`shallower` / `deeper` / `inconclusive` / `insufficient`** — the vocabulary has no "beats";
+- anything claiming an *edge* must pass a **walk-forward (out-of-sample) gate** before it may surface a suggestion — in-sample-only numbers are refused by design;
+- the tool is **read-only**: it never trades, and the AI can never write to your ledger.
+
+## Correctness is a claim you can check
+
+- the [gate](.github/workflows/ci.yml) runs the full test suite + `mypy --strict` + ruff on every push to `main` and every PR — the badge at the top is that gate, live;
+- holdings, market value, and P&L are reconciled **to the cent** against [Ghostfolio](https://ghostfol.io), and Sharpe/Sortino/drawdown **to 4 decimals** against quantstats → [reconcile/RESULTS.md](reconcile/RESULTS.md);
+- every formula is written down in [MATH.md](MATH.md);
+- the number fence is a script you can poke yourself: [`scripts/demo_fence.py`](scripts/demo_fence.py).
 
 ## Requirements
 
@@ -18,7 +57,8 @@ uv sync
 ## Run
 
 ```bash
-uv run python -m app --book data/sample_data/transactions.csv  # the bundled example book (opt-in)
+uv run python -m app --demo                   # zero-setup test drive on the bundled example book
+uv run python -m app --book data/sample_data/transactions.csv  # the same example via its repo path
 uv run python -m app --book path/to/your.csv  # your own book: holdings + returns + risk
 uv run python -m app --book your.csv --no-risk    # skip the holdings drawdown/risk panel (a --backtest still shows its own)
 uv run python -m app --book your.csv --no-prices  # holdings + realized P&L only (no network)
@@ -57,7 +97,7 @@ The report is **composable panels**, not exclusive modes — combine flags and t
 | `--backtest --benchmark REF` | `--target` | validate a target vs a canonical reference (`60-40` / `all-weather` / `permanent`) — drawdown-first legs + a walk-forward held-out verdict |
 | `--narrate` | `--book` + an LLM key | a plain-language **SUMMARY** at the top of the brief; the model writes only the words, every number is substituted and verified from the core (opt-in, off by default — see [Narration](#narration-optional-plain-language-summary)) |
 
-There is **no silent built-in default**: a book-dependent action without `--book` errors out, and a bare `python -m app` prints a hint — the bundled example is opt-in (`--book data/sample_data/transactions.csv`), never assumed. `--allocate` is **propose-only** and cannot be combined with `--rebalance`/`--backtest` (review the written file, then act on it in a separate command). A `target.csv` is one you create with `--dump-target` / `--allocate-out` (or use `data/sample_data/target.csv`).
+There is **no silent built-in default**: a book-dependent action without `--book` errors out, and a bare `python -m app` prints a hint — the bundled example is opt-in (`--demo`, or `--book data/sample_data/transactions.csv`), never assumed. `--allocate` is **propose-only** and cannot be combined with `--rebalance`/`--backtest` (review the written file, then act on it in a separate command). A `target.csv` is one you create with `--dump-target` / `--allocate-out` (or use `data/sample_data/target.csv`).
 
 **Your own default** lives in a gitignored `.env` at the repo root: set `ASSET_BOOK=path/to/your.csv` (and optionally `ASSET_TARGET=path/to/target.csv`; `~` is expanded, relative paths resolve against the repo root; the older `ASSET_CSV` name is still honored) and a bare `python -m app` becomes your brief, `--rebalance MODE` alone works, etc. Explicit flags always win, and the pure `--backtest --target` run stays book-free by contract — pass `--book` explicitly to stack your status panel onto a backtest.
 
@@ -117,7 +157,7 @@ It reads the activities (a dividend's cash = `quantity × unitPrice`; Ghostfolio
 
 The drawdown panel also reports **Gains given back** — the largest dollar decline in your cumulative market profit (the felt "how much did I watch evaporate"). It's flow-neutral: deposits, withdrawals, and trades cancel, so funding and broker transfers don't distort it (the raw account balance would dip on every transfer).
 
-Example output (drawdown leads, then risk-adjusted ratios, then returns, then holdings):
+Example output — the shape `--demo` prints (drawdown leads, then risk-adjusted ratios, then returns, then holdings):
 
 ```
 === DRAWDOWN (investment, time-weighted) ===
@@ -156,7 +196,7 @@ Prices: 4 cache  (age: 6.2h .. 6.2h old as of 2026-06-02 02:42 UTC)
 Generated by asset-management. Figures are deterministic and reconciled against ghostfolio + quantstats; this is not financial advice.
 ```
 
-Confidence bands come from a moving-block bootstrap. Drawdown is *investment* (time-weighted) drawdown, not account-balance drawdown. Each run also emits one structured JSON log line (`run_summary`) on stderr: `{date, source, n_events_replayed, n_prices_fetched, n_prices_missing, n_series_fetched, n_series_missing, fallbacks_used, status, report_saved, email_sent, rebalance, backtest, allocate, dump_target, metadata, screen, narrate, discover, discover_narrate, benchmark_narrate}` (with `email_detail`/`error` present when relevant).
+Confidence bands come from a moving-block bootstrap. Drawdown is *investment* (time-weighted) drawdown, not account-balance drawdown. Each run also emits one structured JSON log line (`run_summary`) on stderr: `{date, source, n_events_replayed, n_prices_fetched, n_prices_missing, n_series_fetched, n_series_missing, fallbacks_used, status, report_saved, email_sent, rebalance, backtest, allocate, dump_target, metadata, screen, narrate, discover, discover_narrate, benchmark_narrate, warm}` (with `email_detail`/`error` present when relevant).
 
 ## MCP server (read-only, for AI assistants)
 
@@ -170,7 +210,41 @@ Expose your portfolio to an AI assistant (Claude Desktop, Claude Code, …) as *
 - **`screen_candidate`** — judge a NEW candidate ticker against your book (diversifier/cost/liquidity/age/overlap, each with a reason); fetches the ticker on demand if it isn't cached (unless `ASSET_MCP_OFFLINE`).
 - **`propose_allocation`** — a strategic target for a posture (`conservative`/`moderate`/`aggressive`) over your book + the universe, validated against a reference (`60-40`/`all-weather`/`permanent`) with a walk-forward held-out drawdown verdict — propose-only, numbers from the core, never a recommendation.
 
-Run it directly, or register it with Claude Code:
+**One-click install (Claude Desktop):** grab `asset-management-<version>.mcpb` from the
+[Releases page](https://github.com/disin7c9/asset-management/releases) (or build it yourself:
+`uv run python scripts/build_mcpb.py`), then Claude Desktop → Settings → Extensions →
+**Install Extension…** → pick the file. The install dialog asks for your transaction file
+(pre-filled with the **bundled demo portfolio** so you can explore on fake data first), a
+price-cache folder, an optional target CSV, and a strict-offline toggle. Nothing else to
+install — Claude Desktop's `uv` runtime resolves Python and the locked dependencies itself.
+
+**In chat:** open the **+** menu for ready-made starters — *Portfolio checkup*, *What's my
+drawdown?*, *Should I rebalance?*, *Fill my gaps*, *Propose a posture* — each one pre-loads
+the figures-only framing. The server also publishes `portfolio://guarantees` (its four
+enforced guarantees, versioned, shipped with the code): attach it from the same **+** menu —
+or, in clients that let the model read resources itself, just ask "can I trust these
+numbers?" and it answers from the manifest instead of improvising.
+
+**If the extension says "Unable to connect":** check `%APPDATA%\Claude\logs\main.log` —
+- `Failed to read version of python binary "python3"/"python" … 9009`: your Claude
+  Desktop build refuses to start uv extensions without *a* system Python answering on
+  PATH (even though the extension ships its own). Install any Python 3 (`winget install
+  Python.Python.3.12`) **and** turn OFF the two `python` App Execution Aliases
+  (Settings → Apps → Advanced app settings → App execution aliases) — Microsoft's Store
+  stubs otherwise keep answering the probe with garbage. Restart Claude Desktop.
+- `No MCP config found for extension … skipping`: Desktop only launches the server once
+  the Configure form has been **saved**, and it ignores the pre-filled defaults until
+  then — but the Save button stays disabled if you change nothing. Toggle any field
+  (e.g. *Strictly offline* on and off) so Save activates, save, restart Claude Desktop.
+- An *install* failing with `os error 32` (file in use): don't rapid-retry — fully quit
+  Claude Desktop, re-open, install once; or use the registration route below.
+- Extension connects and the **+** starters attach, but the model says it has no tools
+  and the tools menu is empty: the extension itself is fine — check your Claude Desktop
+  configuration for the signed-in *account* (Settings → Extensions and the chat's tools
+  menu). In our testing the same machine behaved differently under two accounts on the
+  same plan, so if another account is available, trying it isolates the problem fast.
+
+Or run the server directly / register it with Claude Code:
 
 ```bash
 uv run python -m app.mcp_server                                    # serve over stdio (set ASSET_BOOK in .env)
@@ -226,6 +300,7 @@ Add **`--narrate`** (the same opt-in LLM key as the brief SUMMARY) and a short p
 uv run pytest                  # unit + property-based + regression tests
 uv run mypy app/               # strict type-checking
 uv run ruff check app/ tests/  # lint
+uv run python scripts/build_mcpb.py  # package the Claude-Desktop addon → dist/asset-management-<v>.mcpb
 ```
 
 ## Layout
@@ -244,6 +319,7 @@ asset-management/
 │   ├── allocate.py   choose a target: equal_weight / inverse_vol + per-asset caps
 │   ├── screen.py     judge NEW candidate tickers (diversifier / cost / liquidity / age / overlap)
 │   ├── backtest.py   notional rebalanced-vs-buy-and-hold simulation
+│   ├── pipeline.py   the shared book→prices→returns→risk bundle (cli + mcp_server) + cache warm + the --demo book
 │   ├── report.py     suggestions + backtest + state + prices + returns + risk → ReportData → text/markdown/HTML
 │   ├── narrate.py    fenced narration: validated figures → {{token}} prose → SUMMARY (pure; no number can be the model's)
 │   ├── llm.py        optional narrator backend (OpenAI-compatible + Anthropic); fail-closed, opt-in
@@ -257,6 +333,9 @@ asset-management/
 │   └── __init__.py
 ├── tests/            automated suite (unit, property, regression) — offline, run on every change
 ├── reconcile/        manual cross-validation against external tools (ghostfolio, quantstats)
+├── scripts/          build_universe.py (refresh the ETF universe) · build_mcpb.py (Claude-Desktop bundle) · demo_fence.py (poke the fence)
+├── assets/           README media (the fence demo GIF)
+├── .github/          the gate: ruff + mypy --strict + pytest on every push to main + every PR
 ├── pyproject.toml    dependencies, mypy/ruff config
 └── README.md
 ```
