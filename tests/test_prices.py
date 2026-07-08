@@ -443,10 +443,42 @@ def test_latest_series_fallback_respects_asof(tmp_path: Path) -> None:
     assert res.rows["VOO"].close == 11.0
 
 
-def test_latest_stale_series_cache_not_served_offline(tmp_path: Path) -> None:
+def test_latest_stale_series_cache_served_offline(tmp_path: Path) -> None:
+    # Offline, a series cache older than the TTL is still served: the TTL exists to
+    # trigger a re-fetch, and offline there is nothing to fetch — the newest cached
+    # close (honestly dated) beats reporting the holding missing. (A cache warmed one
+    # evening is already >20h old by the next evening; that must not blank the book.)
     _write_series_cache(
         tmp_path / "VOO_series.parquet", _DAYS, [1.0, 2.0, 3.0],
-        datetime.now(timezone.utc) - timedelta(days=3),  # stale → not served
+        datetime.now(timezone.utc) - timedelta(days=3),  # stale, but offline serves it
+    )
+    res = fetch_latest(["VOO"], asof_date=date(2024, 1, 3), cache_dir=tmp_path, online=False)
+    assert res.rows["VOO"].source == "cache"
+    assert res.rows["VOO"].close == 3.0  # last close ≤ asof
+    assert res.missing == []
+
+
+def test_series_cache_stale_served_offline(tmp_path: Path) -> None:
+    # Same age-tolerance for the price *history* (risk/backtest): offline, fetch_series
+    # serves a stale-but-covering cache instead of reporting it missing.
+    _write_series_cache(
+        tmp_path / "VOO_series.parquet", _DAYS, [1.0, 2.0, 3.0],
+        datetime.now(timezone.utc) - timedelta(days=3),  # stale
+    )
+    res = fetch_series(
+        ["VOO"], date(2024, 1, 1), date(2024, 1, 3), cache_dir=tmp_path, online=False
+    )
+    assert res.missing == []
+    assert list(res.rows["VOO"].round(1)) == [1.0, 2.0, 3.0]
+    assert res.provenance["VOO"][0] == "cache"
+
+
+def test_latest_series_future_stamp_still_refused_offline(tmp_path: Path) -> None:
+    # Age-tolerance must NOT weaken the future-stamp guard: a future fetched_at is
+    # corruption / clock-skew, not mere staleness, so it is rejected even offline.
+    _write_series_cache(
+        tmp_path / "VOO_series.parquet", _DAYS, [1.0, 2.0, 3.0],
+        datetime.now(timezone.utc) + timedelta(hours=24),  # future-stamped → refused
     )
     res = fetch_latest(["VOO"], asof_date=date(2024, 1, 3), cache_dir=tmp_path, online=False)
     assert res.missing == ["VOO"]
@@ -505,6 +537,31 @@ def test_latest_nat_series_cache_not_served_offline(tmp_path: Path) -> None:
     assert res.missing == ["VOO"]
 
 
+def test_latest_cache_future_stamp_still_refused_offline(tmp_path: Path) -> None:
+    # Offline age-tolerance (allow_stale) must NOT weaken the future-stamp guard on the DEDICATED
+    # latest cache either — a future/clock-skewed row is corruption, not staleness (T1). (The
+    # existing series-cache future-stamp test covers _latest_from_series_cache; this covers
+    # _from_cache, the function the allow_stale wiring changed.)
+    asof = date(2024, 1, 3)
+    _write_cache_row(
+        tmp_path / "VOO.parquet", asof, 99.0,
+        datetime.now(timezone.utc) + timedelta(hours=24),  # future-stamped → refused
+    )
+    res = fetch_latest(["VOO"], asof_date=asof, cache_dir=tmp_path, online=False)
+    assert res.missing == ["VOO"]
+
+
+def test_latest_series_too_old_not_served_offline(tmp_path: Path) -> None:
+    # Offline serves a stale cache, but NOT a series tail older than the floor (P2): don't pass
+    # off a months-old close as a "current" price. fetched_at is fresh; the DATA is old.
+    _write_series_cache(
+        tmp_path / "VOO_series.parquet", _DAYS, [1.0, 2.0, 3.0],
+        datetime.now(timezone.utc) - timedelta(hours=1),  # freshly fetched, but tail is 2024-01-03
+    )
+    res = fetch_latest(["VOO"], asof_date=date(2024, 6, 1), cache_dir=tmp_path, online=False)
+    assert res.missing == ["VOO"]  # tail 2024-01-03 is ~5 months before asof → beyond the floor
+
+
 # ── fetch_splits (slice 7: corporate actions) ──────────────────────────────
 
 
@@ -537,6 +594,42 @@ def test_fetch_splits_no_splits_cached_as_empty(
 def test_fetch_splits_offline_no_cache_is_empty(tmp_path: Path) -> None:
     # Unknown offline → no adjustment (the price-basis-mismatch guard is the net).
     assert fetch_splits(["XYZ"], cache_dir=tmp_path, online=False) == {"XYZ": []}
+
+
+def _write_splits_row(path: Path, when: str, ratio: float, fetched_at: datetime) -> None:
+    pd.DataFrame({
+        "date": [pd.Timestamp(when)], "ratio": [ratio],
+        "fetched_at": [pd.Timestamp(fetched_at)],
+    }).to_parquet(path, index=False)
+
+
+def test_fetch_splits_stale_cache_served_offline(tmp_path: Path) -> None:
+    # Offline, a >7d-stale splits cache is SERVED, not dropped — splits are stable facts. Else a
+    # split holding would be valued with pre-split shares at a post-split price (P1): the price
+    # path now serves stale offline, so the split path must too, or the two decouple.
+    _write_splits_row(
+        tmp_path / "NVDA_splits.parquet", "2024-06-10", 10.0,
+        datetime.now(timezone.utc) - timedelta(days=30),  # well past the 7d splits TTL
+    )
+    assert fetch_splits(["NVDA"], cache_dir=tmp_path, online=False)["NVDA"] == [(date(2024, 6, 10), 10.0)]
+
+
+def test_fetch_splits_stale_cache_refetched_online(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Online, the SAME >7d cache is refetched (the TTL still triggers a refresh, catching a new
+    # split) — the age-tolerance is offline-only, the online contract is unchanged.
+    _write_splits_row(
+        tmp_path / "NVDA_splits.parquet", "2024-06-10", 10.0,
+        datetime.now(timezone.utc) - timedelta(days=30),
+    )
+    monkeypatch.setattr(
+        P, "_fetch_yf_splits",
+        lambda tk: _fake_splits([("2024-06-10", 10.0), ("2025-01-02", 4.0)]),
+    )
+    assert fetch_splits(["NVDA"], cache_dir=tmp_path)["NVDA"] == [
+        (date(2024, 6, 10), 10.0), (date(2025, 1, 2), 4.0),
+    ]
 
 
 def test_fetch_splits_drops_noise(

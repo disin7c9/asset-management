@@ -195,7 +195,7 @@ def _manifest(version: str) -> dict[str, object]:
                 "(propose-only).",
             },
         ],
-        # Our 5 conversation starters are runtime-registered (FastMCP decorators), not
+        # Our 6 conversation starters are runtime-registered (FastMCP decorators), not
         # static manifest templates. Without this flag Claude Desktop LISTS them in the
         # + menu but refuses every prompts/get as "attempted undeclared prompt" (click-test
         # lesson, 07-05: "Failed to attach prompt" on every machine). Declaring template
@@ -237,12 +237,13 @@ def _manifest(version: str) -> dict[str, object]:
                 "type": "file",
                 "title": "Transaction file (your book)",
                 "description": (
-                    "Your Ghostfolio-compatible CSV or Ghostfolio JSON export. The "
-                    "pre-filled value is a bundled DEMO portfolio (fake data) — keep it "
-                    "to explore first, swap in your own file when ready."
+                    "Your Ghostfolio-compatible CSV or Ghostfolio JSON export. Optional: if "
+                    "left unset the server runs on a bundled DEMO portfolio (fake data) so you "
+                    "can explore immediately — swap in your own file when ready. (Kept optional "
+                    "so the extension launches without a forced Configure-and-Save first.)"
                 ),
                 "default": "data/sample_data/transactions.csv",
-                "required": True,
+                "required": False,
             },
             "cache_dir": {
                 "type": "directory",

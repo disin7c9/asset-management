@@ -27,6 +27,9 @@ data/*
 data/sample_data/sample.csv
 data/sample_data/sample.json
 data/sample_data/500-activities.json
+# Malformed CSVs for the manual D1 import-safety check (recreatable per docs/testing/
+# manual-test-plan-v2.8.1.md); the automated tests build their own malformed rows.
+data/sample_data/mal*.csv
 reports/
 *.sqlite
 *.db

@@ -187,6 +187,60 @@ def test_every_prompt_carries_the_figures_rule() -> None:
     assert "conservative" in str(err)  # the error names the menu
 
 
+def test_should_i_rebalance_threads_mode_and_new_cash() -> None:
+    # The rebalance starter takes a mode (and new_cash), like propose_a_posture takes a posture:
+    # it threads the chosen mode into the framing, tells the model to deploy new_cash for the
+    # cash modes only, and validates the mode at prompt time.
+    dca = getattr(
+        _get_prompt(
+            "should_i_rebalance", {"mode": "fixed_dca", "new_cash": "500"}
+        ).messages[0].content,
+        "text", "",
+    )
+    assert "mode='fixed_dca'" in dca and "new_cash=500" in dca
+    tot = getattr(  # to_total ignores new_cash → no cash clause
+        _get_prompt("should_i_rebalance", {"mode": "to_total"}).messages[0].content, "text", "",
+    )
+    assert "mode='to_total'" in tot and "new_cash" not in tot
+    with pytest.raises(BaseException) as ei:  # an off-menu mode errors at prompt time
+        _get_prompt("should_i_rebalance", {"mode": "momentum"})
+    err: BaseException = ei.value
+    while isinstance(err, BaseExceptionGroup):  # anyio wraps the McpError in a TaskGroup
+        err = err.exceptions[0]
+    assert "to_total" in str(err)  # the error names the 4-mode menu
+
+
+def test_tool_descriptions_enumerate_their_option_menus() -> None:
+    # Claude Desktop only knows an option set if the description says it: pin that
+    # rebalance_check names all 4 modes + the new_cash rule, and the allocation tools name the
+    # benchmark menu — so a client never has to guess the valid tokens.
+    tools = {t.name: (t.description or "") for t in _list_tools().tools}
+    for mode in ("to_total", "bands", "fixed_dca", "cash_flow_only"):
+        assert mode in tools["rebalance_check"], mode
+    assert "new_cash" in tools["rebalance_check"]
+    for tool in ("propose_allocation", "starter_allocation"):
+        for bench in ("60-40", "all-weather", "permanent"):
+            assert bench in tools[tool], f"{tool}:{bench}"
+
+
+def test_propose_a_posture_threads_posture_and_benchmark() -> None:
+    # Like the rebalance starter, "Propose a posture" now takes BOTH inputs (posture +
+    # benchmark) and validates each at prompt time.
+    txt = getattr(
+        _get_prompt(
+            "propose_a_posture", {"posture": "aggressive", "benchmark": "all-weather"}
+        ).messages[0].content,
+        "text", "",
+    )
+    assert "preset 'aggressive'" in txt and "benchmark 'all-weather'" in txt
+    with pytest.raises(BaseException) as ei:  # an off-menu benchmark errors at prompt time
+        _get_prompt("propose_a_posture", {"posture": "moderate", "benchmark": "sp500"})
+    err: BaseException = ei.value
+    while isinstance(err, BaseExceptionGroup):  # anyio wraps the McpError in a TaskGroup
+        err = err.exceptions[0]
+    assert "60-40" in str(err)  # the error names the benchmark menu
+
+
 def test_onboarding_answer_tokens_are_in_sync_with_the_rubric() -> None:
     # The find_my_starting_allocation prompt and the starter_allocation tool description
     # re-list the answer tokens (horizon/loss_response/cash_buffer) as prose. If someone
@@ -310,13 +364,95 @@ def test_unknown_mode_is_clean_error(warm_book: Path) -> None:
     assert "momentum" in _error_text(res)
 
 
-def test_missing_book_is_clean_error(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("ASSET_BOOK", raising=False)
-    monkeypatch.delenv("ASSET_CSV", raising=False)
-    monkeypatch.delenv("ASSET_CACHE_DIR", raising=False)
+def test_rebalance_check_echoes_new_cash_and_target(
+    warm_book: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # E1: the plan is self-describing — it echoes new_cash + the target source, and fixed_dca /
+    # cash_flow_only actually deploy fresh cash (they were stuck at all-HOLD before, because
+    # rebalance_check hard-coded new_cash to 0 and never accepted it).
+    target = warm_book / "target.csv"
+    target.write_text("Ticker,Weight\nAAA,50\nBBB,50\n", encoding="utf-8")
+    monkeypatch.setenv("ASSET_TARGET", str(target))
+
+    # fixed_dca WITH cash → deploys it across the target mix (no longer all-HOLD) + echoes both
+    res = _call("rebalance_check", {"mode": "fixed_dca", "new_cash": 1000.0})
+    assert not res.isError, _error_text(res)
+    sc = res.structuredContent
+    assert sc is not None
+    assert sc["new_cash"] == pytest.approx(1000.0)
+    assert sc["target_source"] == str(target)
+    buy_tks = {t["ticker"] for t in sc["suggestions"] if t["action"] == "buy"}
+    assert buy_tks == {"AAA", "BBB"}  # fresh cash deployed across the mix, not stuck at all-HOLD
+
+    # fixed_dca WITHOUT cash → nothing deployed, but the note explains why (not a silent puzzle)
+    sc0 = _call("rebalance_check", {"mode": "fixed_dca"}).structuredContent
+    assert sc0 is not None
+    assert not any(t["action"] == "buy" for t in sc0["suggestions"])
+    assert "new_cash=0" in sc0["note"]
+
+    # negative cash is refused
+    assert _call("rebalance_check", {"mode": "fixed_dca", "new_cash": -5.0}).isError
+
+
+def test_rebalance_check_rejects_nonfinite_new_cash() -> None:
+    # M3: a non-finite new_cash (a client sending 1e400 → inf, or nan) must be refused, not
+    # threaded into Trade dollars. nan/inf can't round-trip cleanly through JSON, so exercise
+    # the guard on the tool function directly (FastMCP leaves it callable).
+    from app.mcp_server import rebalance_check
+    for bad in (float("inf"), float("nan"), float("-inf")):
+        with pytest.raises(ValueError, match="finite"):
+            rebalance_check(new_cash=bad)
+
+
+def test_to_total_deploys_new_cash_on_every_surface(warm_book: Path) -> None:
+    # M1: to_total DEPLOYS new_cash (suggest: base = total + new_cash). The tool description must
+    # not lump it with bands as "ignoring" cash, and the should_i_rebalance starter must tell the
+    # model to deploy it for to_total.
+    desc = {t.name: t.description for t in _list_tools().tools}["rebalance_check"] or ""
+    assert "deploys new_cash" in desc                # to_total deploys it
+    assert "these two IGNORE new_cash" not in desc   # the old wrong to_total+bands grouping is gone
+    text = getattr(
+        _get_prompt("should_i_rebalance", {"mode": "to_total", "new_cash": "5000"}).messages[0].content,
+        "text", "",
+    )
+    assert "5000" in text and "to_total adds it to the target total" in text
+
+
+def test_missing_book_falls_back_to_demo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    # F1: book is optional in the manifest (required:false), so a fresh install that never saved
+    # a book must not dead-end — _env_book falls back to the bundled DEMO portfolio with a LOUD
+    # warning, never the user's real book and never a silent swap.
+    import logging
+
+    from app.mcp_server import _env_book
+    from app.pipeline import DEMO_BOOK_CSV
+
+    monkeypatch.setenv("ASSET_CACHE_DIR", str(tmp_path / "cache"))  # keep the demo write hermetic
+    # ASSET_BOOK / ASSET_CSV are "" via the autouse fixture → no book configured
+    with caplog.at_level(logging.WARNING):
+        path = _env_book()
+    assert path.exists() and path.read_text(encoding="utf-8") == DEMO_BOOK_CSV
+    assert "DEMO" in caplog.text and "NOT yours" in caplog.text
+
+    # A book that IS set but points nowhere still errors — never silently swapped for demo data.
+    monkeypatch.setenv("ASSET_BOOK", str(tmp_path / "nope.csv"))
+    with pytest.raises(ValueError, match="missing file"):
+        _env_book()
+
+
+def test_missing_book_prices_demo_through_a_tool(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # T3: beyond _env_book() returning the demo path, a real tool call on the no-book path must
+    # answer with demo HOLDINGS (not error) — the end-to-end fallback, not just the resolver.
+    monkeypatch.setenv("ASSET_CACHE_DIR", str(tmp_path / "cache"))  # hermetic demo write
+    # ASSET_BOOK / ASSET_CSV "" via the autouse fixture; ASSET_MCP_OFFLINE "1" (no auto-warm)
     res = _call("portfolio_summary")
-    assert res.isError
-    assert "ASSET_BOOK" in _error_text(res)
+    assert not res.isError, _error_text(res)
+    sc = res.structuredContent
+    assert sc is not None and sc["holdings"]  # the demo book derives real positions
 
 
 def test_asset_csv_env_is_back_compat(warm_book: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -330,6 +466,18 @@ def test_asset_csv_env_is_back_compat(warm_book: Path, monkeypatch: pytest.Monke
     # The legacy var must resolve the SAME book, not just any non-error: pin its holdings.
     sc = res.structuredContent
     assert sc is not None and {h["ticker"] for h in sc["holdings"]} == {"AAA", "BBB"}
+
+
+def test_env_book_residue_falls_through_to_asset_csv(
+    warm_book: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # M2: an unsubstituted ${...} template residue in ASSET_BOOK must NOT shadow a legacy
+    # ASSET_CSV — residue counts as unset, so the fallback var is still consulted (not demo).
+    from app.mcp_server import _env_book
+    book = os.environ["ASSET_BOOK"]  # warm_book set a real file
+    monkeypatch.setenv("ASSET_BOOK", "${user_config.book}")  # host left it unsubstituted
+    monkeypatch.setenv("ASSET_CSV", book)
+    assert _env_book() == Path(book)  # resolved via ASSET_CSV, not swapped for demo
 
 
 def test_rebalance_refuses_partial_book(

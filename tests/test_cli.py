@@ -876,6 +876,62 @@ def test_env_asset_csv_does_not_reach_pure_backtest(
     assert "=== HOLDINGS ===" not in out
 
 
+def test_narrate_does_not_pull_book_into_pure_backtest(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str],
+) -> None:
+    # C3 (privacy): a pure `--backtest --target` is notional by contract — adding --narrate must
+    # NOT drag in ASSET_BOOK (the user's real portfolio). Regression for the leak where --narrate
+    # sat in needs_book, so it loaded ASSET_BOOK and shipped a SUMMARY of it to the LLM.
+    _mock_backtest_series(monkeypatch)
+    monkeypatch.setenv("ASSET_BOOK", str(SAMPLE))
+    monkeypatch.setenv("ASSET_CSV", str(SAMPLE))
+    with caplog.at_level(logging.INFO):
+        rc = main(["--backtest", "--target", str(TARGET), "--narrate"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "=== BACKTEST" in out
+    assert "=== HOLDINGS ===" not in out                       # book-free: no portfolio loaded
+    assert _run_summary(caplog)["source"] == "(no book; backtest-only)"
+    assert "nothing to narrate" in caplog.text                 # no book SUMMARY, no benchmark note
+
+
+def test_narrate_backtest_benchmark_is_book_free(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str],
+) -> None:
+    # C3 (the useful case the fix enables): `--backtest --benchmark --narrate` with NO book
+    # narrates the benchmark verdict book-free — and even with ASSET_BOOK set, the personal book
+    # is never loaded and the book-derived SUMMARY never runs.
+    from app.llm import NarratorConfig
+
+    monkeypatch.setattr("app.cli.fetch_series", _flat_series)
+    monkeypatch.setenv("ASSET_BOOK", str(SAMPLE))  # set, but must NOT be loaded
+
+    def fake_complete(_cfg: object, system: str, _user: str) -> str:
+        assert "reference portfolio" in system  # ONLY the benchmark note — never a book SUMMARY
+        return (
+            "Your posture's deepest dip was {{bench_dd_preset}}, versus "
+            "{{bench_dd_reference}} for {{bench_reference}}; a held-out test "
+            "couldn't tell them apart."
+        )
+
+    monkeypatch.setattr(
+        "app.cli.load_config",
+        lambda: NarratorConfig("openai", "test-model", "k", "http://x", "paid", 0.0),
+    )
+    monkeypatch.setattr("app.cli.complete", fake_complete)
+
+    with caplog.at_level(logging.INFO):
+        rc = main(["--backtest", "--target", str(TARGET), "--benchmark", "60-40", "--narrate"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "=== HOLDINGS ===" not in out                       # book-free: no personal portfolio
+    assert _run_summary(caplog)["source"] == "(no book; backtest-only)"
+    assert "couldn't tell them apart" in out                   # the benchmark note still rendered
+    assert _run_summary(caplog)["benchmark_narrate"] == "test-model (paid)"
+
+
 def test_explicit_csv_wins_over_env(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -1786,6 +1842,26 @@ def test_dry_run_reports_a_malformed_file_and_exits_2(
     assert _run_summary(caplog)["dry_run"] == "invalid"
 
 
+def test_dry_run_rejects_a_truncated_row_with_rc2(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str],
+) -> None:
+    # D1 headline: a truncated row (missing trailing cells) used to crash --dry-run with a raw
+    # AttributeError traceback + rc 1 (and crashed the real brief too). It must now be a clean
+    # "cannot import" + rc 2.
+    bad = tmp_path / "truncated.csv"
+    bad.write_text(
+        "Date,Code,DataSource,Currency,Price,Quantity,Action,Fee,Note\n"
+        "2024-01-02,VOO,YAHOO,USD,400\n",  # only 5 of 9 columns
+        encoding="utf-8",
+    )
+    with caplog.at_level(logging.INFO):
+        rc = main(["--csv", str(bad), "--dry-run"])
+    out = capsys.readouterr().out
+    assert rc == 2
+    assert "cannot import" in out
+    assert _run_summary(caplog)["dry_run"] == "invalid"
+
+
 def test_dry_run_surfaces_ghostfolio_skips(
     tmp_path: Path, capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -1923,6 +1999,25 @@ def test_warm_rejects_offline(monkeypatch: pytest.MonkeyPatch) -> None:
     _record_warm_fetchers(monkeypatch)
     with pytest.raises(SystemExit):  # parser.error → SystemExit(2)
         main(["--book", str(SAMPLE), "--warm", "--offline"])
+
+
+def test_warm_rejects_a_malformed_book_with_rc2(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str],
+) -> None:
+    # E1: --warm loads the book to collect tickers, so a malformed book must fail cleanly HERE
+    # too (matching the brief / --dry-run) — not escape as a raw traceback + rc 1. A negative-qty
+    # sell warmed fine (rc 0) before D1; now it's a clean "cannot import" + rc 2, before any fetch.
+    bad = tmp_path / "bad.csv"
+    bad.write_text(
+        "Date,Code,DataSource,Currency,Price,Quantity,Action,Fee,Note\n"
+        "2024-01-02,VOO,YAHOO,USD,400,-3,sell,0,\n",  # negative sell quantity
+        encoding="utf-8",
+    )
+    with caplog.at_level(logging.INFO):
+        rc = main(["--book", str(bad), "--warm", "--cache-dir", str(tmp_path)])
+    out = capsys.readouterr().out
+    assert rc == 2
+    assert "cannot import" in out
 
 
 def _record_warm_cache_dir(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:

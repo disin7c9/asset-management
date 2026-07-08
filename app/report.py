@@ -316,8 +316,8 @@ def _section_returns(
     if twr_excluded:
         lines.append(
             f"  ⚠ excluded from TWR & risk: {', '.join(twr_excluded)} "
-            "(unadjusted stock split — raw share counts vs split-adjusted prices; "
-            "MWR/Dietz unaffected). Corporate-action handling lands in v1.x."
+            "(recorded price disagrees with split-adjusted history — an unfetched/unavailable "
+            "split or an off-market entry price; MWR/Dietz unaffected)."
         )
     if any(
         v is None or not math.isfinite(v)

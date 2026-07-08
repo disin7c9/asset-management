@@ -204,7 +204,7 @@ Confidence bands come from a moving-block bootstrap. Drawdown is *investment* (t
 
 ## MCP server (read-only, for AI assistants)
 
-Expose your portfolio to an AI assistant (Claude Desktop, Claude Code, …) as **read-only tools** it can call — so you can "chat with your portfolio" while every number still comes from the validated core, not the model. The server is **read-only and offline** — **no write tools**, bound to your `ASSET_BOOK` book (no file-path args), serving from the on-disk cache. The one bounded exception to no-egress: a **cold cache auto-warms the core set once** (your tickers + benchmark refs, ~30–60s) so an addon user who never runs the CLI still gets real numbers; set `ASSET_MCP_OFFLINE=1` (in `.env`) to keep it strictly airtight for an *already-warmed* cache (pointed at a cold cache it just degrades to `n/a`, and a missing candidate isn't fetched). Seven tools:
+Expose your portfolio to an AI assistant (Claude Desktop, Claude Code, …) as **read-only tools** it can call — so you can "chat with your portfolio" while every number still comes from the validated core, not the model. The server is **read-only and offline** — **no write tools**, bound to your `ASSET_BOOK` book (no file-path args), serving from the on-disk cache. The one bounded exception to no-egress: a **cold cache auto-warms the core set once** (your tickers + benchmark refs, ~30–60s) so an addon user who never runs the CLI still gets real numbers; set `ASSET_MCP_OFFLINE=1` (in `.env`) to keep it strictly airtight for an *already-warmed* cache (pointed at a cold cache it just degrades to `n/a`, and a missing candidate isn't fetched). Eight tools:
 
 - **`portfolio_summary`** — holdings, P&L, and annualized returns.
 - **`risk_report`** — drawdown-first risk: max drawdown (depth/dates/recovery), Ulcer, CDaR, Sharpe/Sortino/Calmar, all with bootstrap confidence intervals.
@@ -213,6 +213,7 @@ Expose your portfolio to an AI assistant (Claude Desktop, Claude Code, …) as *
 - **`discover_gaps`** — suggest NEW ETFs for the roles you hold ≤3% of (propose-only; needs `--warm full`).
 - **`screen_candidate`** — judge a NEW candidate ticker against your book (diversifier/cost/liquidity/age/overlap, each with a reason); fetches the ticker on demand if it isn't cached (unless `ASSET_MCP_OFFLINE`).
 - **`propose_allocation`** — a strategic target for a posture (`conservative`/`moderate`/`aggressive`) over your book + the universe, validated against a reference (`60-40`/`all-weather`/`permanent`) with a walk-forward held-out drawdown verdict — propose-only, numbers from the core, never a recommendation.
+- **`starter_allocation`** — new to this? answer three plain risk questions (horizon / loss-response / cash-buffer) → a starting posture and its validated proposal (the onboarding path into `propose_allocation`; propose-only).
 
 **One-click install (Claude Desktop):** grab `asset-management-<version>.mcpb` from the
 [Releases page](https://github.com/disin7c9/asset-management/releases) (or build it yourself:
@@ -221,6 +222,12 @@ Expose your portfolio to an AI assistant (Claude Desktop, Claude Code, …) as *
 (pre-filled with the **bundled demo portfolio** so you can explore on fake data first), a
 price-cache folder, an optional target CSV, and a strict-offline toggle. Nothing else to
 install — Claude Desktop's `uv` runtime resolves Python and the locked dependencies itself.
+
+**First launch is slow — this is expected.** On install, that `uv` runtime builds a ~360 MB
+Python environment (pandas / NumPy / PyArrow / SciPy) before the server can answer, so give it
+**2–5 minutes the first time** and don't worry if the extension briefly shows as *disconnected*
+while it works. Every launch after that starts in under a second; the first tool call then warms
+the price cache once (~30–60s), and that cache lives in your home folder so it survives reinstalls.
 
 **In chat:** open the **+** menu for ready-made starters — *Portfolio checkup*, *What's my
 drawdown?*, *Should I rebalance?*, *Fill my gaps*, *Find my starting allocation*, *Propose a

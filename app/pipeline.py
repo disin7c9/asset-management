@@ -228,20 +228,21 @@ def compute_prices_returns_risk(
         series = fetch_series(traded, start, today, cache_dir=cache_dir, online=online)
         record_series_fetch(run, series)
         if series.rows:
-            # Guard against unhandled stock splits: the log holds raw share counts
-            # but yfinance prices are split-adjusted, so a ticker that split during
-            # its holding period would fabricate a return in the time-weighted
-            # series. Exclude such a ticker from TWR + risk (and warn) — the honest
-            # stopgap until v1.x adjusts share counts for corporate actions.
+            # Safety net for a price-basis mismatch: the log holds raw share counts while
+            # yfinance prices are split-adjusted. Splits ARE adjusted upstream
+            # (corporate_actions), but if that can't reconcile — an unfetched/unavailable
+            # split, or an off-market recorded entry price — the time-weighted series would
+            # mix bases and fabricate a return, so exclude such a ticker from TWR + risk (and
+            # warn); MWR / Modified Dietz, computed from cash flows, are unaffected.
             twr_series = series.rows
             twr_excluded = price_basis_mismatches(events, series.rows)
             if twr_excluded:
                 log.warning(
-                    "excluding %s from TWR & risk: execution price disagrees with the "
-                    "split-adjusted price history (likely an unhandled stock split). The "
-                    "time-weighted series mixes raw share counts with adjusted prices and "
-                    "would fabricate a return. MWR / Modified Dietz are unaffected; full "
-                    "corporate-action handling is a v1.x item.",
+                    "excluding %s from TWR & risk: the recorded execution price disagrees "
+                    "with the split-adjusted price history — an unfetched/unavailable split "
+                    "or an off-market entry price. The time-weighted series would mix raw "
+                    "share counts with adjusted prices and fabricate a return; MWR / Modified "
+                    "Dietz are unaffected.",
                     ", ".join(twr_excluded),
                 )
                 twr_series = {

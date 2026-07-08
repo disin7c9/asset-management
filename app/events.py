@@ -15,6 +15,7 @@ import csv
 import io
 import json
 import logging
+import math
 from dataclasses import dataclass
 from collections.abc import Sequence
 from datetime import date, datetime, timedelta
@@ -94,6 +95,37 @@ def _to_float(raw: str | None, *, default: float = 0.0) -> float:
     if not s:
         return default
     return float(s)
+
+
+def _require(row: dict[str, Any], field: str, *, rownum: int) -> str:
+    """A structurally-required cell (Action/Date/Code): present and non-empty, else a clear,
+    row-referenced error. Guards a truncated native-CSV row — `csv.DictReader` back-fills the
+    missing trailing columns with `None`, which would otherwise crash downstream on
+    `None.strip()` (a raw traceback) instead of a clean 'cannot import'."""
+    val = row.get(field)
+    if val is None or not str(val).strip():
+        msg = f"data row {rownum}: '{field}' is required but empty (a truncated row or a blank cell?)"
+        raise ValueError(msg)
+    return str(val).strip()
+
+
+def _require_positive(row: dict[str, Any], field: str, *, rownum: int, ctx: str) -> float:
+    """A required numeric cell that must be present and strictly positive (a trade's share
+    count or price). Empty/None/zero/negative → a clear error, never a silent 0.0 that would
+    book a phantom '0 shares @ $0', nor a negative that (on a sell) would ADD shares."""
+    raw = row.get(field)
+    if raw is None or not str(raw).strip():
+        msg = f"data row {rownum} ({ctx}): '{field}' is required for a trade but empty"
+        raise ValueError(msg)
+    try:
+        val = float(str(raw).strip())
+    except ValueError as exc:
+        msg = f"data row {rownum} ({ctx}): '{field}' is not a number: {raw!r}"
+        raise ValueError(msg) from exc
+    if not math.isfinite(val) or val <= 0:
+        msg = f"data row {rownum} ({ctx}): '{field}' must be a positive number, got {val:g}"
+        raise ValueError(msg)
+    return val
 
 
 def _parse_date(raw: str) -> date:
@@ -203,12 +235,14 @@ def _rows_from_ghostfolio_json(raw: str, path: Path) -> tuple[list[dict[str, str
             warnings.append(f"activity {i}: skipped {gtype} (no symbol)")
             continue
         try:
+            qty = float(a.get("quantity") or 0.0)
+            unit = float(a.get("unitPrice") or 0.0)
             row = {
                 "Date": _gf_date(str(a.get("date") or "")),
                 "Code": symbol,
                 "Action": action,
-                "Quantity": _gf_num(float(a.get("quantity") or 0.0)),
-                "Price": _gf_num(float(a.get("unitPrice") or 0.0)),
+                "Quantity": _gf_num(qty),
+                "Price": _gf_num(unit),
                 "Fee": _gf_num(float(a.get("fee") or 0.0)),
                 "Currency": currency,
                 "DataSource": str(a.get("dataSource") or "MANUAL"),
@@ -216,6 +250,15 @@ def _rows_from_ghostfolio_json(raw: str, path: Path) -> tuple[list[dict[str, str
             }
         except (ValueError, TypeError) as exc:
             warnings.append(f"activity {i}: skipped (bad field: {exc})")
+            continue
+        # A buy/sell needs a positive price AND quantity; a $0 / 0-share trade (a transfer-in,
+        # gift, or bad row) is skipped with a warning rather than allowed to abort the whole
+        # import at the _require_positive seam. Matches Ghostfolio's per-activity skip model.
+        if action in ("buy", "sell") and (qty <= 0 or unit <= 0):
+            warnings.append(
+                f"activity {i}: skipped {gtype} {symbol} "
+                f"(non-positive quantity/price: qty={qty:g}, price={unit:g})"
+            )
             continue
         out.append(row)
     return out, warnings
@@ -273,12 +316,26 @@ def _parse_rows(path: Path) -> tuple[list[dict[str, Any]], list[str], str]:
 
 
 def _rows_to_events(rows: list[dict[str, Any]]) -> list[Event]:
-    """Map raw row dicts (native CSV or normalized Ghostfolio) → ordered Events."""
+    """Map raw row dicts (native CSV or normalized Ghostfolio) → ordered Events.
+
+    This is the single ingest seam, so every malformed row is caught HERE with a clear
+    `ValueError` (which `--dry-run` and `load_book` already turn into a clean 'cannot import'
+    + rc 2) rather than crashing downstream or booking a phantom trade: Action/Date/Code must
+    be present (guards a truncated row), and a buy/sell must carry a strictly-positive Price
+    and Quantity (guards an empty cell → silent $0, or a negative → shares added on a sell).
+    Ghostfolio rows are normalized upstream (never None; out-of-scope rows already skipped), so
+    this validation only bites malformed native CSV."""
     events: list[Event] = []
-    for row in rows:
-        action = _parse_action(row["Action"])
-        price = _to_float(row.get("Price"))
-        quantity = _to_float(row.get("Quantity"))
+    for i, row in enumerate(rows, start=1):
+        action = _parse_action(_require(row, "Action", rownum=i))
+        date_str = _require(row, "Date", rownum=i)
+        code = _require(row, "Code", rownum=i).upper()
+        if action in ("buy", "sell"):
+            price = _require_positive(row, "Price", rownum=i, ctx=f"{action} {code}")
+            quantity = _require_positive(row, "Quantity", rownum=i, ctx=f"{action} {code}")
+        else:
+            price = _to_float(row.get("Price"))
+            quantity = _to_float(row.get("Quantity"))
         # Income (dividend/interest) and cash flows carry a cash TOTAL, not a per-share
         # price. Our format puts the total in Price with Quantity 0; a Ghostfolio activity
         # puts a per-unit Price × a Quantity. quantity×price unifies both (Quantity 0 → just
@@ -296,8 +353,8 @@ def _rows_to_events(rows: list[dict[str, Any]]) -> list[Event]:
 
         events.append(
             Event(
-                date=_parse_date(row["Date"]),
-                ticker=row["Code"].strip().upper(),
+                date=_parse_date(date_str),
+                ticker=code,
                 action=action,
                 quantity=quantity,
                 price=price,

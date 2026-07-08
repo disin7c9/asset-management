@@ -76,7 +76,10 @@ def test_manifest_contract_fields() -> None:
     # rejects every prompts/get as "attempted undeclared prompt" (07-05 click-test).
     assert m["prompts_generated"] is True
     cfg = m["user_config"]
-    assert cfg["book"]["required"] is True and cfg["book"]["default"]  # demo pre-fill
+    # book is OPTIONAL (required:false) so the extension launches without a forced
+    # Configure-and-Save (Desktop's Save-disabled-until-changed trap); the server falls
+    # back to the bundled demo book when it's unset.
+    assert cfg["book"]["required"] is False and cfg["book"]["default"]  # demo pre-fill
     # cache_dir: optional and DEFAULT-FREE — Desktop displays "${HOME}/…" defaults
     # literally (unsubstituted); empty routes to the server's own safe per-user default.
     assert cfg["cache_dir"]["required"] is False and "default" not in cfg["cache_dir"]

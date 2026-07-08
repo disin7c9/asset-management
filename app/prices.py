@@ -35,6 +35,11 @@ log = logging.getLogger(__name__)
 
 _CACHE_DIR_DEFAULT = Path("data/prices")
 _CACHE_TTL = timedelta(hours=20)  # roughly one business day
+# Offline, a stale cache is served rather than refetched (there's nothing to fetch); but don't
+# pass off a series tail older than this as a "current" price — beyond it, report the holding
+# missing rather than quote a stale close. The brief is weekly, so ~10 days covers a normal gap
+# (plus a little slack); older than that, calling the price "current" would mislead.
+_OFFLINE_PRICE_FLOOR = timedelta(days=10)
 
 
 @dataclass(frozen=True)
@@ -125,7 +130,7 @@ def fetch_latest(
     missing: list[str] = []
 
     for ticker in dict.fromkeys(tickers):  # dedup, preserve order
-        cached = _from_cache(ticker, asof, cache) if cache else None
+        cached = _from_cache(ticker, asof, cache, allow_stale=not online) if cache else None
         if cached is not None:
             rows[ticker] = cached
             continue
@@ -223,11 +228,16 @@ def _coerce_fetched_at(value: object) -> datetime | None:
     return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
 
 
-def fresh(fetched_at: datetime, ttl: timedelta, *, what: str) -> bool:
+def fresh(
+    fetched_at: datetime, ttl: timedelta, *, what: str, allow_stale: bool = False
+) -> bool:
     """The one freshness gate for every on-disk cache: reject a future-stamped row
     (clock skew / tampered file) and anything older than ``ttl``. Centralized so the
     rule can't drift between the latest-price, series, splits, and metadata caches
-    (public: `metadata.py` imports it)."""
+    (public: `metadata.py` imports it). ``allow_stale`` (set by offline reads) keeps the
+    future-stamp rejection but waives the age limit: the TTL exists to force a re-fetch,
+    and offline there is nothing to fetch — serving the newest cached value (honestly
+    dated) beats returning nothing."""
     now = _now_utc()
     if fetched_at > now:
         log.warning(
@@ -235,10 +245,12 @@ def fresh(fetched_at: datetime, ttl: timedelta, *, what: str) -> bool:
             what, fetched_at, now,
         )
         return False
-    return now - fetched_at <= ttl
+    return allow_stale or now - fetched_at <= ttl
 
 
-def _from_cache(ticker: str, asof: date, cache_dir: Path) -> PriceRow | None:
+def _from_cache(
+    ticker: str, asof: date, cache_dir: Path, *, allow_stale: bool = False
+) -> PriceRow | None:
     path = cache_dir / f"{ticker}.parquet"
     if not path.exists():
         return None
@@ -254,7 +266,7 @@ def _from_cache(ticker: str, asof: date, cache_dir: Path) -> PriceRow | None:
     fetched_at = _coerce_fetched_at(row["fetched_at"])
     if fetched_at is None:
         return None  # NaT / corrupt — unusable, refetch
-    if not fresh(fetched_at, _CACHE_TTL, what=ticker):
+    if not fresh(fetched_at, _CACHE_TTL, what=ticker, allow_stale=allow_stale):
         return None
     return PriceRow(
         ticker=ticker,
@@ -339,7 +351,11 @@ def fetch_series(
     provenance: dict[str, tuple[str, datetime]] = {}
 
     for ticker in dict.fromkeys(tickers):
-        cached = _series_from_cache(ticker, start, end, cache) if cache else None
+        cached = (
+            _series_from_cache(ticker, start, end, cache, allow_stale=not online)
+            if cache
+            else None
+        )
         if cached is not None:
             rows[ticker], cached_at = cached
             provenance[ticker] = ("cache", cached_at)
@@ -411,15 +427,15 @@ def _series_from_stooq(ticker: str, start: date, end: date) -> "pd.Series[float]
 
 
 def _read_fresh_series_cache(
-    path: Path, ticker: str
+    path: Path, ticker: str, *, allow_stale: bool = False
 ) -> "tuple[pd.Series[float], datetime] | None":
     """Read a series-cache parquet → (sorted series, fetched_at), or None.
 
     Shared by `_series_from_cache` (price history) and `_latest_from_series_cache`
     (the latest-from-series fallback). Returns None if the file is absent,
     unreadable, malformed (missing date/close/fetched_at), future-stamped, or
-    stale (older than the TTL). Does NOT apply any date-range filter — callers
-    slice for what they need."""
+    (unless ``allow_stale``) stale beyond the TTL. Does NOT apply any date-range
+    filter — callers slice for what they need."""
     if not path.exists():
         return None
     try:
@@ -432,7 +448,7 @@ def _read_fresh_series_cache(
     fetched = _coerce_fetched_at(pd.to_datetime(df["fetched_at"]).max())
     if fetched is None:
         return None  # NaT (corrupt/empty) — unusable, refetch
-    if not fresh(fetched, _CACHE_TTL, what=ticker):
+    if not fresh(fetched, _CACHE_TTL, what=ticker, allow_stale=allow_stale):
         return None  # stale or future-stamped → refetch
     idx = pd.to_datetime(df["date"]).dt.normalize()
     series = pd.Series(
@@ -442,10 +458,12 @@ def _read_fresh_series_cache(
 
 
 def _series_from_cache(
-    ticker: str, start: date, end: date, cache_dir: Path
+    ticker: str, start: date, end: date, cache_dir: Path, *, allow_stale: bool = False
 ) -> "tuple[pd.Series[float], datetime] | None":
     """Return (series, fetched_at) from the cache, or None if absent/stale."""
-    read = _read_fresh_series_cache(cache_dir / f"{ticker}_series.parquet", ticker)
+    read = _read_fresh_series_cache(
+        cache_dir / f"{ticker}_series.parquet", ticker, allow_stale=allow_stale
+    )
     if read is None:
         return None
     series, fetched = read
@@ -463,15 +481,20 @@ def _latest_from_series_cache(
 
     Unifies the two on-disk caches so a risk-on run's series cache can serve a
     latest price the dedicated latest cache lacks — notably under `--no-risk
-    --offline`. Returns the last close at/before `asof` from a fresh cached
-    series (same TTL + future-stamp rules as the latest cache), else None."""
-    read = _read_fresh_series_cache(cache_dir / f"{ticker}_series.parquet", ticker)
+    --offline`. Returns the last close at/before `asof` from the cached series,
+    age-tolerant (offline fallback); future-stamped rows are still rejected, else None."""
+    read = _read_fresh_series_cache(
+        cache_dir / f"{ticker}_series.parquet", ticker, allow_stale=True
+    )
     if read is None:
         return None
     series, fetched = read
     series = series[series.index <= pd.Timestamp(asof)]
     if series.empty:
         return None
+    tail = series.index[-1].date()
+    if asof - tail > _OFFLINE_PRICE_FLOOR:
+        return None  # too old to pass off as a current price, even offline
     return PriceRow(
         ticker=ticker,
         asof_date=series.index[-1].date(),
@@ -538,9 +561,11 @@ def _parse_splits(s: "pd.Series[float] | None") -> list[tuple[date, float]]:
     return sorted(rows)
 
 
-def _splits_from_cache(ticker: str, cache_dir: Path) -> list[tuple[date, float]] | None:
-    """Cached split history, or None if absent/stale. A no-split ticker is cached
-    as a harmless identity placeholder so we don't refetch it every run."""
+def _splits_from_cache(
+    ticker: str, cache_dir: Path, *, allow_stale: bool = False
+) -> list[tuple[date, float]] | None:
+    """Cached split history, or None if absent (or stale, unless ``allow_stale``). A no-split
+    ticker is cached as a harmless identity placeholder so we don't refetch it every run."""
     path = cache_dir / f"{ticker}_splits.parquet"
     if not path.exists():
         return None
@@ -554,7 +579,7 @@ def _splits_from_cache(ticker: str, cache_dir: Path) -> list[tuple[date, float]]
     fetched = _coerce_fetched_at(pd.to_datetime(df["fetched_at"]).max())
     if fetched is None:
         return None
-    if not fresh(fetched, _SPLITS_TTL, what=ticker):
+    if not fresh(fetched, _SPLITS_TTL, what=ticker, allow_stale=allow_stale):
         return None  # stale or future-stamped → refetch
     return _parse_splits(pd.Series(df["ratio"].to_numpy(), index=pd.to_datetime(df["date"])))
 
@@ -599,12 +624,12 @@ def fetch_splits(
 
     out: dict[str, list[tuple[date, float]]] = {}
     for ticker in dict.fromkeys(tickers):
-        cached = _splits_from_cache(ticker, cache) if cache else None
+        cached = _splits_from_cache(ticker, cache, allow_stale=not online) if cache else None
         if cached is not None:
             out[ticker] = cached
             continue
         if not online:
-            out[ticker] = []  # unknown offline → no adjustment (guard catches splits)
+            out[ticker] = []  # no cached split offline → no adjustment (guard catches splits)
             continue
         rows = _parse_splits(_fetch_yf_splits(ticker))
         if cache:

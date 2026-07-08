@@ -373,9 +373,14 @@ def main(argv: list[str] | None = None) -> int:
     # No silent sample fallback: book-dependent actions operate on YOUR holdings, so
     # they require your transaction log. --backtest is notional (target-only) and is
     # exempt; the bundled example is opt-in via an explicit --demo.
+    # --narrate is deliberately NOT a book-requiring action: it's a modifier. A notional
+    # `--backtest --benchmark --narrate` narrates the benchmark verdict with no book, and a
+    # plain `--backtest --narrate` has nothing book-free to say (the SUMMARY is book-derived
+    # and gated on a loaded book below). Listing it here would drag ASSET_BOOK — the user's
+    # real portfolio — into a run documented as book-free (a privacy leak).
     needs_book = bool(
         args.rebalance or args.allocate or args.onboard or args.dump_target or args.save
-        or args.send or args.metadata or args.screen or args.narrate or args.discover is not None
+        or args.send or args.metadata or args.screen or args.discover is not None
         or args.dry_run
     )
     # Personal defaults from .env (gitignored; loaded above). ASSET_BOOK (or ASSET_CSV,
@@ -567,11 +572,22 @@ def main(argv: list[str] | None = None) -> int:
     discovery_summary: Section | None = None
     benchmark_summary: Section | None = None
     if args.narrate:
-        summary_section = _compute_narration(state, prices, returns, risk, dollar_dd, run)
+        # The SUMMARY narrates holdings/returns/risk — all book-derived — so it runs only when
+        # a book was actually loaded. A book-free notional backtest has no portfolio to
+        # summarize (narrating it would drag in ASSET_BOOK, the user's real book, and — free
+        # tier — ship coarse bands about it to the LLM); narrate only the benchmark verdict,
+        # which is itself book-free.
+        if args.book is not None:
+            summary_section = _compute_narration(state, prices, returns, risk, dollar_dd, run)
         if discovery is not None and discovery_results is not None:
             discovery_summary = _compute_discovery_narration(discovery, discovery_results, run)
         if benchmark is not None:
             benchmark_summary = _compute_benchmark_narration(benchmark, run)
+        if args.book is None and benchmark is None:
+            log.info(
+                "--narrate had nothing to narrate: a notional backtest has no book SUMMARY. "
+                "Add --benchmark for a verdict note, or --book for a portfolio brief."
+            )
 
     data = build_report_data(
         state, prices=prices, returns=returns, risk=risk,
@@ -924,9 +940,19 @@ def _warm_cache(
             run["error"] = "book_not_found"
             _log_run_summary(run)
             return 2
-        book_tickers = sorted(
-            {ev.ticker for ev in load_events(args.book) if ev.ticker != CASH_TICKER}
-        )
+        try:
+            book_tickers = sorted(
+                {ev.ticker for ev in load_events(args.book) if ev.ticker != CASH_TICKER}
+            )
+        except (ValueError, KeyError) as exc:
+            # A malformed book must fail cleanly here too — matching the brief / --dry-run
+            # (else the D1 ValueError would escape as a raw traceback + rc 1).
+            log.error("cannot import %s: %s", args.book, exc)
+            run["status"] = "error"
+            run["error"] = "cannot_import"
+            _log_run_summary(run)
+            sys.stdout.write(f"\n✗ cannot import {args.book}: {exc}\n")
+            return 2
     extra: list[str] = []
     scope = args.warm
     if args.warm == "full":

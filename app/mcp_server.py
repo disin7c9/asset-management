@@ -18,7 +18,7 @@ math. Design invariants (v2.0.0 Phase 1):
 - **Bound to one book** (`ASSET_BOOK`, or `ASSET_CSV` back-compat): tools take no
   file-path argument, so a caller can't point the server at an arbitrary file.
 
-The chat front door: 5 **prompts** (conversation starters in the client's "+" menu, each
+The chat front door: 6 **prompts** (conversation starters in the client's "+" menu, each
 carrying the tool-figures-only framing) and a ``portfolio://guarantees`` **resource** —
 the four guarantees as a fetchable trust manifest the model can cite verbatim.
 
@@ -39,6 +39,7 @@ import logging
 import math
 import os
 import re
+from collections.abc import Collection
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from importlib.metadata import PackageNotFoundError, version as _pkg_version
@@ -59,6 +60,7 @@ from app.pipeline import (
     held_market_value,
     load_book,
     warm_cache,
+    write_demo_book,
 )
 from app.allocate import PRESETS, build_preset_target
 from app.onboard import posture_from_answers
@@ -139,18 +141,42 @@ mcp._mcp_server.version = _VERSION
 # ── config resolution (env-only; no argparse on this surface) ────────────────
 
 
+def _env_raw(var: str, *, fallback: str | None = None) -> str | None:
+    """The cleaned value of a path env var (``var``, then an optional back-compat ``fallback``),
+    or None when unset/empty OR an MCPB host's unsubstituted ``${...}`` template residue. The one
+    place the '${…} residue counts as unset' rule lives — shared by `_env_path` (raise if None),
+    `_env_book` (demo fallback if None), and `_cache_dir` (default if None). Residue in the
+    primary var is cleared BEFORE the fallback is read, so it can't shadow a legacy setting."""
+    raw = os.environ.get(var, "").strip()
+    if raw.startswith("${"):  # unsubstituted template residue → treat as unset for the fallback
+        raw = ""
+    if not raw and fallback:
+        raw = os.environ.get(fallback, "").strip()
+        if raw.startswith("${"):
+            raw = ""
+    return raw or None
+
+
+def _one_of(raw: str, choices: Collection[str], what: str, *, allow_none: bool = False) -> str:
+    """Normalize a client-supplied enum token (strip + lowercase) and validate it against
+    ``choices``. One validator for every MCP enum arg (mode / preset / benchmark) so the
+    normalization and error wording can't drift across tools. ``allow_none`` also accepts the
+    literal ``'none'`` (the benchmark arg uses it to skip validation). Returns the normalized
+    token; raises ValueError (→ a clean MCP error) listing the valid options."""
+    val = raw.strip().lower()
+    if val in choices or (allow_none and val == "none"):
+        return val
+    options = ", ".join(sorted(choices)) + (" or 'none'" if allow_none else "")
+    raise ValueError(f"unknown {what} {raw!r} — pick one of: {options}")
+
+
 def _env_path(var: str, what: str, *, fallback: str | None = None) -> Path:
     """Resolve a book/target path from an env var (.env convention): ``~`` expanded, a
     relative path repo-relative. ``fallback`` is a back-compat env var read if ``var`` is
     unset. Raises a clear ValueError (→ a clean MCP error) if unset or missing — the server
     never guesses a path."""
-    raw = os.environ.get(var, "").strip()
-    if not raw and fallback:
-        raw = os.environ.get(fallback, "").strip()
-    # An MCPB host may substitute an UNSET optional user_config as the literal
-    # "${user_config.x}" placeholder (spec-undefined) — treat template residue as unset
-    # so the user gets the "not set" guidance, not a bogus missing-file path.
-    if not raw or raw.startswith("${"):
+    raw = _env_raw(var, fallback=fallback)
+    if raw is None:
         raise ValueError(f"{var} is not set — {what}")
     p = Path(raw).expanduser()
     path = p if p.is_absolute() else _REPO_ROOT / p
@@ -161,7 +187,21 @@ def _env_path(var: str, what: str, *, fallback: str | None = None) -> Path:
 
 def _env_book() -> Path:
     """The bound book path: ``ASSET_BOOK`` (legacy ``ASSET_CSV`` honored). One helper so the
-    var name, help text, and back-compat fallback stay identical across every tool."""
+    var name, help text, and back-compat fallback stay identical across every tool.
+
+    If NO book is configured — the var unset/empty, or an MCPB host's unsubstituted
+    ``${user_config.book}`` template residue — fall back to the bundled DEMO portfolio (with a
+    LOUD stderr warning), so a one-click install answers with real (demo) numbers instead of
+    dead-ending at n/a when the user accepts the defaults without re-saving (Claude Desktop
+    ignores manifest defaults until a Save). A book that IS set but points at a missing file
+    still errors — the user's real book is never silently swapped for demo data."""
+    if _env_raw("ASSET_BOOK", fallback="ASSET_CSV") is None:
+        log.warning(
+            "no transaction file configured — running on the bundled DEMO portfolio (fake "
+            "data, NOT yours). Set your book in the extension's Configure panel (Settings) to "
+            "see your own holdings."
+        )
+        return write_demo_book(_cache_dir())
     return _env_path(
         "ASSET_BOOK",
         "point it at your transaction file — a Ghostfolio-compatible CSV or a Ghostfolio "
@@ -175,8 +215,8 @@ def _cache_dir() -> Path:
     default (checkout: ``data/prices``; installed/bundle: ``~/.asset-management/prices``
     — never inside a host-managed extension dir, which updates wipe). Template residue
     from an MCPB host (``${user_config...}``) is treated as unset."""
-    raw = os.environ.get("ASSET_CACHE_DIR", "").strip()
-    if raw and not raw.startswith("${"):
+    raw = _env_raw("ASSET_CACHE_DIR")
+    if raw is not None:
         p = Path(raw).expanduser()
         return p if p.is_absolute() else _REPO_ROOT / p
     return default_cache_dir(_REPO_ROOT)
@@ -399,6 +439,15 @@ class Trade(BaseModel):
 class RebalancePlan(BaseModel):
     asof: date
     mode: str
+    new_cash: float = Field(
+        default=0.0,
+        description="new cash deployed this run: fixed_dca / cash_flow_only REQUIRE it, "
+        "to_total also deploys it if passed, only bands ignores it. For fixed_dca / "
+        "cash_flow_only, 0 → all-HOLD.",
+    )
+    target_source: str = Field(
+        default="", description="the ASSET_TARGET file the plan is measured against"
+    )
     suggestions: list[Trade]
     unpriced: list[str] = Field(
         description="held/target tickers with no cached price; offline, a NEW target "
@@ -688,18 +737,24 @@ def risk_report() -> RiskReport:
 @mcp.tool(
     annotations=_READ_ONLY,
     description="Buy/sell/hold suggestions to move current holdings toward the target "
-    "allocation (ASSET_TARGET), for the named discipline rule (default to_total). "
-    "Offline + read-only — it suggests, never trades. A NEW target ticker can't be "
-    "sized offline (no cached price); those appear under 'unpriced'.",
+    "allocation (ASSET_TARGET). There are exactly 4 modes: 'to_total' (rebalance the whole "
+    "book back to target weights — ALSO deploys new_cash into the rebalance if you pass it) and "
+    "'bands' (trade only sleeves that drifted past the 5%/25% threshold — the one mode that "
+    "IGNORES new_cash); 'fixed_dca' (spread new_cash across the target mix) and 'cash_flow_only' "
+    "(put new_cash into the most-underweight sleeves) — these two REQUIRE new_cash > 0 and "
+    "suggest all-HOLD when it is 0. Offline + read-only — it suggests, never trades. A NEW "
+    "target ticker can't be sized offline (no cached price); those appear under 'unpriced'.",
 )
-def rebalance_check(mode: str = "to_total") -> RebalancePlan:
-    if mode not in VALID_MODES:
-        raise ValueError(f"unknown rebalance mode {mode!r}; valid: {sorted(VALID_MODES)}")
+def rebalance_check(mode: str = "to_total", new_cash: float = 0.0) -> RebalancePlan:
+    mode = _one_of(mode, VALID_MODES, "rebalance mode")
+    if not math.isfinite(new_cash) or new_cash < 0:
+        raise ValueError(f"new_cash must be a finite number >= 0, got {new_cash}")
     today = date.today()
     b = _build(no_risk=True, today=today)
-    target = load_target(
-        _env_path("ASSET_TARGET", "set it to your target-allocation CSV for rebalance_check")
+    target_path = _env_path(
+        "ASSET_TARGET", "set it to your target-allocation CSV for rebalance_check"
     )
+    target = load_target(target_path)
     held = b.state.held()
     price_per_share = {tk: pr.close for tk, pr in b.prices.items()}
     unpriced = sorted((set(target) | set(held)) - set(price_per_share))
@@ -709,7 +764,8 @@ def rebalance_check(mode: str = "to_total") -> RebalancePlan:
         # over a partial book — the weights would understate the total and emit
         # confidently-wrong trades. Refuse with an explanation, never fabricate.
         return RebalancePlan(
-            asof=today, mode=mode, suggestions=[], unpriced=unpriced,
+            asof=today, mode=mode, new_cash=new_cash, target_source=str(target_path),
+            suggestions=[], unpriced=unpriced,
             note=_cold_error(
                 "Can't size a rebalance offline: held tickers lack a cached price "
                 f"({', '.join(unpriced_held)}) — the plan would be over a partial book. "
@@ -718,7 +774,7 @@ def rebalance_check(mode: str = "to_total") -> RebalancePlan:
             ),
         )
     held_value = {tk: held[tk].shares * price_per_share[tk] for tk in held}
-    sugg = suggest(cast("Mode", mode), held_value, price_per_share, target)
+    sugg = suggest(cast("Mode", mode), held_value, price_per_share, target, new_cash=new_cash)
     trades = [
         Trade(
             ticker=s.ticker, action=s.action, shares=s.shares, dollars=s.dollars,
@@ -726,7 +782,18 @@ def rebalance_check(mode: str = "to_total") -> RebalancePlan:
         )
         for s in sugg
     ]
-    return RebalancePlan(asof=today, mode=mode, suggestions=trades, unpriced=unpriced)
+    # Self-describing: fixed_dca / cash_flow_only exist to deploy NEW cash, so with none they
+    # emit all-HOLD — say so rather than leave the caller puzzled by a plan of only HOLDs.
+    note = _OFFLINE_NOTE
+    if mode in ("fixed_dca", "cash_flow_only") and new_cash == 0:
+        note = (
+            f"{mode} deploys NEW cash, but new_cash=0 → every line is HOLD. Pass "
+            f"new_cash=<amount> to see where the money would go. {_OFFLINE_NOTE}"
+        )
+    return RebalancePlan(
+        asof=today, mode=mode, new_cash=new_cash, target_source=str(target_path),
+        suggestions=trades, unpriced=unpriced, note=note,
+    )
 
 
 @mcp.tool(
@@ -926,9 +993,7 @@ def _benchmark_verdict(
 )
 def propose_allocation(preset: str = "moderate", benchmark: str = "60-40") -> ProposedAllocation:
     today = date.today()
-    pset = preset.strip().lower()
-    if pset not in PRESETS:
-        raise ValueError(f"unknown preset {preset!r}; valid: {sorted(PRESETS)}.")
+    pset = _one_of(preset, PRESETS, "preset")
     return _build_proposal(pset, benchmark, today)
 
 
@@ -937,9 +1002,7 @@ def _build_proposal(pset: str, benchmark: str, today: date) -> ProposedAllocatio
     The shared body of `propose_allocation` and `starter_allocation` — both must produce
     IDENTICAL weights for a given posture, so there is exactly one build path. `pset` is a
     validated preset; `benchmark` is validated here."""
-    bench = benchmark.strip().lower()
-    if bench != "none" and bench not in BENCHMARKS:
-        raise ValueError(f"unknown benchmark {benchmark!r}; valid: {sorted(BENCHMARKS)} or 'none'.")
+    bench = _one_of(benchmark, BENCHMARKS, "benchmark", allow_none=True)
     b = _build(no_risk=True, today=today)
     if not b.prices:
         raise ValueError(_cold_error(
@@ -986,7 +1049,8 @@ class StarterAllocation(BaseModel):
     "loss_response ('sell' | 'hold' | 'buy_more'), cash_buffer ('no' | 'partly' | "
     "'comfortably') — and it maps them to a conservative/moderate/aggressive posture (a "
     "fixed, explainable rubric — never your guess) and returns that preset allocation "
-    "validated against a benchmark, same as propose_allocation. Ask the three questions in "
+    "validated against a benchmark (60-40 / all-weather / permanent, or 'none' to skip — "
+    "default 60-40), same as propose_allocation. Ask the three questions in "
     "plain language first, then call this with the chosen answer tokens. Propose-only: a "
     "hand-designed starting posture, never a recommendation or a return forecast.",
 )
@@ -1048,12 +1112,30 @@ def whats_my_drawdown() -> str:
 
 
 @mcp.prompt(title="Should I rebalance?")
-def should_i_rebalance() -> str:
-    """Whether my own target bands say to act — each suggestion paired to its rule."""
+def should_i_rebalance(mode: str = "to_total", new_cash: str = "0") -> str:
+    """Whether my target policy says to act, for a chosen mode (to_total | bands | fixed_dca | cash_flow_only)."""
+    # validate at prompt time — a starter must not open on a tool error
+    m = _one_of(mode, VALID_MODES, "mode")
+    cash_clause = ""
+    nc = new_cash.strip()
+    has_cash = bool(nc) and nc not in ("0", "0.0")
+    if m in ("fixed_dca", "cash_flow_only"):
+        if has_cash:
+            cash_clause = f" Deploy new_cash={nc} — this mode only acts on NEW cash."
+        else:
+            cash_clause = (
+                " This mode only acts on NEW cash — ask me how much I want to invest, then "
+                "call it with that amount as new_cash."
+            )
+    elif m == "to_total" and has_cash:
+        cash_clause = (
+            f" Also deploy new_cash={nc} — to_total adds it to the target total and "
+            "rebalances the whole book to that."
+        )
     return (
-        "Call rebalance_check and tell me whether my rebalance policy says to act. For "
-        "each suggested action, name the RULE that produced it and the drift figure "
-        "behind it; if nothing fires, say so plainly. These are descriptions of my own "
+        f"Call rebalance_check with mode='{m}'.{cash_clause} Tell me whether my rebalance "
+        "policy says to act: for each suggested action, name the RULE that produced it and "
+        "the drift figure behind it; if nothing fires, say so plainly. These describe my own "
         "configured policy — not recommendations. " + _FIGURES_RULE
     )
 
@@ -1093,18 +1175,16 @@ def find_my_starting_allocation() -> str:
 
 
 @mcp.prompt(title="Propose a posture")
-def propose_a_posture(posture: str = "moderate") -> str:
-    """A starting allocation for a risk posture (conservative / moderate / aggressive) and how it held up vs a benchmark."""
-    p = posture.strip().lower()
-    if p not in PRESETS:  # validate at prompt time — a starter must not open on a tool error
-        raise ValueError(
-            f"unknown posture {posture!r} — pick one of: {', '.join(sorted(PRESETS))}"
-        )
+def propose_a_posture(posture: str = "moderate", benchmark: str = "60-40") -> str:
+    """A starting allocation for a risk posture (conservative / moderate / aggressive), validated against a benchmark (60-40 / all-weather / permanent, or 'none' to skip)."""
+    # validate at prompt time — a starter must not open on a tool error
+    p = _one_of(posture, PRESETS, "posture")
+    b = _one_of(benchmark, BENCHMARKS, "benchmark", allow_none=True)
     return (
-        f"Call propose_allocation with preset '{p}'. Show the proposed weights and "
-        "what each holding is for (its role), then report the benchmark verdict exactly "
-        "as returned — the vocabulary is 'shallower/deeper/inconclusive/insufficient' by "
-        "design, never 'beats'; if the verdict is null, relay the tool's note on why. Be "
+        f"Call propose_allocation with preset '{p}' and benchmark '{b}'. Show the proposed "
+        "weights and what each holding is for (its role), then report the benchmark verdict "
+        "exactly as returned — the vocabulary is 'shallower/deeper/inconclusive/insufficient' "
+        "by design, never 'beats'; if the verdict is null, relay the tool's note on why. Be "
         "clear this is a hand-designed posture prior, not an optimized or predicted-best "
         "portfolio. " + _FIGURES_RULE
     )

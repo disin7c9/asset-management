@@ -39,10 +39,13 @@ def test_load_events_parses_a_basic_row(tmp_path: Path) -> None:
     assert e.currency == "USD" and e.source == "YAHOO" and e.note == "first"
 
 
-def test_load_events_tolerates_bom_and_empty_numeric_cells(tmp_path: Path) -> None:
-    text = "﻿" + _HEADER + "2024-01-02,BND,YAHOO,USD,,5,buy,,\n"  # BOM + empty Price/Fee
+def test_load_events_tolerates_bom_and_empty_fee(tmp_path: Path) -> None:
+    # BOM (Excel-saved CSV) is stripped and an empty OPTIONAL Fee → 0.0. An empty Price/Quantity
+    # on a buy/sell is NOT tolerated — that's a malformed trade (see
+    # test_load_events_report_rejects_malformed_native_rows); only the genuinely-optional Fee is.
+    text = "﻿" + _HEADER + "2024-01-02,BND,YAHOO,USD,72.50,5,buy,,\n"  # BOM + empty Fee
     e = load_events(_csv(tmp_path, text))[0]
-    assert e.price == 0.0 and e.fee == 0.0 and e.quantity == 5.0
+    assert e.price == 72.50 and e.fee == 0.0 and e.quantity == 5.0
 
 
 def test_load_events_mixed_case_action(tmp_path: Path) -> None:
@@ -56,6 +59,28 @@ def test_load_events_maps_price_to_cash_for_cash_actions(tmp_path: Path, action:
     code = "CASH" if action in ("deposit", "withdraw") else "VOO"
     e = load_events(_csv(tmp_path, _HEADER + f"2024-03-01,{code},YAHOO,USD,12.5,0,{action},0,\n"))[0]
     assert e.cash == 12.5 and e.price == 0.0
+
+
+def test_income_row_tolerates_empty_price_and_quantity(tmp_path: Path) -> None:
+    # Non-trade rows (dividend/interest/deposit/withdraw) tolerate empty Price/Quantity — the
+    # D1 positivity guard applies to buy/sell ONLY. Regression against over-tightening it to
+    # every action (which would reject a legitimate income/cash book with blank cells).
+    text = _HEADER + (
+        "2024-01-05,VOO,YAHOO,USD,365,10,buy,1,\n"
+        "2024-03-01,VOO,YAHOO,USD,,,dividend,0,empty price+qty\n"  # both blank on a non-trade
+    )
+    events = load_events(_csv(tmp_path, text))
+    assert len(events) == 2  # loaded, not aborted at the _require_positive seam
+    div = next(e for e in events if e.action == "dividend")
+    assert div.cash == 0.0 and div.price == 0.0 and div.quantity == 0.0
+
+
+@pytest.mark.parametrize("bad", ["nan", "inf", "-inf"])
+def test_trade_with_nonfinite_price_rejected(tmp_path: Path, bad: str) -> None:
+    # A nan/inf trade cell parses as a float but is NOT a valid positive number; it must be
+    # rejected, not slipped past the `> 0` guard into cost basis / returns (E3).
+    with pytest.raises(ValueError, match="positive number"):
+        load_events(_csv(tmp_path, _HEADER + f"2024-01-05,VOO,YAHOO,USD,{bad},10,buy,1,\n"))
 
 
 def test_load_events_unknown_action_rejected(tmp_path: Path) -> None:
@@ -185,6 +210,21 @@ def test_ghostfolio_json_accepts_a_bare_activities_list(tmp_path: Path) -> None:
     assert load_events(_gf_json(tmp_path, [_act()], wrap=False))[0].ticker == "VOO"
 
 
+def test_ghostfolio_zero_price_or_qty_buy_skipped_not_aborted(tmp_path: Path) -> None:
+    # A $0 / 0-share Ghostfolio BUY (a transfer-in, gift, or bad row) is skipped WITH A WARNING,
+    # never allowed to abort the whole import at the _require_positive seam (E2). Ghostfolio's
+    # own model is per-activity skip, not all-or-nothing.
+    p = _gf_json(tmp_path, [
+        _act(symbol="VOO", type="BUY", unitPrice=400, quantity=10),
+        _act(symbol="GIFT", type="BUY", unitPrice=0, quantity=5, date="2024-02-01T00:00:00.000Z"),
+        _act(symbol="ZERO", type="BUY", unitPrice=50, quantity=0, date="2024-02-02T00:00:00.000Z"),
+    ])
+    events, warnings, fmt = load_events_report(p)
+    assert [e.ticker for e in events] == ["VOO"]  # both non-positive trades dropped, VOO kept
+    assert sum("non-positive" in w for w in warnings) == 2
+    assert any("GIFT" in w for w in warnings) and any("ZERO" in w for w in warnings)
+
+
 def test_load_events_report_returns_warnings_and_format(tmp_path: Path) -> None:
     # The dry-run seam: same events as load_events, PLUS the skip reasons and the format
     # label (which load_events only logs). A non-USD activity is dropped with a reason.
@@ -215,6 +255,37 @@ def test_load_events_report_raises_on_a_bad_row(tmp_path: Path) -> None:
     p = _csv(tmp_path, _HEADER + "2024-01-02,VOO,YAHOO,USD,400,1,teleport,0,\n")
     with pytest.raises(ValueError):
         load_events_report(p)
+
+
+@pytest.mark.parametrize(
+    ("row", "match"),
+    [
+        # truncated row → csv.DictReader None-fills the missing cells (was: _parse_action(None)
+        # → AttributeError, a raw traceback + rc 1)
+        ("2024-01-02,VOO,YAHOO,USD,400\n", "Action"),
+        # empty required trade fields (were: silently coerced to 0.0 → a phantom $0 / 0-share buy)
+        ("2024-01-02,VOO,YAHOO,USD,,10,buy,0,\n", "Price"),
+        ("2024-01-02,VOO,YAHOO,USD,400,,buy,0,\n", "Quantity"),
+        # negative share count on a sell (was: accepted → derive ADDED shares instead of removing)
+        ("2024-01-02,VOO,YAHOO,USD,400,-3,sell,0,\n", "positive"),
+    ],
+)
+def test_load_events_report_rejects_malformed_native_rows(
+    tmp_path: Path, row: str, match: str
+) -> None:
+    # D1: the import preview (and the real loader, same seam) must refuse a structurally-broken
+    # or empty-required-field native CSV row with a clear ValueError — never crash, never
+    # silently book a 0/negative trade.
+    with pytest.raises(ValueError, match=match):
+        load_events_report(_csv(tmp_path, _HEADER + row))
+
+
+def test_load_events_truncated_row_raises_not_crashes(tmp_path: Path) -> None:
+    # Regression for the worst D1 case: a truncated row used to reach _parse_action(None) →
+    # AttributeError, crashing the REAL brief (load_events), not only --dry-run. Now a clean error.
+    p = _csv(tmp_path, _HEADER + "2024-01-02,VOO,YAHOO,USD,400\n")
+    with pytest.raises(ValueError, match="required but empty"):
+        load_events(p)
 
 
 def test_ghostfolio_dividend_is_quantity_times_unitprice(tmp_path: Path) -> None:
