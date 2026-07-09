@@ -732,8 +732,8 @@ def test_benchmark_narrate_leads_the_panel(
     def fake_complete(_cfg: object, system: str, _user: str) -> str:
         if "reference portfolio" in system:  # the benchmark note
             return (
-                "Your posture's deepest dip was {{bench_dd_preset}}, versus "
-                "{{bench_dd_reference}} for {{bench_reference}}; a held-out test "
+                "Your posture's overall drawdown pain was {{bench_ulcer_preset}}, versus "
+                "{{bench_ulcer_reference}} for {{bench_reference}}; a held-out test "
                 "couldn't tell them apart."
             )
         return "A calm summary of the book."  # the (empty-book) SUMMARY block
@@ -911,8 +911,8 @@ def test_narrate_backtest_benchmark_is_book_free(
     def fake_complete(_cfg: object, system: str, _user: str) -> str:
         assert "reference portfolio" in system  # ONLY the benchmark note — never a book SUMMARY
         return (
-            "Your posture's deepest dip was {{bench_dd_preset}}, versus "
-            "{{bench_dd_reference}} for {{bench_reference}}; a held-out test "
+            "Your posture's overall drawdown pain was {{bench_ulcer_preset}}, versus "
+            "{{bench_ulcer_reference}} for {{bench_reference}}; a held-out test "
             "couldn't tell them apart."
         )
 

@@ -209,6 +209,7 @@ def test_backtest_section_renders(state, prices) -> None:
     out = render_text(data)
     assert "rebalanced (quarterly)" in out and "buy & hold" in out
     assert "Max drawdown" in out and "Final value" in out
+    assert "Ulcer index" in out and "CDaR (worst 5%)" in out  # the verdict trio (v2.9.0)
     assert "simulation, not a prediction" in out
     # P0-3: Sharpe/Sortino now carry a 95% CI row (not bare points).
     assert out.count("95% CI") >= 3

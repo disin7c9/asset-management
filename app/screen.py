@@ -321,6 +321,8 @@ def _check_role(rc: RoleCheck | None) -> CheckResult:
     oos = rc.oos
     if oos is not None:
         values.update(
+            oos_ulcer_with=oos.ulcer_with, oos_ulcer_without=oos.ulcer_without,
+            oos_cdar_with=oos.cdar_with, oos_cdar_without=oos.cdar_without,
             oos_dd_with=oos.dd_with, oos_dd_without=oos.dd_without,
             oos_vol_with=oos.vol_with, oos_vol_without=oos.vol_without,
         )

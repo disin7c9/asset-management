@@ -175,14 +175,20 @@ def ulcer_index(index: "pd.Series[float]") -> float:
 def cdar(index: "pd.Series[float]", alpha: float = 0.05) -> float:
     """Conditional Drawdown-at-Risk: mean of the worst `alpha` fraction of drawdowns.
 
-    Returned as a positive magnitude. alpha=0.05 → average of the worst 5%.
+    Returned as a positive magnitude. alpha=0.05 → average of the worst 5% of days.
+    Takes the worst ``ceil(alpha·N)`` days explicitly (at least one), NOT the days
+    at/above the (1−alpha) quantile: when fewer than alpha of the days are underwater
+    the quantile is 0.0 and a ``>= threshold`` filter sweeps in every zero-drawdown day,
+    collapsing CDaR to the overall mean and understating the true worst tail (~20× on a
+    mostly-at-peak leg) — which since v2.9.0 also blinds the verdict's CDaR gate.
     """
     dd_mag = (-_drawdown_curve(index)).to_numpy()  # positive magnitudes
-    if dd_mag.size == 0:
+    n = dd_mag.size
+    if n == 0:
         return 0.0
-    threshold = float(np.quantile(dd_mag, 1.0 - alpha))
-    tail = dd_mag[dd_mag >= threshold]
-    return float(tail.mean()) if tail.size > 0 else float(dd_mag.max())
+    k = max(1, int(np.ceil(alpha * n)))          # worst-alpha count, at least one day
+    worst = np.partition(dd_mag, n - k)[n - k:]  # the k deepest magnitudes (O(n), unordered)
+    return float(worst.mean())
 
 
 # ── risk-adjusted ratios (delegate to empyrical) ──────────────────────────
@@ -205,17 +211,29 @@ def _max_drawdown_depth(returns: "pd.Series[float]") -> float:
     return float(empyrical.max_drawdown(returns))
 
 
-def _ulcer_from_returns(returns: "pd.Series[float]") -> float:
-    """Ulcer index from a return series (builds the growth index internally)."""
+def ulcer_from_returns(returns: "pd.Series[float]") -> float:
+    """Ulcer index from a return series (builds the growth index internally).
+
+    Public: the ONE returns→Ulcer bridge — `summarize_risk`'s CI and `backtest`'s
+    held-out verdict both use it, so the definition can't drift."""
     return ulcer_index((1.0 + returns).cumprod())
 
 
-def _cdar_from_returns(returns: "pd.Series[float]") -> float:
-    """CDaR from a return series (builds the growth index internally)."""
+def cdar_from_returns(returns: "pd.Series[float]") -> float:
+    """CDaR from a return series (builds the growth index internally).
+
+    Public for the same reason as `ulcer_from_returns` (backtest's verdict)."""
     return cdar((1.0 + returns).cumprod())
 
 
 # ── bootstrap confidence intervals ────────────────────────────────────────
+
+
+def path_block(n: int) -> int:
+    """Moving-block size for path-dependent statistics (~√n, at least 2). Shared by
+    ``summarize_risk``'s max-DD/Ulcer/CDaR CIs and ``backtest``'s paired Ulcer-gain CI,
+    so the block rule can't drift between the point panel and the held-out verdict."""
+    return max(2, int(round(n**0.5)))
 
 
 def moving_block_indices(n: int, block: int, rng: np.random.Generator) -> np.ndarray:
@@ -289,18 +307,18 @@ def summarize_risk(
     # Path-dependent extrema (max-DD, Ulcer, CDaR) need a LARGER bootstrap block
     # than mean-type ratios: an ~n**(1/3) block can't reassemble a multi-month
     # decline, biasing those bands shallow. Use ~√n for them; ratios keep the default.
-    path_block = max(2, round(len(daily_returns) ** 0.5))
+    pblock = path_block(len(daily_returns))
     return RiskSummary(
         n_days=len(daily_returns),
         drawdown=max_drawdown(index),
         max_drawdown_ci=bootstrap_ci(
-            _max_drawdown_depth, daily_returns, n=bootstrap_n, seed=seed, block=path_block
+            _max_drawdown_depth, daily_returns, n=bootstrap_n, seed=seed, block=pblock
         ),
         ulcer_index=bootstrap_ci(
-            _ulcer_from_returns, daily_returns, n=bootstrap_n, seed=seed, block=path_block
+            ulcer_from_returns, daily_returns, n=bootstrap_n, seed=seed, block=pblock
         ),
         cdar=bootstrap_ci(
-            _cdar_from_returns, daily_returns, n=bootstrap_n, seed=seed, block=path_block
+            cdar_from_returns, daily_returns, n=bootstrap_n, seed=seed, block=pblock
         ),
         sharpe=bootstrap_ci(sharpe, daily_returns, n=bootstrap_n, seed=seed),
         sortino=bootstrap_ci(sortino, daily_returns, n=bootstrap_n, seed=seed),

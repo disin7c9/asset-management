@@ -189,8 +189,11 @@ def test_role_check_hedge_improves_oos() -> None:
     rc = role_check({"AAA": aaa, "HEDGE": hedge}, {"AAA": 1.0}, "HEDGE", sleeve=0.5)
     assert rc.verdict == "improved"
     oos = rc.oos
-    assert oos is not None and oos.dd_with > oos.dd_without  # shallower drawdown
+    assert oos is not None and oos.dd_with > oos.dd_without      # shallower drawdown
+    assert oos.ulcer_with < oos.ulcer_without                    # less whole-window pain (the decider)
+    assert oos.cdar_with < oos.cdar_without                      # milder worst tail (the agreement check)
     assert "OOS" in rc.reason and "overfitting gap" in rc.reason
+    assert "Ulcer" in rc.reason                                  # the reason leads with the verdict statistic
 
 
 def test_role_check_amplifier_worsens_oos() -> None:
@@ -218,6 +221,59 @@ def test_role_check_clone_is_inconclusive() -> None:
     rc = role_check({"AAA": aaa, "CLONE": clone}, {"AAA": 1.0}, "CLONE", sleeve=0.5)
     assert rc.verdict == "inconclusive"
     assert "no clear out-of-sample improvement" in rc.reason
+
+
+def test_oos_verdict_gates_name_their_cause() -> None:
+    # The three verdict gates (v2.9.0) each name what blocked them; the cause lands in
+    # role_check / benchmark_compare reasons so "inconclusive" is never unexplained.
+    from app.backtest import RoleWindow, _oos_verdict
+
+    def win(ulcer_wo: float, ulcer_w: float, cdar_wo: float, cdar_w: float) -> RoleWindow:
+        return RoleWindow(
+            label="out-of-sample", start=date(2025, 1, 1), end=date(2025, 6, 1), n_days=100,
+            dd_without=-0.18, dd_with=-0.18, ulcer_without=ulcer_wo, ulcer_with=ulcer_w,
+            cdar_without=cdar_wo, cdar_with=cdar_w, vol_without=0.15, vol_with=0.15,
+            ret_without=None, ret_with=None,
+        )
+
+    flat = pd.Series([0.001, -0.001] * 50)
+
+    # The cause is a structured enum (not prose to regex); ci is None when no bootstrap ran.
+    # Gate 1: an Ulcer gap inside the noise margin → inconclusive before any bootstrap.
+    v, ci, cause = _oos_verdict(win(0.080, 0.079, 0.15, 0.15), flat, flat, bootstrap_n=50, seed=1)
+    assert v == "inconclusive" and ci is None and cause == "noise_margin"
+
+    # Gate 2: Ulcer says clearly better but the worst tail (CDaR) is clearly WORSE (by more
+    # than _CDAR_SLACK) — an Ulcer win bought with a deeper tail must not read "improved".
+    v, ci, cause = _oos_verdict(win(0.10, 0.06, 0.15, 0.25), flat, flat, bootstrap_n=50, seed=1)
+    assert v == "inconclusive" and ci is None and cause == "cdar_contradicts"
+
+    # Gate 3: identical return paths → every paired resample gains exactly 0, so the CI can't
+    # confirm the (fabricated) point gap → bootstrap ran (ci present) but did not confirm.
+    v, ci, cause = _oos_verdict(win(0.10, 0.06, 0.15, 0.14), flat, flat, bootstrap_n=50, seed=1)
+    assert v == "inconclusive" and ci is not None and cause == "bootstrap_unconfirmed"
+
+    # Short window: a clear Ulcer gap but < 10 aligned days → window_too_short, NOT
+    # "bootstrap_unconfirmed" (the bootstrap never ran).
+    short = pd.Series([0.001, -0.001] * 4)  # 8 days
+    v, ci, cause = _oos_verdict(win(0.10, 0.06, 0.15, 0.14), short, short, bootstrap_n=50, seed=1)
+    assert v == "inconclusive" and ci is None and cause == "window_too_short"
+
+
+def test_ulcer_np_matches_risk_ulcer_index() -> None:
+    # backtest._ulcer_np (numpy-native, used in the bootstrap hot loop) MUST equal
+    # risk.ulcer_index (the canonical pandas definition) — the drift guard that lets the
+    # paired bootstrap skip the per-resample pd.Series wrap without changing any number.
+    import numpy as np
+
+    from app.backtest import _ulcer_np
+    from app.risk import ulcer_index
+
+    rng = np.random.default_rng(0)
+    for _ in range(20):
+        rets = rng.normal(0.0005, 0.02, size=int(rng.integers(15, 300)))
+        idx = (1.0 + pd.Series(rets)).cumprod()
+        assert _ulcer_np(rets) == pytest.approx(ulcer_index(idx), abs=1e-12)
 
 
 def test_role_check_insufficient_data_paths() -> None:
@@ -334,7 +390,29 @@ def test_benchmark_shallower_drawdown_reads_shallower() -> None:
     assert [leg.label for leg in res.legs] == ["preset", "chop"]
     assert res.oos is not None
     assert res.verdict == "shallower"       # the preset (RISE) has the shallower OOS drawdown
-    assert res.dd_diff_ci[0] > 0.0          # 95% CI of (preset − ref) drawdown excludes zero
+    assert res.ulcer_gain_ci[0] > 0.0       # 95% CI of the Ulcer gain confirms less pain
+
+
+def test_benchmark_ulcer_resolves_where_max_dd_ties() -> None:
+    # The A1 (v2.9.0) capability: both sides share the SAME worst crash inside the held-out
+    # window, so the single-worst-event statistic ties (the old max-DD verdict saw nothing
+    # here) — but the reference ALSO bleeds through a long secondary slump. Ulcer
+    # (whole-window pain) separates them decisively and CDaR doesn't contradict.
+    from app.backtest import benchmark_compare
+
+    crash = [-0.01] * 20 + [0.02] * 11
+    a = _close_path([0.0005] * 280 + crash + [0.0005] * 89)                  # the crash only
+    b = _close_path([0.0005] * 280 + crash + [-0.003] * 60 + [0.0005] * 29)  # crash + a long bleed
+    res = benchmark_compare(
+        {"A": a, "B": b}, {"A": 1.0}, {"B": 1.0}, reference="bleeder", bootstrap_n=200
+    )
+    assert res is not None and res.oos is not None
+    oos = res.oos
+    assert abs(oos.dd_with - oos.dd_without) < 0.005   # the single worst event ties...
+    assert oos.ulcer_with < oos.ulcer_without - 0.01   # ...but the preset carried far less pain
+    assert res.verdict == "shallower"
+    assert res.ulcer_gain_ci[0] > 0.0
+    assert "Ulcer" in res.reason and "context" in res.reason  # max DD reported as context
 
 
 def test_benchmark_identical_portfolios_are_inconclusive() -> None:

@@ -119,8 +119,9 @@ _BAND_SPECS: dict[str, _BandSpec] = {
 # family is banded automatically. The brief's fixed metrics match by exact name above;
 # these match by prefix only when no exact spec exists.
 _PREFIX_BANDS: tuple[tuple[str, _BandSpec], ...] = (
-    ("gap_", _EXPOSURE_BAND),    # discovery: the book's exposure to a gap role
-    ("bench_dd_", _DD_BAND),     # benchmark: a leg's max-drawdown depth
+    ("gap_", _EXPOSURE_BAND),       # discovery: the book's exposure to a gap role
+    ("bench_dd_", _DD_BAND),        # benchmark: a leg's max-drawdown depth
+    ("bench_ulcer_", _BAND_SPECS["ulcer"]),  # benchmark: a leg's Ulcer index (the verdict stat)
 )
 
 
@@ -481,38 +482,43 @@ _BENCHMARK_DISPLAY: dict[str, str] = {
 }
 
 # The held-out verdict as ONE fixed, number-free sentence the model must convey AS-IS and
-# never strengthen — drawdown DEPTH only; "no clear difference" is the honest, common
-# result on a short history.
+# never strengthen. Since v2.9.0 the verdict is judged on the ULCER index (whole-window
+# drawdown pain), so the cited figures ARE the two OOS Ulcer values (see build_benchmark_claims)
+# and these sentences describe what Ulcer measures WITHOUT over-claiming: a lower Ulcer does not
+# on its own prove the declines were both shallower AND shorter, so we say "how deep and how
+# long, combined" (what the metric is), never assert both moved.
 _VERDICT_SENTENCE: dict[BenchmarkVerdict, str] = {
-    "shallower": "Over the tested out-of-sample window, your posture's deepest drop was "
-    "SHALLOWER than the reference's.",
-    "deeper": "Over the tested out-of-sample window, your posture's deepest drop was "
-    "DEEPER than the reference's.",
-    "inconclusive": "A held-out test found NO CLEAR difference between the two drawdowns — "
-    "the usual, honest result on a short history.",
+    "shallower": "Over the tested out-of-sample window, your posture carried LESS overall "
+    "drawdown pain than the reference — a single whole-window measure of how deep and how "
+    "long its declines ran, combined.",
+    "deeper": "Over the tested out-of-sample window, your posture carried MORE overall "
+    "drawdown pain than the reference — a single whole-window measure of how deep and how "
+    "long its declines ran, combined.",
+    "inconclusive": "A held-out test found NO CLEAR difference in overall drawdown pain "
+    "between the two — an honest, common result on a short history.",
     "insufficient": "There was not enough overlapping history to run a held-out test, so "
     "the comparison is not yet judged.",
 }
 
 
 def build_benchmark_claims(result: BenchmarkResult) -> dict[str, Claim]:
-    """Validated figures the benchmark note may cite: each leg's max-drawdown DEPTH (your
-    posture and the reference, banded like the brief's max_drawdown via the bench_dd_
-    prefix) and the reference's NAME (cited by {{token}} so a digit-bearing name like
-    "60-40" can't trip PCN). The walk-forward VERDICT is NOT here — it's a word, mandated
-    as fixed framing in the prompt, never a number the model picks. Returns {} unless both
-    legs are present (an 'insufficient' run with no common window has nothing honest to
-    cite)."""
-    if len(result.legs) != 2:
+    """Validated figures the benchmark note may cite, ALL from the held-out (out-of-sample)
+    window the verdict is actually judged on: the two Ulcer indices — your posture's and the
+    reference's — which ARE the verdict statistic (banded via the bench_ulcer_ prefix), plus
+    the reference's NAME (cited by {{token}} so a digit-bearing name like "60-40" can't trip
+    PCN). Ulcer, not max-DD, is cited so the numbers can never point opposite to the Ulcer-based
+    verdict word (the pre-v2.9.0 failure: a shallower single drop next to a 'more pain' verdict).
+    The VERDICT itself is NOT a number here — it's a word mandated as fixed framing in the
+    prompt. Returns {} when there is no held-out window (an 'insufficient'/too-short run has
+    nothing honest to cite)."""
+    if result.oos is None:
         return {}
-    posture, reference = result.legs
+    oos = result.oos
     claims: dict[str, Claim] = {}
-    _add_claim(claims, "bench_dd_preset", posture.risk.max_drawdown_ci.point,
-               _pct(posture.risk.max_drawdown_ci.point),
-               "your posture's deepest peak-to-trough decline over the shared window")
-    _add_claim(claims, "bench_dd_reference", reference.risk.max_drawdown_ci.point,
-               _pct(reference.risk.max_drawdown_ci.point),
-               "the reference portfolio's deepest decline over the same window")
+    _add_claim(claims, "bench_ulcer_preset", oos.ulcer_with, _mag(oos.ulcer_with),
+               "your posture's overall drawdown pain (Ulcer index) over the held-out window")
+    _add_claim(claims, "bench_ulcer_reference", oos.ulcer_without, _mag(oos.ulcer_without),
+               "the reference's overall drawdown pain (Ulcer index) over the same window")
     name = _BENCHMARK_DISPLAY.get(result.reference, result.reference)
     _add_claim(claims, "bench_reference", name, name,
                "the name of the well-known reference you are compared against")
@@ -523,17 +529,21 @@ _BENCHMARK_SYSTEM_PROMPT = (
     "You explain, in plain language for a portfolio's owner, how their chosen posture (a "
     "conservative / moderate / aggressive preset mix) compares to a well-known reference "
     "portfolio — DRAWDOWN-FIRST.\n"
-    "You are given each side's deepest decline and ONE fixed verdict sentence stating what "
-    "a held-out (walk-forward) test found. Put that verdict in plain words for the owner.\n"
+    "You are given each side's overall drawdown pain (its Ulcer index) and ONE fixed verdict "
+    "sentence stating what a held-out (walk-forward) test found. Put that verdict in plain "
+    "words for the owner.\n"
     "HARD RULES:\n"
     "- Refer to every figure AND the reference's name ONLY by its {{token}} placeholder. "
     "NEVER write a digit, percent, or portfolio name yourself — one stray character voids "
     "the whole note. (The reference's name may contain digits; cite {{bench_reference}}, "
     "never spell it.)\n"
-    "- Lead with drawdown: how deep your posture fell versus how deep the reference fell.\n"
+    "- Lead with overall drawdown pain: your posture's {{bench_ulcer_preset}} versus the "
+    "reference's {{bench_ulcer_reference}}. This is the whole-window measure the verdict is "
+    "judged on (how deep AND how long declines ran, combined) — NOT the single worst drop.\n"
     "- Convey the verdict EXACTLY as given and NO stronger. NEVER say one portfolio 'beats', "
-    "'outperforms', 'wins', or is 'better than' the other — the finding is about drawdown "
-    "DEPTH alone, and on a short history it is usually 'no clear difference'.\n"
+    "'outperforms', 'wins', or is 'better than' the other — the finding is about overall "
+    "drawdown pain alone, and on a short history 'no clear difference' is a common, honest "
+    "result.\n"
     "- NEVER predict returns or say which will do better going forward; you have no forward "
     "figures and past drawdown is not a forecast.\n"
     "- Do NOT quantify in words ('twice as deep', 'half'); stay qualitative ('a little "

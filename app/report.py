@@ -493,6 +493,11 @@ def _leg_table(
     def ratio(x: float) -> str:
         return _NA if not math.isfinite(x) else f"{x:+.2f}"
 
+    def mag(x: float) -> str:
+        # Unsigned: Ulcer / CDaR are non-negative magnitudes, so no forced '+' (max DD,
+        # a negative depth, keeps _pct_or_na's sign).
+        return _NA if not math.isfinite(x) else f"{x * 100:.2f}%"
+
     def dd_ci(ci: MetricCI) -> str:
         if not math.isfinite(ci.point):
             return _NA
@@ -508,6 +513,10 @@ def _leg_table(
         "-" * (lw + cw * len(legs)),
         row("Max drawdown", [_pct_or_na(leg.risk.max_drawdown_ci.point) for leg in legs]),
         row("  95% CI", [dd_ci(leg.risk.max_drawdown_ci) for leg in legs]),
+        row("Ulcer index", [mag(leg.risk.ulcer_index.point) for leg in legs]),
+        row("  95% CI", [dd_ci(leg.risk.ulcer_index) for leg in legs]),
+        row("CDaR (worst 5%)", [mag(leg.risk.cdar.point) for leg in legs]),
+        row("  95% CI", [dd_ci(leg.risk.cdar) for leg in legs]),
         row("Sharpe (252-basis)", [ratio(leg.risk.sharpe.point) for leg in legs]),
         row("  95% CI", [ratio_ci(leg.risk.sharpe) for leg in legs]),
         row("Sortino", [ratio(leg.risk.sortino.point) for leg in legs]),
@@ -548,8 +557,9 @@ def _section_benchmark(bm: BenchmarkResult) -> Section:
     lines.append("")
     lines.append(f"Walk-forward (held-out): {bm.reason}")
     lines.append(
-        "Where your posture lands vs a known reference — never 'beats it'. On a short "
-        "history the honest verdict is usually inconclusive."
+        "Where your posture lands vs a known reference — never 'beats it'. The verdict "
+        "rides on the Ulcer index (whole-window drawdown pain), with CDaR as the "
+        "worst-tail check; max drawdown is context, not the decider."
     )
     return Section(
         f"BENCHMARK (preset vs {bm.reference} · {bm.start} → {bm.end} — propose-only)",

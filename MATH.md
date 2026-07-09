@@ -201,10 +201,15 @@ $$
 
 ### 5.5 Conditional Drawdown-at-Risk — `cdar`
 The drawdown analogue of **CVaR / Expected Shortfall**: average of the worst $\alpha$ fraction of
-drawdowns. With magnitudes $X=\{-DD(d)\}\ge 0$ and threshold $q=Q_{1-\alpha}(X)$ (the $(1-\alpha)$ quantile):
+drawdowns. With magnitudes $X=\{-DD(d)\}\ge 0$ over $N$ days, take the $k=\lceil\alpha N\rceil$
+largest (at least one):
 $$
-\mathrm{CDaR}_\alpha=\operatorname{mean}\{\,x\in X : x\ge q\,\},\qquad \alpha=0.05 .
+\mathrm{CDaR}_\alpha=\frac1k\!\!\sum_{x\in\operatorname{top}_k(X)}\!\! x,\qquad \alpha=0.05,\ \ k=\lceil\alpha N\rceil .
 $$
+The worst-$k$ days are taken **explicitly** — not the days at/above the $(1-\alpha)$ quantile $q$:
+when fewer than $\alpha$ of days are underwater, $q=0$ and a "$x\ge q$" filter sweeps in every
+zero-drawdown day, collapsing CDaR to the overall mean (~20× understatement on a mostly-at-peak
+leg). Since v2.9.0 CDaR is a verdict gate (§12.5), so this understatement is corrected here.
 
 ---
 
@@ -405,42 +410,56 @@ require $n_{\text{is}}\ge 60$ **and** $n_{\text{oos}}\ge 60$ else the verdict is
 capital each window; legs date-aligned by inner join (never positional truncation).
 
 ### 12.4 Window statistics — `_window_stats`
-Per leg (with-candidate, without): max-drawdown depth (§5.2), annualized vol (§7), true TWR (§2.5).
-Gains (positive = better):
+Per leg (with-candidate, without), over the held-out window: **Ulcer index** (§5.4 — the verdict
+statistic) and **CDaR** (§5.5 — the tail check), plus max-drawdown depth (§5.2), annualized vol
+(§7), and true TWR (§2.5) as DESCRIPTIVE context. Gains (positive = the tested leg carried less
+pain):
 $$
-\text{ddgain}=\mathrm{MDD}_{\text{with}}-\mathrm{MDD}_{\text{without}},
+\text{ulcergain}=\mathrm{UI}_{\text{without}}-\mathrm{UI}_{\text{with}},
 \qquad
-\text{volgain}=\sigma_{\text{without}}-\sigma_{\text{with}} .
+\text{cdargain}=\mathrm{CDaR}_{\text{without}}-\mathrm{CDaR}_{\text{with}} .
 $$
 
-### 12.5 Verdict with noise margins
-Differences smaller than $\varepsilon_{dd}=\varepsilon_{\sigma}=0.005$ (0.5 pp) are noise, not signal:
+### 12.5 Verdict — Ulcer-first, three gates
+The verdict is judged on the **Ulcer index** (whole-window drawdown pain), **not** max-drawdown
+depth: a single worst drop is an extreme-value statistic whose bootstrap CI almost always straddles
+zero on a short history (the chronic "inconclusive"). Max drawdown and volatility are reported but
+do **not** vote — Ulcer already carries the drawdown-producing (downside) volatility a drawdown-first
+verdict cares about; upside volatility is deliberately not penalized. With $\varepsilon_{U}=0.0025$
+(Ulcer noise margin) and $\varepsilon_{C}=0.005$ (CDaR contradiction slack, at CDaR's larger tail scale):
 $$
 \text{verdict}=
 \begin{cases}
-\textbf{improved} & \text{ddgain}\ge \varepsilon_{dd}\ \text{and}\ \text{volgain}\ge -\varepsilon_{\sigma}\\
-\textbf{worsened} & \text{ddgain}\le -\varepsilon_{dd}\ \text{and}\ \text{volgain}\le \varepsilon_{\sigma}\\
-\textbf{inconclusive} & \text{otherwise}
+\textbf{inconclusive} & |\text{ulcergain}|<\varepsilon_{U} & (\texttt{noise\_margin})\\
+\textbf{inconclusive} & \operatorname{sign}(\text{ulcergain})\cdot\text{cdargain}<-\varepsilon_{C} & (\texttt{cdar\_contradicts})\\
+\textbf{improved} & \text{ulcergain}>0\ \text{and}\ \mathrm{CI}_{\text{low}}>0\\
+\textbf{worsened} & \text{ulcergain}<0\ \text{and}\ \mathrm{CI}_{\text{high}}<0\\
+\textbf{inconclusive} & \text{otherwise} & (\texttt{bootstrap\_unconfirmed})
 \end{cases}
 $$
+$\mathrm{CI}$ is the paired-bootstrap 95% interval of the Ulcer gain (§12.6). Gate 2 lets CDaR **tie**
+but not **contradict** the Ulcer direction — it catches an Ulcer win bought with a deeper worst tail.
+The blocking gate is returned as a structured `cause` for consumers to branch on.
 
-### 12.6 Paired moving-block bootstrap of the drawdown difference — `_paired_dd_diff_ci`
+### 12.6 Paired moving-block bootstrap of the Ulcer gain — `_paired_ulcer_gain_ci`
 The honesty gate. Both legs ride the same market, so resample them with the **same** block indices —
-shared market moves cancel in the difference, leaving only the candidate's marginal effect (the
+shared market moves cancel in the difference, leaving only the tested leg's marginal effect (the
 variance-reduction-by-pairing principle, as in a paired $t$-test). For $j=1\dots B$ ($B=1000$),
-drawing one index set $I_j$ from §8.1 with block $b=\min(\max(\lfloor\sqrt n\rfloor,2),\,n)$:
+drawing one index set $I_j$ from §8.1 with block $b=\max(2,\operatorname{round}\sqrt n)$
+(`risk.path_block`, the same √n rule as the point CIs):
 $$
-\Delta_j=\mathrm{MDD}\!\bigl(r^{\text{with}}[I_j]\bigr)-\mathrm{MDD}\!\bigl(r^{\text{without}}[I_j]\bigr),
+\Delta_j=\mathrm{UI}\!\bigl(r^{\text{without}}[I_j]\bigr)-\mathrm{UI}\!\bigl(r^{\text{with}}[I_j]\bigr),
 \qquad
-\mathrm{MDD}(\mathbf r)=\min\!\left(\frac{\Pi}{\operatorname{cummax}\Pi}-1\right),\ \ \Pi=\operatorname{cumprod}(1+\mathbf r).
+\mathrm{UI}(\mathbf r)=\sqrt{\tfrac1N\textstyle\sum_d DD_d^2},\ \ DD=\tfrac{\Pi}{\operatorname{cummax}\Pi}-1,\ \Pi=\operatorname{cumprod}(1+\mathbf r).
 $$
 $$
 \mathrm{CI}_{95}=\bigl[\,Q_{2.5}(\{\Delta_j\}),\ Q_{97.5}(\{\Delta_j\})\,\bigr].
 $$
-**An improved/worsened verdict stands only if $0\notin\mathrm{CI}_{95}$**; otherwise it is downgraded to
-**inconclusive**. Needs $n\ge 10$ aligned days (else returns $(0,0)$ → always contains zero →
-inconclusive). Decisive on a real effect, honestly inconclusive inside the noise band — the property
-that keeps the gate from passing overfit noise.
+Non-finite resamples are dropped (as in the risk-panel bootstrap). An improved/worsened verdict
+stands only if the CI **confirms the direction** ($\mathrm{CI}_{\text{low}}>0$ for improved,
+$\mathrm{CI}_{\text{high}}<0$ for worsened); otherwise inconclusive. Needs $n\ge 10$ aligned days
+(else no interval → `window_too_short`). Decisive on a real effect, honestly inconclusive inside the
+noise band — the property that keeps the gate from passing overfit noise.
 
 ---
 
@@ -459,7 +478,7 @@ that keeps the gate from passing overfit noise.
 | candidate sleeve $s$ | $0.05$ | backtest | role-check displacement |
 | OOS fraction | $0.30$ | backtest | held-out share |
 | min window | $60$ days each side | backtest | else "insufficient" |
-| noise margins | $0.005$ (DD, vol) | backtest | signal vs noise |
+| verdict margins | $\varepsilon_U=0.0025$ (Ulcer), $\varepsilon_C=0.005$ (CDaR slack) | backtest | signal vs noise |
 | corr thresholds | warn $0.60$, fail $0.85$, downside escalate $+0.15$ | screen | diversifier verdict |
 | overlap thresholds | warn $0.40$, fail $0.70$ | screen | near-duplicate verdict |
 | concentration warn | $0.50$ | screen | top-10 weight |

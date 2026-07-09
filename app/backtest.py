@@ -30,7 +30,15 @@ import numpy as np
 import pandas as pd
 
 from app.returns import true_twr_annualized, twr_index
-from app.risk import RiskSummary, max_drawdown, moving_block_indices, summarize_risk
+from app.risk import (
+    RiskSummary,
+    cdar_from_returns,
+    max_drawdown,
+    moving_block_indices,
+    path_block,
+    summarize_risk,
+    ulcer_from_returns,
+)
 
 INITIAL_CAPITAL = 10_000.0
 SCHEDULES: tuple[str, ...] = ("never", "monthly", "quarterly", "annually")
@@ -41,9 +49,16 @@ SCHEDULES: tuple[str, ...] = ("never", "monthly", "quarterly", "annually")
 CANDIDATE_SLEEVE = 0.05
 _OOS_FRACTION = 0.30
 _MIN_WINDOW_DAYS = 60
-# Point-estimate margins: differences smaller than these are noise, not a verdict.
-_DD_MARGIN = 0.005   # 0.5pp of drawdown depth
-_VOL_MARGIN = 0.005  # 0.5pp of annualized volatility
+# Point-estimate margin (v2.9.0): a smaller Ulcer gain than this is noise, not a
+# verdict. Ulcer (RMS drawdown) runs at roughly half the scale of max-DD depth, so
+# 0.25pp mirrors the 0.5pp max-DD margin the verdict used before it.
+_ULCER_MARGIN = 0.0025
+# CDaR contradiction slack (its OWN margin, NOT _ULCER_MARGIN): the worst-tail average
+# may tie, but must not CONTRADICT the Ulcer direction by more than this to keep an
+# improved/worsened verdict. CDaR is a worst-tail MEAN, running near max-DD scale (~2×
+# Ulcer), so it is judged at that scale — sharing the tighter Ulcer margin would veto
+# genuine Ulcer wins on ordinary tail noise.
+_CDAR_SLACK = 0.005
 
 
 @dataclass(frozen=True)
@@ -225,8 +240,12 @@ class RoleWindow:
     start: date
     end: date
     n_days: int
-    dd_without: float     # max drawdown depth, negative fraction
+    dd_without: float     # max drawdown depth, negative fraction — DESCRIPTIVE (see _oos_verdict)
     dd_with: float
+    ulcer_without: float  # Ulcer index (RMS drawdown), positive — the verdict statistic
+    ulcer_with: float
+    cdar_without: float   # CDaR (mean of the worst-5% drawdowns), positive — the agreement check
+    cdar_with: float
     vol_without: float    # annualized daily-return volatility
     vol_with: float
     ret_without: float | None  # annualized TWR; None if window too short
@@ -291,50 +310,74 @@ def _window_stats(
     end: date,
 ) -> RoleWindow:
     """Drawdown-first stats for both legs from their (aligned) daily returns."""
-    def stats(r: "pd.Series[float]") -> tuple[float, float, float | None]:
+    def stats(r: "pd.Series[float]") -> tuple[float, float, float, float, float | None]:
         depth = max_drawdown(twr_index(r)).depth
         vol = float(r.std()) * math.sqrt(252.0)
-        return depth, vol, true_twr_annualized(r)
+        return depth, ulcer_from_returns(r), cdar_from_returns(r), vol, true_twr_annualized(r)
 
-    dd_wo, vol_wo, ret_wo = stats(r_wo)
-    dd_w, vol_w, ret_w = stats(r_w)
+    dd_wo, ulcer_wo, cdar_wo, vol_wo, ret_wo = stats(r_wo)
+    dd_w, ulcer_w, cdar_w, vol_w, ret_w = stats(r_w)
     return RoleWindow(
         label=label, start=start, end=end, n_days=len(r_wo),
         dd_without=dd_wo, dd_with=dd_w,
+        ulcer_without=ulcer_wo, ulcer_with=ulcer_w,
+        cdar_without=cdar_wo, cdar_with=cdar_w,
         vol_without=vol_wo, vol_with=vol_w,
         ret_without=ret_wo, ret_with=ret_w,
     )
 
 
-def _dd_depth(returns: np.ndarray) -> float:
-    """Max drawdown depth of a return array (negative fraction)."""
+def _ulcer_np(returns: np.ndarray) -> float:
+    """Ulcer index straight from a return array — numpy-native, no pandas round-trip.
+    MUST equal ``risk.ulcer_index`` (pinned to ~1e-12 by test); used only inside the
+    paired-bootstrap hot loop, where wrapping each of ~1000 resamples in a pd.Series
+    (the old form) was measured ~7-10× slower for byte-identical output."""
     curve = np.cumprod(1.0 + returns)
-    peaks = np.maximum.accumulate(curve)
-    return float((curve / peaks - 1.0).min())
+    dd = curve / np.maximum.accumulate(curve) - 1.0
+    return float(np.sqrt(np.mean(np.square(dd))))
 
 
-def _paired_dd_diff_ci(
+def _paired_ulcer_gain_ci(
     r_wo: np.ndarray,
     r_w: np.ndarray,
     *,
     bootstrap_n: int,
     seed: int,
-) -> tuple[float, float]:
-    """95% CI of (dd_with − dd_without) via a PAIRED moving-block bootstrap:
-    the same resampled blocks index both legs' (date-aligned, equal-length)
-    daily returns, so shared market moves cancel and only the candidate's
-    effect remains. Returns (0.0, 0.0) — always 'contains zero' → inconclusive
-    — when the window is too short to resample."""
+) -> tuple[float, float] | None:
+    """95% CI of the Ulcer GAIN (ulcer_without − ulcer_with; positive = the tested
+    leg carried less drawdown pain) via a PAIRED moving-block bootstrap: the same
+    resampled blocks index both legs' (date-aligned, equal-length) daily returns,
+    so shared market moves cancel and only the tested leg's effect remains.
+    Returns None — no measured interval — when the window is too short to resample
+    (< 10 aligned days) or every resample was non-finite."""
     n = len(r_wo)
     if n < 10 or n != len(r_w):
-        return (0.0, 0.0)
-    block = min(max(int(math.sqrt(n)), 2), n)  # √n — same as risk's path-dependent CIs
+        return None
+    block = path_block(n)  # the ONE √n block rule (shared with risk.summarize_risk)
     rng = np.random.default_rng(seed)
-    diffs = np.empty(bootstrap_n)
+    gains = np.empty(bootstrap_n)
     for i in range(bootstrap_n):
         idx = moving_block_indices(n, block, rng)  # the ONE resampler (see risk.py)
-        diffs[i] = _dd_depth(r_w[idx]) - _dd_depth(r_wo[idx])
-    return (float(np.percentile(diffs, 2.5)), float(np.percentile(diffs, 97.5)))
+        gains[i] = _ulcer_np(r_wo[idx]) - _ulcer_np(r_w[idx])
+    gains = gains[np.isfinite(gains)]  # drop non-finite resamples, as risk.bootstrap_ci does
+    if gains.size == 0:
+        return None
+    return (float(np.percentile(gains, 2.5)), float(np.percentile(gains, 97.5)))
+
+
+# Why an OOS verdict came back 'inconclusive' — a structured, branchable fact (not prose a
+# consumer must regex). "" = the verdict resolved (improved/worsened). Rendered for humans via
+# _CAUSE_PHRASE; surfaced on BenchmarkResult.cause so MCP clients can steer (e.g. 'window_too_short'
+# → warm a longer history, vs 'noise_margin' → they're genuinely equivalent).
+OosCause = Literal[
+    "", "noise_margin", "cdar_contradicts", "window_too_short", "bootstrap_unconfirmed"
+]
+_CAUSE_PHRASE: dict[OosCause, str] = {
+    "noise_margin": "the Ulcer gap is within the noise margin",
+    "cdar_contradicts": "the worst-tail average (CDaR) contradicts the Ulcer direction",
+    "window_too_short": "the held-out window is too short to resample",
+    "bootstrap_unconfirmed": "the paired bootstrap does not confirm the gap",
+}
 
 
 def _oos_verdict(
@@ -344,28 +387,55 @@ def _oos_verdict(
     *,
     bootstrap_n: int,
     seed: int,
-) -> tuple[RoleVerdict, tuple[float, float]]:
-    """Drawdown-first verdict on a HELD-OUT window + the paired-bootstrap honesty gate —
-    shared by `role_check` (target vs +candidate) and `benchmark_compare` (preset vs
-    reference). ``_with`` is the leg under test (candidate-added, or the preset), ``_without``
-    the baseline. The verdict ('improved' = shallower drawdown beyond the noise margin)
-    stands ONLY if the 95% CI of the drawdown difference excludes zero; else 'inconclusive'.
-    Returns (verdict, ci)."""
-    dd_gain = oos.dd_with - oos.dd_without     # >0 = shallower drawdown for the tested leg
-    vol_gain = oos.vol_without - oos.vol_with  # >0 = calmer
-    if dd_gain >= _DD_MARGIN and vol_gain >= -_VOL_MARGIN:
-        verdict: RoleVerdict = "improved"
-    elif dd_gain <= -_DD_MARGIN and vol_gain <= _VOL_MARGIN:
-        verdict = "worsened"
-    else:
-        verdict = "inconclusive"
-    ci: tuple[float, float] = (0.0, 0.0)
-    if verdict in ("improved", "worsened"):
-        ci = _paired_dd_diff_ci(r_without.to_numpy(), r_with.to_numpy(),
-                                bootstrap_n=bootstrap_n, seed=seed)
-        if ci[0] <= 0.0 <= ci[1]:
-            verdict = "inconclusive"
-    return verdict, ci
+) -> tuple[RoleVerdict, tuple[float, float] | None, OosCause]:
+    """Drawdown-first verdict on a HELD-OUT window — shared by `role_check` (target vs
+    +candidate) and `benchmark_compare` (preset vs reference). ``_with`` is the leg under
+    test (candidate-added, or the preset), ``_without`` the baseline.
+
+    The verdict statistic is the ULCER INDEX (v2.9.0). Max-DD depth is one worst event —
+    an extreme-value statistic so noisy on short windows that its bootstrap CI almost
+    always straddled zero (the chronic "inconclusive"); Ulcer is the RMS of EVERY day's
+    drawdown, so the same paired bootstrap can actually resolve. Three gates, in order:
+      1. the Ulcer gain must clear the noise margin (``_ULCER_MARGIN``);
+      2. CDaR (the worst-tail average) may tie but must not CONTRADICT the direction by
+         more than its own ``_CDAR_SLACK`` — catches an Ulcer win bought with a deeper tail;
+      3. the paired-bootstrap 95% CI of the Ulcer gain must confirm the direction.
+    Max drawdown and volatility stay DESCRIPTIVE: reported everywhere, voting nowhere.
+    Note vol is NOT a hidden veto: Ulcer already captures the *drawdown-producing* (downside)
+    volatility that a drawdown-first verdict cares about; upside volatility is deliberately
+    not penalized (it is not, in itself, a defect). Returns (verdict, ulcer_gain_ci, cause):
+    ci is a measured interval only when a bootstrap ran (else None), and cause names the gate
+    that blocked an unresolved verdict ("" when it resolved)."""
+    ulcer_gain = oos.ulcer_without - oos.ulcer_with  # >0 = less pain for the tested leg
+    cdar_gain = oos.cdar_without - oos.cdar_with     # >0 = a milder worst tail
+    if abs(ulcer_gain) < _ULCER_MARGIN:
+        return "inconclusive", None, "noise_margin"
+    if (ulcer_gain > 0 and cdar_gain < -_CDAR_SLACK) or (
+        ulcer_gain < 0 and cdar_gain > _CDAR_SLACK
+    ):
+        return "inconclusive", None, "cdar_contradicts"
+    ci = _paired_ulcer_gain_ci(r_without.to_numpy(), r_with.to_numpy(),
+                               bootstrap_n=bootstrap_n, seed=seed)
+    if ci is None:  # too short to resample — the honest cause, not "bootstrap didn't confirm"
+        return "inconclusive", None, "window_too_short"
+    if ulcer_gain > 0 and ci[0] > 0.0:
+        return "improved", ci, ""
+    if ulcer_gain < 0 and ci[1] < 0.0:
+        return "worsened", ci, ""
+    return "inconclusive", ci, "bootstrap_unconfirmed"
+
+
+def _oos_figure_clause(oos: RoleWindow, baseline: str) -> str:
+    """The Ulcer-first OOS figure fragment shared by role_check and benchmark_compare, so
+    the two reasons render the same statistics one way: 'Ulcer W vs WO <baseline>; CDaR W
+    vs WO; max DD W vs WO (context)'. Ulcer is the verdict statistic, CDaR the tail check;
+    max DD trails as descriptive context. Ulcer/CDaR print at 2dp so a gap near the 0.25pp
+    margin is legible; ``baseline`` labels the without-leg ('without', 'the reference', …)."""
+    return (
+        f"Ulcer {oos.ulcer_with * 100:.2f}% vs {oos.ulcer_without * 100:.2f}% {baseline}; "
+        f"CDaR {oos.cdar_with * 100:.2f}% vs {oos.cdar_without * 100:.2f}%; "
+        f"max DD {oos.dd_with * 100:.1f}% vs {oos.dd_without * 100:.1f}% (context)"
+    )
 
 
 def role_check(
@@ -446,27 +516,26 @@ def role_check(
         return insufficient("held-out window could not be simulated")
     oos_win = _window_stats("out-of-sample", *oos_pair, start=split_ts.date(), end=hi.date())
 
-    # Verdict on the HELD-OUT window only (drawdown-first noise margins + the paired-
-    # bootstrap CI honesty gate), shared with benchmark_compare via _oos_verdict.
-    verdict, _ci = _oos_verdict(
+    # Verdict on the HELD-OUT window only (Ulcer-first: noise margin, CDaR agreement,
+    # paired-bootstrap CI honesty gate), shared with benchmark_compare via _oos_verdict.
+    verdict, _ci, cause = _oos_verdict(
         oos_win, oos_pair[0], oos_pair[1], bootstrap_n=bootstrap_n, seed=seed
     )
-    dd_gain = oos_win.dd_with - oos_win.dd_without  # for the reason + in-sample-gap lines
+    ulcer_gain = oos_win.ulcer_without - oos_win.ulcer_with  # the verdict statistic's gain
 
     parts = [
         f"OOS ({oos_win.start}→{oos_win.end}, {oos_win.n_days}d) with a "
-        f"{sleeve * 100:.0f}% sleeve: max DD {oos_win.dd_with * 100:.1f}% vs "
-        f"{oos_win.dd_without * 100:.1f}% without; vol {oos_win.vol_with * 100:.1f}% vs "
-        f"{oos_win.vol_without * 100:.1f}%",
+        f"{sleeve * 100:.0f}% sleeve: " + _oos_figure_clause(oos_win, "without")
+        + f"; vol {oos_win.vol_with * 100:.1f}% vs {oos_win.vol_without * 100:.1f}%",
     ]
     if is_win is not None:
-        is_gain = is_win.dd_with - is_win.dd_without
+        is_gain = is_win.ulcer_without - is_win.ulcer_with
         parts.append(
-            f"in-sample DD gain was {is_gain * 100:+.1f}pp vs OOS {dd_gain * 100:+.1f}pp"
+            f"in-sample Ulcer gain was {is_gain * 100:+.2f}pp vs OOS {ulcer_gain * 100:+.2f}pp"
             " (the overfitting gap to watch)"
         )
     if verdict == "inconclusive":
-        parts.append("no clear out-of-sample improvement (inside the noise/CI band)")
+        parts.append(f"no clear out-of-sample improvement ({_CAUSE_PHRASE[cause]})")
     windows = tuple(w for w in (is_win, oos_win) if w is not None)
     return RoleCheck(candidate, sleeve, schedule, windows, verdict, "; ".join(parts))
 
@@ -475,9 +544,10 @@ def validate_from_role(rc: RoleCheck) -> bool:
     """The walk-forward evidence → the edge gate's ``validated`` flag.
 
     Returns True ONLY when the held-out role check came back ``improved`` — which
-    already requires the out-of-sample drawdown to be shallower beyond the noise
-    margin AND the paired moving-block bootstrap CI of the difference to exclude
-    zero (see ``role_check``). ``worsened`` / ``inconclusive`` / ``insufficient``
+    already requires the out-of-sample Ulcer (RMS drawdown) to be lower beyond the
+    noise margin, the worst-tail CDaR not to contradict it, AND the paired
+    moving-block bootstrap CI of the Ulcer gain to confirm the direction (see
+    ``_oos_verdict``). ``worsened`` / ``inconclusive`` / ``insufficient``
     all → False: the gate stays shut unless the evidence is unambiguous.
 
     This is the ONLY sanctioned producer of ``validated=True`` for
@@ -512,8 +582,10 @@ class BenchmarkResult:
     """A preset target vs a canonical reference over their COMMON priced window:
     full-history legs (drawdown-first) + a walk-forward held-out verdict. The verdict is
     "where the preset's drawdown lands vs the reference", NOT "beats it" — usually
-    'inconclusive' on a short history. `dd_diff_ci` is the 95% CI of (preset − reference)
-    out-of-sample drawdown depth."""
+    'inconclusive' on a short history. `ulcer_gain_ci` is the 95% CI of the out-of-sample
+    Ulcer gain (reference − preset; positive = the preset carried less drawdown pain), or
+    None when no bootstrap ran (margin/CDaR-gated or too short). `cause` names the gate that
+    left an inconclusive verdict unresolved ("" when it resolved) — see ``OosCause``."""
 
     reference: str
     start: date                       # full-history window (the legs' span)
@@ -521,9 +593,10 @@ class BenchmarkResult:
     legs: tuple[BacktestLeg, ...]     # (preset, reference)
     oos: RoleWindow | None
     verdict: BenchmarkVerdict
-    dd_diff_ci: tuple[float, float]
+    ulcer_gain_ci: tuple[float, float] | None
     reason: str
     missing: tuple[str, ...]
+    cause: OosCause = ""
     provenance: dict[str, tuple[str, datetime]] = field(default_factory=dict)
 
 
@@ -595,17 +668,18 @@ def benchmark_compare(
     n_is = len(common) - n_oos
     oos_win: RoleWindow | None = None
     verdict: RoleVerdict = "insufficient"
-    ci: tuple[float, float] = (0.0, 0.0)
+    ci: tuple[float, float] | None = None
+    cause: OosCause = ""
     if n_is >= _MIN_WINDOW_DAYS and n_oos >= _MIN_WINDOW_DAYS:
         split = common[n_is]
-        # baseline = reference, alt = preset → dd_with/_without read "preset vs reference"
+        # baseline = reference, alt = preset → *_with/_without read "preset vs reference"
         oos_pair = _aligned_leg_returns(
             series, reference_weights, target,
             schedule=schedule, start=split.date(), end=hi.date(),
         )
         if oos_pair is not None:
             oos_win = _window_stats("out-of-sample", *oos_pair, start=split.date(), end=hi.date())
-            verdict, ci = _oos_verdict(oos_win, *oos_pair, bootstrap_n=bootstrap_n, seed=seed)
+            verdict, ci, cause = _oos_verdict(oos_win, *oos_pair, bootstrap_n=bootstrap_n, seed=seed)
 
     bverdict = _BENCHMARK_VERDICT[verdict]  # "improved"→"shallower" etc. (never "beats")
     if oos_win is None:
@@ -613,21 +687,19 @@ def benchmark_compare(
                   f"windows to judge vs {reference} honestly")
     else:
         reason = (
-            f"OOS ({oos_win.start}→{oos_win.end}, {oos_win.n_days}d): preset max DD "
-            f"{oos_win.dd_with * 100:.1f}% vs {reference} {oos_win.dd_without * 100:.1f}% — "
-            f"{_BENCHMARK_PHRASE[bverdict]} {reference}"
+            f"OOS ({oos_win.start}→{oos_win.end}, {oos_win.n_days}d): "
+            + _oos_figure_clause(oos_win, reference)
+            + f" — {_BENCHMARK_PHRASE[bverdict]} {reference}"
         )
-        if ci != (0.0, 0.0):  # a real drawdown gap → the paired bootstrap ran; show its width
-            reason += f"; 95% CI of the DD difference [{ci[0] * 100:+.1f}pp, {ci[1] * 100:+.1f}pp]"
-            if bverdict == "inconclusive":
-                reason += " straddles zero — not distinguishable on this history"
-        elif bverdict == "inconclusive":
-            reason += "; the gap is within the noise margin"
+        if ci is not None:  # the paired bootstrap ran → show its width
+            reason += f"; 95% CI of the Ulcer gain [{ci[0] * 100:+.2f}pp, {ci[1] * 100:+.2f}pp]"
+        if cause:  # the gate that kept it inconclusive, by name
+            reason += f" ({_CAUSE_PHRASE[cause]})"
 
     return BenchmarkResult(
         reference=reference,
         start=preset_curve.index[0].date(), end=preset_curve.index[-1].date(),
         legs=(preset_leg, ref_leg), oos=oos_win, verdict=bverdict,
-        dd_diff_ci=ci, reason=reason, missing=missing,
+        ulcer_gain_ci=ci, reason=reason, missing=missing, cause=cause,
         provenance={tk: p for tk, p in (provenance or {}).items() if tk in all_priced},
     )

@@ -483,16 +483,18 @@ def _benchmark_result(reference: str = "60-40"):  # type: ignore[no-untyped-def]
     return res
 
 
-def test_benchmark_claims_cite_both_depths_and_the_reference_name() -> None:
+def test_benchmark_claims_cite_the_oos_ulcers_and_the_reference_name() -> None:
+    # v2.9.0: the note cites the two OOS Ulcer indices (the verdict statistic), NOT max-DD
+    # depths — so the cited numbers can never point opposite to the Ulcer-based verdict word.
     claims = build_benchmark_claims(_benchmark_result("60-40"))
-    assert set(claims) == {"bench_dd_preset", "bench_dd_reference", "bench_reference"}
+    assert set(claims) == {"bench_ulcer_preset", "bench_ulcer_reference", "bench_reference"}
     # The reference name is cited by token, so a digit-bearing slug ("60-40") can't trip PCN.
     assert claims["bench_reference"].rendered == "the classic 60/40 stock-and-bond mix"
     assert claims["bench_reference"].band is None                 # a name → no band
-    # The preset (RISE) never drew down; the reference (CHOP) did → banded by depth.
-    assert claims["bench_dd_preset"].band == "mild"              # |~0%| < 5%
-    assert claims["bench_dd_reference"].band in {"moderate", "significant", "severe"}
-    assert claims["bench_dd_reference"].rendered.endswith("%")    # a signed depth, e.g. -26.xx%
+    # The preset (RISE) never drew down → ~0 Ulcer; the reference (CHOP) did → higher, banded.
+    assert claims["bench_ulcer_preset"].band == "mild"           # ~0% < 2%
+    assert claims["bench_ulcer_reference"].band in {"moderate", "significant", "severe"}
+    assert claims["bench_ulcer_reference"].rendered.endswith("%")  # an unsigned magnitude
 
 
 def test_benchmark_claims_empty_without_two_legs() -> None:
@@ -500,10 +502,10 @@ def test_benchmark_claims_empty_without_two_legs() -> None:
 
     bare = BenchmarkResult(
         reference="60-40", start=date(2022, 1, 3), end=date(2022, 6, 1),
-        legs=(), oos=None, verdict="insufficient", dd_diff_ci=(0.0, 0.0),
+        legs=(), oos=None, verdict="insufficient", ulcer_gain_ci=None,
         reason="n/a", missing=("VOO", "BND"),
     )
-    assert build_benchmark_claims(bare) == {}                    # nothing honest to cite
+    assert build_benchmark_claims(bare) == {}                    # no OOS window → nothing to cite
 
 
 def test_benchmark_prompt_injects_fixed_verdict_and_forbids_beats() -> None:
@@ -521,8 +523,9 @@ def test_benchmark_narration_renders_and_stays_fenced() -> None:
     res = _benchmark_result("permanent")
     claims = build_benchmark_claims(res)
     prose = (
-        "Your posture's deepest dip was {{bench_dd_preset}}, versus {{bench_dd_reference}} "
-        "for {{bench_reference}}; a held-out test couldn't tell them apart."
+        "Your posture's overall drawdown pain was {{bench_ulcer_preset}}, versus "
+        "{{bench_ulcer_reference}} for {{bench_reference}}; a held-out test couldn't tell "
+        "them apart."
     )
     out = render_narration(prose, claims)
     assert out is not None

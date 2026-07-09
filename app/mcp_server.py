@@ -533,17 +533,28 @@ class BenchmarkVerdict(BaseModel):
     reference: str = Field(description="the canonical reference compared against (e.g. 60-40)")
     # backtest.BenchmarkVerdict (imported as BenchmarkWord — the pydantic class owns the name) is
     # the single source of the verdict vocabulary: pydantic rejects an off-set value, the JSON
-    # schema enumerates the options, and a new word (e.g. an A1 Ulcer verdict) can't silently drift.
+    # schema enumerates the options, and a new word can't silently drift. Since v2.9.0 the
+    # verdict statistic is the ULCER index (whole-window drawdown pain), CDaR must not
+    # contradict; max-DD stays descriptive.
     verdict: BenchmarkWord = Field(
         description='"shallower" | "deeper" | "inconclusive" | "insufficient" — where the '
-        'preset\'s held-out drawdown lands vs the reference. NEVER "beats"; usually '
-        '"inconclusive" on a short history.'
+        "preset's held-out drawdown pain (Ulcer index) lands vs the reference. "
+        'NEVER "beats"; usually "inconclusive" on a short history.'
     )
     reason: str
-    oos_dd_diff_low: float | None = Field(
-        None, description="95% CI low of (preset − reference) out-of-sample max-drawdown depth"
+    oos_ulcer_gain_low: float | None = Field(
+        None,
+        description="95% CI low of the out-of-sample Ulcer gain (reference − preset; "
+        "positive = the preset carried less drawdown pain); null when no bootstrap ran",
     )
-    oos_dd_diff_high: float | None = None
+    oos_ulcer_gain_high: float | None = None
+    inconclusive_cause: str | None = Field(
+        None,
+        description="when verdict is 'inconclusive', which gate left it unresolved: "
+        "'noise_margin' (genuinely equivalent) | 'cdar_contradicts' | 'window_too_short' "
+        "(warm a longer history) | 'bootstrap_unconfirmed'; null when the verdict resolved "
+        "or was 'insufficient'",
+    )
 
 
 class ProposedAllocation(BaseModel):
@@ -966,16 +977,18 @@ def _benchmark_verdict(
             f"({', '.join(result.missing)}), so the comparison would judge a renormalized "
             "portfolio rather than the proposed weights" + warm_hint
         )
-    lo, hi = result.dd_diff_ci
-    # benchmark_compare returns (0.0, 0.0) as a PLACEHOLDER when no paired bootstrap ran
-    # (the inconclusive / insufficient verdicts) — surfacing it as a real CI would read as
-    # "the difference is exactly zero", so null it unless it's a measured interval (mirrors
-    # backtest's own `if ci != (0.0, 0.0)` guard).
-    has_ci = (lo, hi) != (0.0, 0.0) and math.isfinite(lo) and math.isfinite(hi)
+    # ulcer_gain_ci is None when no paired bootstrap ran (margin/CDaR-gated, too short, or
+    # insufficient); a present tuple is already finite (the bootstrap drops non-finite
+    # resamples). Guard finiteness defensively so a stray nan can never surface as a real CI.
+    ci = result.ulcer_gain_ci
+    lo: float | None = None
+    hi: float | None = None
+    if ci is not None and math.isfinite(ci[0]) and math.isfinite(ci[1]):
+        lo, hi = ci
     verdict = BenchmarkVerdict(
         reference=benchmark, verdict=result.verdict, reason=result.reason,
-        oos_dd_diff_low=lo if has_ci else None,
-        oos_dd_diff_high=hi if has_ci else None,
+        oos_ulcer_gain_low=lo, oos_ulcer_gain_high=hi,
+        inconclusive_cause=result.cause or None,
     )
     return verdict, f"Walk-forward held-out drawdown comparison vs {benchmark}."
 

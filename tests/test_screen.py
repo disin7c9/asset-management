@@ -287,7 +287,8 @@ def test_role_row_maps_verdicts_and_carries_values() -> None:
 
     oos = RoleWindow(
         label="out-of-sample", start=date(2025, 1, 1), end=date(2025, 6, 1), n_days=100,
-        dd_without=-0.20, dd_with=-0.12, vol_without=0.15, vol_with=0.11,
+        dd_without=-0.20, dd_with=-0.12, ulcer_without=0.09, ulcer_with=0.05,
+        cdar_without=0.18, cdar_with=0.10, vol_without=0.15, vol_with=0.11,
         ret_without=0.05, ret_with=0.06,
     )
     rc = RoleCheck("CAND", 0.05, "quarterly", (oos,), "improved", "OOS …")
@@ -295,6 +296,7 @@ def test_role_row_maps_verdicts_and_carries_values() -> None:
     c = _check(r, "role")
     assert c.status == "pass"
     assert c.values["oos_dd_with"] == -0.12 and c.values["oos_dd_without"] == -0.20
+    assert c.values["oos_ulcer_with"] == 0.05 and c.values["oos_cdar_without"] == 0.18
     assert c.values["sleeve"] == 0.05
 
     for verdict, status in (("worsened", "fail"), ("inconclusive", "warn"),

@@ -874,15 +874,16 @@ def test_propose_allocation_maps_a_benchmark_result(
     monkeypatch.setattr(
         "app.mcp_server.benchmark_compare",
         lambda *a, **k: types.SimpleNamespace(
-            verdict="shallower", reason="held-out: a shallower drawdown",
-            dd_diff_ci=(-0.08, -0.01), missing=(),
+            verdict="shallower", reason="held-out: less drawdown pain (Ulcer)",
+            ulcer_gain_ci=(0.01, 0.08), missing=(), cause="",
         ),
     )
     res = _call("propose_allocation", {"preset": "conservative", "benchmark": "60-40"})
     assert not res.isError, _error_text(res)
     v = res.structuredContent["verdict"]  # type: ignore[index]
     assert v is not None and v["verdict"] == "shallower" and v["reference"] == "60-40"
-    assert v["oos_dd_diff_low"] == pytest.approx(-0.08)
+    assert v["oos_ulcer_gain_low"] == pytest.approx(0.01)
+    assert v["inconclusive_cause"] is None  # a resolved verdict carries no cause
 
 
 def test_propose_allocation_unknown_preset_is_clean_error(warm_book: Path) -> None:
@@ -893,22 +894,23 @@ def test_propose_allocation_unknown_preset_is_clean_error(warm_book: Path) -> No
 def test_propose_allocation_nulls_placeholder_ci(
     warm_book: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # benchmark_compare returns dd_diff_ci=(0.0, 0.0) as a placeholder for inconclusive/
-    # insufficient verdicts (no paired bootstrap ran) — it must not surface as a real CI.
+    # benchmark_compare returns ulcer_gain_ci=None when no paired bootstrap ran (margin/CDaR-
+    # gated or too short) — it must surface as null low/high, with the structured cause.
     import types
 
     monkeypatch.setattr(
         "app.mcp_server.benchmark_compare",
         lambda *a, **k: types.SimpleNamespace(
             verdict="inconclusive", reason="within the noise margin",
-            dd_diff_ci=(0.0, 0.0), missing=(),
+            ulcer_gain_ci=None, missing=(), cause="noise_margin",
         ),
     )
     res = _call("propose_allocation", {"preset": "moderate", "benchmark": "60-40"})
     assert not res.isError, _error_text(res)
     v = res.structuredContent["verdict"]  # type: ignore[index]
     assert v is not None and v["verdict"] == "inconclusive"
-    assert v["oos_dd_diff_low"] is None and v["oos_dd_diff_high"] is None  # placeholder nulled
+    assert v["oos_ulcer_gain_low"] is None and v["oos_ulcer_gain_high"] is None  # no interval
+    assert v["inconclusive_cause"] == "noise_margin"  # the structured gate, for clients to branch
 
 
 def test_propose_allocation_validate_fetches_on_demand_when_unlocked(
@@ -944,7 +946,7 @@ def test_propose_allocation_nulls_verdict_when_target_renormalized(
         "app.mcp_server.benchmark_compare",
         lambda *a, **k: types.SimpleNamespace(
             verdict="shallower", reason="held-out: shallower",
-            dd_diff_ci=(-0.05, -0.01), missing=("VWO",),
+            ulcer_gain_ci=(0.01, 0.05), missing=("VWO",),
         ),
     )
     res = _call("propose_allocation", {"preset": "moderate", "benchmark": "60-40"})
