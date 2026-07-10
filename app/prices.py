@@ -2,8 +2,14 @@
 
 Provider chain (per ticker):
     1. on-disk Parquet cache (fresh-within-TTL hit returns source="cache")
-    2. yfinance
-    3. stooq (free CSV; no API key)
+    2. yfinance (one spaced retry — Yahoo throttles bursts with empty frames)
+    3. Tiingo (free API key via TIINGO_API_KEY; skipped, logged once, without one)
+
+**Both live providers must return the same price basis** — split-adjusted, dividend-
+UNadjusted closes — because the cache stores whichever won and the rest of the codebase
+(`corporate_actions.adjust_for_splits`) re-expresses share counts to match it. yfinance
+serves that basis directly; Tiingo does not, so `_parse_tiingo_rows` rebuilds it from the
+`splitFactor` Tiingo ships per row. See that function — the basis is the subtle part.
 
 Every returned PriceRow records `source` and `fetched_at` so any displayed
 number can be traced back to its origin. Cache rows clamp their age to ≥ 0
@@ -14,19 +20,24 @@ with `.rows` (successful) and `.missing` (failed). The caller can render the
 report and continue.
 
 Tests are offline by default: each test monkey-patches the two underlying
-network wrappers `_fetch_yf` and `_fetch_stooq_csv` so no real HTTP happens.
+network wrappers `_fetch_yf` and `_fetch_tiingo_json` so no real HTTP happens.
 """
 
 from __future__ import annotations
 
-import csv
-import io
+import json
 import logging
+import math
+import os
+import time
 import urllib.request
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
+from http.client import HTTPMessage
 from pathlib import Path
+from typing import IO
+from urllib.parse import quote
 
 import pandas as pd
 import yfinance as yf
@@ -49,7 +60,7 @@ class PriceRow:
     ticker: str
     asof_date: date
     close: float
-    source: str            # "cache" | "yfinance" | "stooq"
+    source: str            # "cache" | "yfinance" | "tiingo"
     fetched_at: datetime   # tz-aware (UTC)
 
     @property
@@ -65,7 +76,7 @@ class SeriesResult:
 
     `rows` maps ticker → a pandas Series of daily close prices indexed by a
     normalized (midnight) DatetimeIndex. `provenance` maps ticker → the real
-    `(source, fetched_at)` of that series — `source ∈ {cache, yfinance, stooq}`
+    `(source, fetched_at)` of that series — `source ∈ {cache, yfinance, tiingo}`
     and `fetched_at` is when the data was actually obtained (the cache's stored
     timestamp on a hit) — so the caller can stamp honest provenance instead of
     a placeholder.
@@ -77,12 +88,12 @@ class SeriesResult:
 
     @property
     def fallbacks_used(self) -> int:
-        """Tickers served by the secondary (stooq) provider after yfinance failed.
+        """Tickers served by the secondary (Tiingo) provider after yfinance failed.
 
-        Mirrors `PricesResult.fallbacks_used`: counts the stooq wins on *this*
+        Mirrors `PricesResult.fallbacks_used`: counts the Tiingo wins on *this*
         run. A cache hit reports source "cache" (its original provider isn't
         re-derived), so historical fallbacks aren't double-counted."""
-        return sum(1 for src, _ in self.provenance.values() if src == "stooq")
+        return sum(1 for src, _ in self.provenance.values() if src == "tiingo")
 
 
 @dataclass(frozen=True)
@@ -101,13 +112,13 @@ class PricesResult:
         return sum(1 for r in self.rows.values() if r.source == "yfinance")
 
     @property
-    def n_stooq(self) -> int:
-        return sum(1 for r in self.rows.values() if r.source == "stooq")
+    def n_tiingo(self) -> int:
+        return sum(1 for r in self.rows.values() if r.source == "tiingo")
 
     @property
     def fallbacks_used(self) -> int:
-        """Tickers that needed the secondary (stooq) provider after yfinance failed."""
-        return self.n_stooq
+        """Tickers that needed the secondary (Tiingo) provider after yfinance failed."""
+        return self.n_tiingo
 
 
 def fetch_latest(
@@ -119,7 +130,7 @@ def fetch_latest(
 ) -> PricesResult:
     """Fetch the close at or before `asof_date` for each ticker (de-duplicated).
 
-    Provider order: cache → yfinance → stooq. On live success the row is
+    Provider order: cache → yfinance → Tiingo. On live success the row is
     written back to the cache for next time. Never raises on a per-ticker
     failure — those tickers appear in the returned `missing` list.
     """
@@ -128,6 +139,7 @@ def fetch_latest(
 
     rows: dict[str, PriceRow] = {}
     missing: list[str] = []
+    circuit = _RetryCircuit()  # batch-scoped yfinance retry breaker
 
     for ticker in dict.fromkeys(tickers):  # dedup, preserve order
         cached = _from_cache(ticker, asof, cache, allow_stale=not online) if cache else None
@@ -145,7 +157,7 @@ def fetch_latest(
             else:
                 missing.append(ticker)
             continue
-        live = _from_yfinance(ticker, asof) or _from_stooq(ticker, asof)
+        live = _from_yfinance(ticker, asof, circuit=circuit) or _from_tiingo(ticker, asof)
         if live is None:
             missing.append(ticker)
             continue
@@ -155,18 +167,49 @@ def fetch_latest(
 
     result = PricesResult(rows=rows, missing=missing)
     log.info(
-        "prices fetched: returned=%d cache=%d yfinance=%d stooq=%d missing=%d",
+        "prices fetched: returned=%d cache=%d yfinance=%d tiingo=%d missing=%d",
         len(result.rows), result.n_cache, result.n_yfinance,
-        result.n_stooq, len(result.missing),
+        result.n_tiingo, len(result.missing),
     )
     return result
 
 
 # ── provider wrappers (monkey-patchable in tests) ─────────────────────────
 
+_YF_RETRY_WAIT = 1.5   # seconds between the two yfinance attempts
+_YF_BLOCKED_AFTER = 3  # consecutive failures in one batch → assume a block, stop retrying
+
+
+class _RetryCircuit:
+    """Per-batch yfinance retry state — created fresh by each `fetch_latest` / `fetch_series`.
+
+    The spaced retry clears a transient single-ticker throttle, but callers loop over tickers
+    one at a time, so under a *wholesale* Yahoo block retrying every ticker just doubles the
+    request volume against a volume-throttling host and burns `_YF_RETRY_WAIT × N` of dead sleep
+    (~9 min on a 375-ticker warm). After `_YF_BLOCKED_AFTER` consecutive failures the circuit
+    opens and the rest of the batch skips the retry. It is deliberately **batch-scoped**, not a
+    module global: a fresh batch (a later, unrelated MCP tool call) re-assesses from zero, and two
+    concurrent batches can't corrupt each other's count."""
+
+    def __init__(self) -> None:
+        self.consecutive_failures = 0
+
+    @property
+    def armed(self) -> bool:
+        return self.consecutive_failures < _YF_BLOCKED_AFTER
+
+    def record(self, *, ok: bool) -> None:
+        self.consecutive_failures = 0 if ok else self.consecutive_failures + 1
+        if not ok and self.consecutive_failures == _YF_BLOCKED_AFTER:
+            log.info(
+                "yfinance failed %d times in a row this batch — treating Yahoo as blocked "
+                "and skipping the retry for the rest of this batch",
+                _YF_BLOCKED_AFTER,
+            )
+
 
 def _fetch_yf(ticker: str, start: date, end: date) -> pd.DataFrame | None:
-    """Thin wrapper around yfinance.download. Returns None on any failure."""
+    """One raw yfinance.download attempt — the mockable network seam. None on failure/empty."""
     try:
         df = yf.download(
             ticker,
@@ -178,21 +221,116 @@ def _fetch_yf(ticker: str, start: date, end: date) -> pd.DataFrame | None:
     except Exception as exc:  # noqa: BLE001 — yfinance raises many specific things
         log.warning("yfinance fetch failed for %s: %s", ticker, exc)
         return None
-    if df is None or df.empty:
+    return df if df is not None and not df.empty else None
+
+
+def _fetch_yf_retrying(
+    ticker: str, start: date, end: date, *, circuit: _RetryCircuit | None = None
+) -> pd.DataFrame | None:
+    """`_fetch_yf` with one spaced retry, gated by a batch `circuit`.
+
+    Yahoo throttles bursts (a cache warm or a multi-tool chat turn fires dozens of requests),
+    and a throttled call comes back empty rather than raising, so a brief pause clears the
+    transient case. The `circuit` (owned by the batch loop) opens after a run of failures so a
+    wholesale block doesn't retry every ticker; with no circuit (a lone call) the retry is
+    always armed. The raw one-shot `_fetch_yf` stays the seam tests mock, so this policy layer
+    is transparent to them.
+    """
+    armed = circuit is None or circuit.armed
+    attempts = 2 if armed else 1
+    for attempt in range(1, attempts + 1):
+        df = _fetch_yf(ticker, start, end)
+        if df is not None and not df.empty:
+            if circuit is not None:
+                circuit.record(ok=True)
+            return df
+        if attempt < attempts:
+            time.sleep(_YF_RETRY_WAIT)
+    if circuit is not None:
+        circuit.record(ok=False)
+    return None
+
+
+_warned_no_tiingo_key = False
+
+
+def _warn_no_tiingo_key() -> None:
+    """One INFO per process, the first time the fallback is skipped for lack of a key."""
+    global _warned_no_tiingo_key
+    if _warned_no_tiingo_key:
+        return
+    _warned_no_tiingo_key = True
+    log.info(
+        "yfinance failed and TIINGO_API_KEY is not set — skipping the Tiingo fallback "
+        "(a free key from tiingo.com enables a second price source)"
+    )
+
+
+def _env_secret(var: str) -> str:
+    """A secret from the environment, or "" when it isn't really set.
+
+    An MCPB host substitutes an optional `user_config` field the user left blank with
+    the LITERAL `"${user_config.x}"` template text. That must count as unset — never be
+    posted as a credential — else a blank key field sends a doomed authenticated request
+    per ticker instead of skipping cleanly. `mcp_server._env_raw` applies the same rule
+    to the path vars; this is its counterpart for secrets (Layer 2 imports no app module).
+    """
+    raw = os.environ.get(var, "").strip()
+    return "" if raw.startswith("${") else raw
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse 3xx rather than follow it.
+
+    `urllib` re-sends every header on a redirect and — unlike `requests` — does NOT
+    strip `Authorization` when the host changes, so a redirect (a compromised host, a
+    MITM'd proxy) would hand the user's API key to the target. Tiingo's API does not
+    redirect, so refusing is free: the 3xx surfaces as an HTTPError → a logged miss.
+    """
+
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: IO[bytes],
+        code: int,
+        msg: str,
+        headers: HTTPMessage,
+        newurl: str,
+    ) -> urllib.request.Request | None:
         return None
-    return df
 
 
-def _fetch_stooq_csv(ticker: str) -> str | None:
-    """Fetch the stooq daily-history CSV for a US ticker. None on failure."""
-    url = f"https://stooq.com/q/d/l/?s={ticker.lower()}.us&i=d"
+_TIINGO_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
+def _fetch_tiingo_json(
+    ticker: str, start: date, end: date
+) -> list[dict[str, object]] | None:
+    """Fetch Tiingo daily EOD rows for [start, end]. None on failure or no key.
+
+    The secondary provider behind yfinance. Auth is a free API key read from
+    TIINGO_API_KEY (loaded from .env by cli/mcp_server; the Desktop addon passes
+    it from its settings) — sent as a header so it can never leak into a logged
+    URL. Without a key the fallback is skipped and that is logged once.
+    """
+    key = _env_secret("TIINGO_API_KEY")
+    if not key:
+        _warn_no_tiingo_key()
+        return None
+    # Quote the ticker: it comes from the user's book / --screen, where it is only
+    # upper-cased, so a stray '?', '#' or '/' would otherwise rewrite the request.
+    url = (
+        f"https://api.tiingo.com/tiingo/daily/{quote(ticker.lower(), safe='')}/prices"
+        f"?startDate={start.isoformat()}&endDate={end.isoformat()}"
+    )
+    req = urllib.request.Request(url, headers={"Authorization": f"Token {key}"})
     try:
-        with urllib.request.urlopen(url, timeout=10) as resp:  # noqa: S310 — fixed scheme
-            data: bytes = resp.read()
+        with _TIINGO_OPENER.open(req, timeout=10) as resp:  # noqa: S310 — fixed scheme
+            rows = json.loads(resp.read().decode("utf-8"))
     except Exception as exc:  # noqa: BLE001
-        log.warning("stooq fetch failed for %s: %s", ticker, exc)
+        log.warning("tiingo fetch failed for %s: %s", ticker, exc)
         return None
-    return data.decode("utf-8")
+    return rows if isinstance(rows, list) else None
 
 
 # ── individual sources ────────────────────────────────────────────────────
@@ -248,6 +386,27 @@ def fresh(
     return allow_stale or now - fetched_at <= ttl
 
 
+def usable_price(value: float) -> bool:
+    """Whether a close is usable as a price: finite AND strictly positive.
+
+    The ONE price-validity rule, shared by every ingest point (Tiingo, yfinance, and both
+    cache reads) and by the market-value / rebalance sinks — so no consumer has to re-derive
+    it and the checks can't drift apart (they did: a sink on `> 0` and one on `isfinite` once
+    disagreed about the same ticker). `> 0` alone is wrong (`inf > 0` is True); `isfinite`
+    alone is wrong (0.0 and negatives aren't prices); NaN fails both. A 0 / negative / ±inf
+    close is a bad feed row or a corrupt cache cell, never a tradeable price.
+    """
+    return math.isfinite(value) and value > 0.0
+
+
+def _usable_closes(series: "pd.Series[float]") -> "pd.Series[float]":
+    """`series` keeping only usable prices — the Series form of `usable_price`, so the
+    history paths (yfinance + cache) drop bad closes by the exact same rule as the scalar
+    paths. A dropped day makes its neighbours span a 2-day return, far better than the
+    -100%/±inf a 0 or non-finite close fabricates into the drawdown-first figures."""
+    return series[series.map(usable_price)]
+
+
 def _from_cache(
     ticker: str, asof: date, cache_dir: Path, *, allow_stale: bool = False
 ) -> PriceRow | None:
@@ -268,19 +427,24 @@ def _from_cache(
         return None  # NaT / corrupt — unusable, refetch
     if not fresh(fetched_at, _CACHE_TTL, what=ticker, allow_stale=allow_stale):
         return None
+    close = float(row["close"])
+    if not usable_price(close):
+        return None  # 0 / negative / non-finite cell (corrupt or legacy cache) — refetch
     return PriceRow(
         ticker=ticker,
         asof_date=asof,
-        close=float(row["close"]),
+        close=close,
         source="cache",
         fetched_at=fetched_at,
     )
 
 
-def _from_yfinance(ticker: str, asof: date) -> PriceRow | None:
+def _from_yfinance(
+    ticker: str, asof: date, *, circuit: _RetryCircuit | None = None
+) -> PriceRow | None:
     end = asof + timedelta(days=1)
     start = asof - timedelta(days=10)
-    df = _fetch_yf(ticker, start, end)
+    df = _fetch_yf_retrying(ticker, start, end, circuit=circuit)
     if df is None or df.empty:
         return None
     close = _normalize_close(df)  # shared extractor: one MultiIndex/"Close"/empty guard
@@ -297,34 +461,110 @@ def _from_yfinance(ticker: str, asof: date) -> PriceRow | None:
     )
 
 
-def _from_stooq(ticker: str, asof: date) -> PriceRow | None:
-    raw = _fetch_stooq_csv(ticker)
+def _tiingo_float(value: object) -> float | None:
+    """A finite float from a Tiingo JSON scalar, else None.
+
+    Rejects `bool` (a subclass of `int` — `float(True)` would be a silent $1.00 price)
+    and non-finite values: `json.loads` accepts the bare `NaN`/`Infinity` tokens, and
+    `float("inf")`/`float("nan")` return rather than raise, so neither is caught by the
+    except clause. `OverflowError` (a huge JSON int) is an ArithmeticError, not a
+    ValueError, so it too must be named or it escapes the per-ticker loop and aborts the
+    batch. The yfinance path drops these via `_normalize_close`'s `dropna`; this mirrors it.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return None
+    try:
+        out = float(value)
+    except (ValueError, TypeError, OverflowError):
+        return None
+    return out if math.isfinite(out) else None
+
+
+def _tiingo_date(value: object) -> date | None:
+    """The day out of a Tiingo timestamp ("2024-01-05T00:00:00.000Z"), else None."""
+    if not isinstance(value, str):
+        return None
+    try:
+        return date.fromisoformat(value[:10])
+    except ValueError:
+        return None
+
+
+def _parse_tiingo_rows(rows: list[dict[str, object]]) -> list[tuple[date, float]]:
+    """Tiingo JSON rows → ascending [(date, split-adjusted close)]; bad rows skipped.
+
+    **The basis.** Tiingo's `close` is the RAW as-traded price, while yfinance's `Close`
+    (`auto_adjust=False`) is **split-adjusted** — the basis this codebase assumes
+    everywhere (`corporate_actions.py`: "price history from yfinance is split-adjusted",
+    and `adjust_for_splits` re-expresses share counts to match). Serving raw closes would
+    fabricate a vast one-day return across any split — NVDA's 10:1 turns $1208 → $121
+    overnight, a phantom −90% day straight into the drawdown and Ulcer figures.
+
+    So we rebuild yfinance's basis from the `splitFactor` Tiingo ships on every row:
+    divide each close by the product of the split factors of all *later* rows — the same
+    "splits effective strictly after this date" rule as
+    `corporate_actions.cumulative_split_factor`. (`adjClose` is split- AND dividend-
+    adjusted — a third basis, ≈0.17% off yfinance here — so it is not a drop-in.)
+
+    Forgiving by contract: a row that isn't a dict, or whose date/close is missing,
+    malformed, boolean, or non-finite, is skipped rather than raising — `fetch_latest`
+    and `fetch_series` promise never to raise on a per-ticker miss.
+    """
+    parsed: list[tuple[date, float, float]] = []  # (date, raw close, split factor)
+    for row in rows:
+        if not isinstance(row, dict):
+            continue  # a JSON array of non-dicts (an error page, a format shift)
+        day, close = _tiingo_date(row.get("date")), _tiingo_float(row.get("close"))
+        if day is None or close is None or not usable_price(close):
+            continue  # a 0 / negative close is a halted / bad-feed row — skip it
+        factor = _tiingo_float(row.get("splitFactor"))
+        parsed.append((day, close, factor if factor and factor > 0.0 else 1.0))
+
+    parsed.sort()
+    out: list[tuple[date, float]] = []
+    later_splits = 1.0  # product of the split factors effective AFTER the row in hand
+    for day, close, factor in reversed(parsed):
+        out.append((day, close / later_splits))
+        later_splits *= factor
+    out.reverse()
+    return out
+
+
+def _tiingo_closes(
+    ticker: str, start: date, end: date
+) -> list[tuple[date, float]] | None:
+    """Split-adjusted (date, close) pairs within [start, end], ascending. None if empty.
+
+    Fetches through **today** whenever `end` is older, then slices: yfinance's adjusted
+    Close reflects every split up to now, so a split that happened *after* `end` still
+    rescales the whole requested window. Asking only for [start, end] would miss it and
+    leave the two providers on different bases again — the exact bug this guards.
+
+    Every current caller passes `end == today` (fetch_latest defaults asof to today;
+    fetch_series is always called with `today`), so the reach-forward is a no-op in
+    practice and fetches nothing extra. If a dated-history feature ever passes an `end`
+    well in the past, prefer deriving the post-`end` split factor from the splits cache
+    (`fetch_splits`) over downloading the intervening prices only to discard them.
+    """
+    raw = _fetch_tiingo_json(ticker, start, max(end, date.today()))
     if not raw:
         return None
-    reader = csv.DictReader(io.StringIO(raw))
-    candidates: list[tuple[date, float]] = []
-    for row in reader:
-        # Stooq header is documented as title-case ("Date,Open,...") but we
-        # accept any case to be forgiving of upstream changes.
-        d_str = row.get("Date") or row.get("date")
-        close_str = row.get("Close") or row.get("close")
-        if d_str is None or close_str is None:
-            continue
-        try:
-            d = date.fromisoformat(d_str)
-            if d <= asof:
-                candidates.append((d, float(close_str)))
-        except ValueError:
-            continue
-    if not candidates:
+    pairs = [(d, c) for d, c in _parse_tiingo_rows(raw) if start <= d <= end]
+    return pairs or None
+
+
+def _from_tiingo(ticker: str, asof: date) -> PriceRow | None:
+    # Same 10-day lookback as `_from_yfinance`: a close older than that is not a
+    # "current" price anywhere else here either (cf. `_OFFLINE_PRICE_FLOOR`).
+    pairs = _tiingo_closes(ticker, asof - timedelta(days=10), asof)
+    if not pairs:
         return None
-    candidates.sort()
-    d, close = candidates[-1]
+    day, close = pairs[-1]  # ascending, already bounded at asof
     return PriceRow(
         ticker=ticker,
-        asof_date=d,
+        asof_date=day,
         close=close,
-        source="stooq",
+        source="tiingo",
         fetched_at=_now_utc(),
     )
 
@@ -339,7 +579,7 @@ def fetch_series(
 ) -> SeriesResult:
     """Fetch the daily close *history* in [start, end] for each ticker.
 
-    Provider order per ticker: cache → yfinance → stooq. The whole series is
+    Provider order per ticker: cache → yfinance → Tiingo. The whole series is
     cached as `data/prices/<TICKER>_series.parquet` (columns: date, close,
     fetched_at) and reused if fresh within TTL and covering `end`. Never
     raises on a per-ticker miss — those appear in `missing`.
@@ -349,6 +589,7 @@ def fetch_series(
     rows: dict[str, pd.Series[float]] = {}
     missing: list[str] = []
     provenance: dict[str, tuple[str, datetime]] = {}
+    circuit = _RetryCircuit()  # batch-scoped yfinance retry breaker
 
     for ticker in dict.fromkeys(tickers):
         cached = (
@@ -363,11 +604,11 @@ def fetch_series(
         if not online:
             missing.append(ticker)
             continue
-        live = _series_from_yfinance(ticker, start, end)
+        live = _series_from_yfinance(ticker, start, end, circuit=circuit)
         source = "yfinance"
         if live is None or live.empty:
-            live = _series_from_stooq(ticker, start, end)
-            source = "stooq"
+            live = _series_from_tiingo(ticker, start, end)
+            source = "tiingo"
         if live is None or live.empty:
             missing.append(ticker)
             continue
@@ -393,37 +634,28 @@ def _normalize_close(df: pd.DataFrame) -> "pd.Series[float] | None":
     if close.empty:
         return None
     close.index = pd.to_datetime(close.index).normalize()
-    return close.astype(float)
+    close = _usable_closes(close.astype(float))  # dropna leaves ±inf and 0/negative; drop them too
+    return close if not close.empty else None
 
 
-def _series_from_yfinance(ticker: str, start: date, end: date) -> "pd.Series[float] | None":
-    df = _fetch_yf(ticker, start, end + timedelta(days=1))
+def _series_from_yfinance(
+    ticker: str, start: date, end: date, *, circuit: _RetryCircuit | None = None
+) -> "pd.Series[float] | None":
+    df = _fetch_yf_retrying(ticker, start, end + timedelta(days=1), circuit=circuit)
     if df is None or df.empty:
         return None
     return _normalize_close(df)
 
 
-def _series_from_stooq(ticker: str, start: date, end: date) -> "pd.Series[float] | None":
-    raw = _fetch_stooq_csv(ticker)
-    if not raw:
+def _series_from_tiingo(ticker: str, start: date, end: date) -> "pd.Series[float] | None":
+    pairs = _tiingo_closes(ticker, start, end)
+    if not pairs:
         return None
-    dates: list[pd.Timestamp] = []
-    closes: list[float] = []
-    for row in csv.DictReader(io.StringIO(raw)):
-        d_str = row.get("Date") or row.get("date")
-        close_str = row.get("Close") or row.get("close")
-        if d_str is None or close_str is None:
-            continue
-        try:
-            d = date.fromisoformat(d_str)
-            if start <= d <= end:
-                dates.append(pd.Timestamp(d))
-                closes.append(float(close_str))
-        except ValueError:
-            continue
-    if not dates:
-        return None
-    return pd.Series(closes, index=pd.DatetimeIndex(dates), dtype=float).sort_index()
+    return pd.Series(
+        [c for _, c in pairs],
+        index=pd.DatetimeIndex([pd.Timestamp(d) for d, _ in pairs]),
+        dtype=float,
+    )
 
 
 def _read_fresh_series_cache(
@@ -454,6 +686,9 @@ def _read_fresh_series_cache(
     series = pd.Series(
         df["close"].astype(float).to_numpy(), index=pd.DatetimeIndex(idx)
     ).sort_index()
+    series = _usable_closes(series)  # a corrupt/legacy cell (0, negative, NaN, inf) must not re-serve
+    if series.empty:
+        return None
     return series, fetched
 
 

@@ -1,11 +1,12 @@
 """Tests for the price fetcher.
 
 Offline by default: each test monkey-patches the two underlying network
-wrappers (`_fetch_yf`, `_fetch_stooq_csv`) so no real HTTP happens.
+wrappers (`_fetch_yf`, `_fetch_tiingo_json`) so no real HTTP happens.
 """
 
 from __future__ import annotations
 
+import logging
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -23,12 +24,26 @@ from app.prices import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _hermetic_prices_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Isolate the live secret and the once-per-process no-key warning.
+
+    `TIINGO_API_KEY` is cleared so a developer's real `.env` (loaded by `cli.main` in
+    another test) can never send this suite to api.tiingo.com — the same rule
+    `test_email.py` applies to `RESEND_API_KEY`. The no-key warning latch is reset so
+    tests can't leak the "already warned" state into each other. (The yfinance retry
+    circuit is now batch-scoped, not a module global, so nothing to reset there.)
+    """
+    monkeypatch.delenv("TIINGO_API_KEY", raising=False)
+    monkeypatch.setattr(P, "_warned_no_tiingo_key", False)
+
+
 def _fake_yf_df(price: float, on: date) -> pd.DataFrame:
     return pd.DataFrame({"Close": [price]}, index=pd.DatetimeIndex([pd.Timestamp(on)]))
 
 
-def _fake_stooq_csv(price: float, on: date) -> str:
-    return f"Date,Open,High,Low,Close,Volume\n{on.isoformat()},0,0,0,{price},0\n"
+def _fake_tiingo_rows(price: float, on: date) -> list[dict[str, object]]:
+    return [{"date": f"{on.isoformat()}T00:00:00.000Z", "close": price}]
 
 
 def _write_cache_row(
@@ -52,7 +67,7 @@ def test_fetch_returns_provenance(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(P, "_fetch_yf", lambda t, s, e: _fake_yf_df(100.0, date(2024, 1, 5)))
-    monkeypatch.setattr(P, "_fetch_stooq_csv", lambda t: None)
+    monkeypatch.setattr(P, "_fetch_tiingo_json", lambda t, s, e: None)
     result = fetch_latest(["VOO"], asof_date=date(2024, 1, 6), cache_dir=tmp_path)
     assert isinstance(result, PricesResult)
     assert "VOO" in result.rows
@@ -77,7 +92,7 @@ def test_latest_missing_close_column_degrades_not_crashes(
         return _fake_yf_df(100.0, date(2024, 1, 5))
 
     monkeypatch.setattr(P, "_fetch_yf", _yf)
-    monkeypatch.setattr(P, "_fetch_stooq_csv", lambda t: None)
+    monkeypatch.setattr(P, "_fetch_tiingo_json", lambda t, s, e: None)
     result = fetch_latest(["GOOD", "BAD"], asof_date=date(2024, 1, 6), cache_dir=tmp_path)
     assert result.rows["GOOD"].close == 100.0  # the bad ticker didn't poison the batch
     assert result.missing == ["BAD"]
@@ -109,7 +124,7 @@ def test_fetch_uses_cache_when_fresh(
     )
     monkeypatch.setattr(P, "_fetch_yf", lambda *a, **k: pytest.fail("yf should not be called"))
     monkeypatch.setattr(
-        P, "_fetch_stooq_csv", lambda *a, **k: pytest.fail("stooq should not be called")
+        P, "_fetch_tiingo_json", lambda *a, **k: pytest.fail("tiingo should not be called")
     )
     result = fetch_latest(["VOO"], asof_date=asof, cache_dir=tmp_path)
     assert result.rows["VOO"].source == "cache"
@@ -135,14 +150,15 @@ def test_fetch_bypasses_stale_cache(
 # ── fallback chain ──────────────────────────────────────────────────────────
 
 
-def test_fetch_falls_back_to_stooq(
+def test_fetch_falls_back_to_tiingo(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     asof = date(2024, 1, 5)
     monkeypatch.setattr(P, "_fetch_yf", lambda t, s, e: None)
-    monkeypatch.setattr(P, "_fetch_stooq_csv", lambda t: _fake_stooq_csv(88.0, asof))
+    monkeypatch.setattr(P, "_fetch_tiingo_json", lambda t, s, e: _fake_tiingo_rows(88.0, asof))
     result = fetch_latest(["VOO"], asof_date=asof, cache_dir=tmp_path)
-    assert result.rows["VOO"].source == "stooq"
+    assert result.rows["VOO"].source == "tiingo"
+    assert result.rows["VOO"].close == 88.0
     assert result.fallbacks_used == 1
 
 
@@ -156,26 +172,433 @@ def test_fetch_returns_partial_on_missing(
         "_fetch_yf",
         lambda t, s, e: _fake_yf_df(100.0, asof) if t == "VOO" else None,
     )
-    monkeypatch.setattr(P, "_fetch_stooq_csv", lambda t: None)
+    monkeypatch.setattr(P, "_fetch_tiingo_json", lambda t, s, e: None)
     result = fetch_latest(["VOO", "ZZZBAD"], asof_date=asof, cache_dir=tmp_path)
     assert "VOO" in result.rows
     assert "ZZZBAD" not in result.rows
     assert result.missing == ["ZZZBAD"]
 
 
-def test_fetch_lowercase_stooq_header_is_tolerated(
+def test_tiingo_malformed_rows_are_skipped(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # Forgiving parse: rows missing a field, with a bad date, or a non-numeric
+    # close are dropped — one good row still yields a price, never a crash.
     asof = date(2024, 1, 5)
+    rows: list[dict[str, object]] = [
+        {"close": 1.0},                                        # no date
+        {"date": "not-a-date", "close": 2.0},                  # bad date
+        {"date": f"{asof.isoformat()}T00:00:00.000Z", "close": "nope"},  # bad close
+        {"date": f"{asof.isoformat()}T00:00:00.000Z", "close": 77.0},   # good
+    ]
     monkeypatch.setattr(P, "_fetch_yf", lambda t, s, e: None)
-    monkeypatch.setattr(
-        P,
-        "_fetch_stooq_csv",
-        lambda t: f"date,open,high,low,close,volume\n{asof.isoformat()},0,0,0,77.0,0\n",
-    )
+    monkeypatch.setattr(P, "_fetch_tiingo_json", lambda t, s, e: rows)
     result = fetch_latest(["VOO"], asof_date=asof, cache_dir=tmp_path)
     assert result.rows["VOO"].close == 77.0
-    assert result.rows["VOO"].source == "stooq"
+    assert result.rows["VOO"].source == "tiingo"
+
+
+def test_tiingo_skipped_without_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The REAL wrapper (not a mock): without TIINGO_API_KEY it must return None
+    # before any HTTP is attempted — the no-key path is a silent skip, not an error.
+    monkeypatch.setattr(
+        P._TIINGO_OPENER, "open", lambda *a, **k: pytest.fail("no HTTP without a key")
+    )
+    assert P._fetch_tiingo_json("VOO", date(2024, 1, 1), date(2024, 1, 5)) is None
+
+
+def test_tiingo_key_placeholder_residue_counts_as_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # An MCPB host substitutes an optional user_config field the user left blank with the
+    # LITERAL "${user_config.x}". That is not a credential: it must take the clean no-key
+    # skip, not post a doomed `Authorization: Token ${...}` per ticker. (mcp_server._env_raw
+    # applies the same rule to the path vars; this pins it for the secret.)
+    monkeypatch.setenv("TIINGO_API_KEY", "${user_config.tiingo_api_key}")
+    monkeypatch.setattr(
+        P._TIINGO_OPENER, "open", lambda *a, **k: pytest.fail("residue must not be sent as a key")
+    )
+    assert P._fetch_tiingo_json("VOO", date(2024, 1, 1), date(2024, 1, 5)) is None
+
+
+def test_no_tiingo_key_is_logged_exactly_once(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The reason the once-per-process latch exists: a cold fallback warm skips the key for
+    # EVERY ticker, and one INFO per ticker would be dozens of lines of noise.
+    monkeypatch.setattr(P._TIINGO_OPENER, "open", lambda *a, **k: pytest.fail("no HTTP"))
+    with caplog.at_level(logging.INFO, logger="app.prices"):
+        for _ in range(3):
+            assert P._fetch_tiingo_json("VOO", date(2024, 1, 1), date(2024, 1, 5)) is None
+    hits = [r for r in caplog.records if "TIINGO_API_KEY is not set" in r.getMessage()]
+    assert len(hits) == 1
+
+
+def test_tiingo_refuses_redirects_so_the_key_cannot_follow() -> None:
+    # urllib re-sends every header on a 3xx and does NOT strip Authorization when the host
+    # changes, so following a redirect would hand the user's API key to the target.
+    req = P.urllib.request.Request("https://api.tiingo.com/x")
+    assert P._NoRedirect().redirect_request(req, None, 302, "Found", {}, "https://evil.example") is None  # type: ignore[arg-type]
+
+
+def test_tiingo_ticker_is_url_quoted(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Tickers arrive from the book CSV / --screen with only .strip().upper(), so a stray
+    # '?' or '/' must not be able to rewrite the request path or displace the date query.
+    monkeypatch.setenv("TIINGO_API_KEY", "sekrit")
+    seen: dict[str, str] = {}
+
+    def fake_open(req, timeout=None):  # type: ignore[no-untyped-def]
+        seen["url"] = req.full_url
+        raise OSError("stop here")
+
+    monkeypatch.setattr(P._TIINGO_OPENER, "open", fake_open)
+    P._fetch_tiingo_json("A/B?x=1", date(2024, 1, 1), date(2024, 1, 5))
+    assert "/tiingo/daily/a%2Fb%3Fx%3D1/prices" in seen["url"]
+    assert seen["url"].count("?") == 1  # the injected '?' did not add a second query
+
+
+# ── the price BASIS: Tiingo raw close → yfinance's split-adjusted basis ────────
+
+
+def _tiingo_row(day: str, close: float, split: float = 1.0) -> dict[str, object]:
+    return {"date": f"{day}T00:00:00.000Z", "close": close, "splitFactor": split}
+
+
+def test_tiingo_rebuilds_yfinance_split_adjusted_basis(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression lock for the v2.10.0 review's headline bug.
+
+    Tiingo's `close` is RAW; yfinance's `Close` (auto_adjust=False) is SPLIT-ADJUSTED —
+    the basis `corporate_actions.adjust_for_splits` assumes. Serving raw closes fabricated
+    a ~-90% one-day return across a split (NVDA 10:1: $1208 -> $121). Every close before a
+    split must be divided by that split's factor.
+    """
+    rows = [
+        _tiingo_row("2024-06-07", 1208.88),              # pre-split, raw
+        _tiingo_row("2024-06-10", 121.79, split=10.0),   # the 10:1 split lands here
+        _tiingo_row("2024-06-11", 120.91),               # post-split
+    ]
+    monkeypatch.setattr(P, "_fetch_tiingo_json", lambda t, s, e: rows)
+    pairs = dict(P._tiingo_closes("NVDA", date(2024, 6, 7), date(2024, 6, 11)))
+    assert pairs[date(2024, 6, 7)] == pytest.approx(120.888)  # 1208.88 / 10 — matches yfinance
+    assert pairs[date(2024, 6, 10)] == pytest.approx(121.79)  # split day: already post-split
+    assert pairs[date(2024, 6, 11)] == pytest.approx(120.91)
+    # And the phantom crash is gone: no fabricated ~-90% day.
+    closes = [pairs[d] for d in sorted(pairs)]
+    worst = min(b / a - 1.0 for a, b in zip(closes, closes[1:]))
+    assert worst > -0.5
+
+
+def test_tiingo_multi_split_uses_the_product_of_all_later_factors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # TWO splits in one window: a close before both must be divided by the PRODUCT (2 * 3 = 6),
+    # not just the next factor. A single-split test can't tell "product of all later" from "only
+    # the next" — they coincide for one split — so this pins the accumulation across splits.
+    rows = [
+        _tiingo_row("2024-01-01", 600.0),             # before BOTH splits → ÷6
+        _tiingo_row("2024-02-01", 300.0, split=2.0),  # 2:1 here → before the later 3:1 → ÷3
+        _tiingo_row("2024-03-01", 100.0, split=3.0),  # 3:1 here → nothing later → ÷1
+        _tiingo_row("2024-04-01", 110.0),             # after both → ÷1
+    ]
+    monkeypatch.setattr(P, "_fetch_tiingo_json", lambda t, s, e: rows)
+    pairs = dict(P._tiingo_closes("X", date(2024, 1, 1), date(2024, 4, 1)))
+    assert pairs[date(2024, 1, 1)] == pytest.approx(100.0)  # 600 / (2*3)
+    assert pairs[date(2024, 2, 1)] == pytest.approx(100.0)  # 300 / 3
+    assert pairs[date(2024, 3, 1)] == pytest.approx(100.0)  # 100 / 1
+    assert pairs[date(2024, 4, 1)] == pytest.approx(110.0)  # unadjusted
+
+
+def test_tiingo_reverse_split_scales_earlier_closes_up(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A reverse split ships splitFactor < 1 (a 1:10 → 0.1). Dividing by 0.1 scales the pre-split
+    # raw closes UP to the post-reverse basis — matching yfinance. Pins the factor<1 direction
+    # (a "sanity" guard that rejected sub-1 factors would fabricate a +900% jump here).
+    rows = [
+        _tiingo_row("2024-01-01", 5.0),              # pre-reverse raw $5 → $50 adjusted
+        _tiingo_row("2024-02-01", 52.0, split=0.1),  # 1:10 reverse lands here
+        _tiingo_row("2024-03-01", 48.0),
+    ]
+    monkeypatch.setattr(P, "_fetch_tiingo_json", lambda t, s, e: rows)
+    pairs = dict(P._tiingo_closes("X", date(2024, 1, 1), date(2024, 3, 1)))
+    assert pairs[date(2024, 1, 1)] == pytest.approx(50.0)  # 5.0 / 0.1
+    assert pairs[date(2024, 2, 1)] == pytest.approx(52.0)
+    assert pairs[date(2024, 3, 1)] == pytest.approx(48.0)
+
+
+def test_tiingo_applies_a_split_that_happened_after_the_window_end(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # yfinance's adjusted Close reflects EVERY split up to today, including one after the
+    # requested `end`. So the Tiingo fetch must reach through today and adjust, then slice —
+    # else a backtest window ending before a split silently returns raw prices.
+    today = date.today()
+    seen: dict[str, date] = {}
+
+    def fake_fetch(t: str, s: date, e: date) -> list[dict[str, object]]:
+        seen["end"] = e
+        return [
+            _tiingo_row("2024-01-02", 1000.0),
+            _tiingo_row("2024-01-03", 1010.0),
+            _tiingo_row(today.isoformat(), 101.0, split=10.0),  # split AFTER the window
+        ]
+
+    monkeypatch.setattr(P, "_fetch_tiingo_json", fake_fetch)
+    pairs = dict(P._tiingo_closes("X", date(2024, 1, 2), date(2024, 1, 3)))
+    assert seen["end"] == today  # reached past `end` to see the later split
+    assert set(pairs) == {date(2024, 1, 2), date(2024, 1, 3)}  # but returned only the window
+    assert pairs[date(2024, 1, 2)] == pytest.approx(100.0)  # 1000 / 10
+    assert pairs[date(2024, 1, 3)] == pytest.approx(101.0)  # 1010 / 10
+
+
+def test_tiingo_missing_or_bad_split_factor_defaults_to_no_adjustment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rows: list[dict[str, object]] = [
+        {"date": "2024-01-02T00:00:00.000Z", "close": 10.0},                  # no splitFactor
+        {"date": "2024-01-03T00:00:00.000Z", "close": 11.0, "splitFactor": 0},  # nonsense
+        {"date": "2024-01-04T00:00:00.000Z", "close": 12.0, "splitFactor": "x"},
+    ]
+    monkeypatch.setattr(P, "_fetch_tiingo_json", lambda t, s, e: rows)
+    pairs = dict(P._tiingo_closes("X", date(2024, 1, 2), date(2024, 1, 4)))
+    assert [pairs[d] for d in sorted(pairs)] == [10.0, 11.0, 12.0]  # untouched
+
+
+# ── the parse contract: one bad row must never abort the batch ────────────────
+
+
+def test_tiingo_non_dict_rows_degrade_to_missing_not_crash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A valid JSON list whose elements aren't dicts (an error page, a format shift) used to
+    # raise AttributeError out of the un-guarded per-ticker loop and blank the whole report.
+    monkeypatch.setattr(P, "_fetch_yf", lambda t, s, e: None)
+    monkeypatch.setattr(P, "_fetch_tiingo_json", lambda t, s, e: [None, 123, "oops"])
+    result = fetch_latest(["VOO"], asof_date=date(2024, 1, 5), cache_dir=tmp_path)
+    assert result.missing == ["VOO"] and result.rows == {}
+
+
+@pytest.mark.parametrize(
+    ("close", "why"),
+    [
+        (float("nan"), "json.loads parses a bare NaN token"),
+        (float("inf"), "float('inf') never raises"),
+        ("inf", "the string form doesn't either"),
+        (True, "bool is a subclass of int — would become $1.00"),
+        (10**400, "float() of a huge int raises OverflowError, not ValueError"),
+    ],
+)
+def test_tiingo_unusable_closes_are_skipped_never_priced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, close: object, why: str
+) -> None:
+    # The yfinance path drops these via _normalize_close's dropna; the Tiingo path must too.
+    # A non-finite close would otherwise be cached and re-served as source="cache", poisoning
+    # market value, weights, and every drawdown figure downstream.
+    monkeypatch.setattr(P, "_fetch_yf", lambda t, s, e: None)
+    monkeypatch.setattr(
+        P, "_fetch_tiingo_json",
+        lambda t, s, e: [{"date": "2024-01-05T00:00:00.000Z", "close": close}],
+    )
+    result = fetch_latest(["VOO"], asof_date=date(2024, 1, 5), cache_dir=tmp_path)
+    assert result.missing == ["VOO"], why
+    assert not (tmp_path / "VOO.parquet").exists()  # nothing unusable reached the cache
+
+
+def test_tiingo_one_bad_row_does_not_drop_the_good_ones(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rows: list[object] = [
+        {"date": "2024-01-02T00:00:00.000Z", "close": float("nan")},
+        "not a dict",
+        {"date": "bad-date", "close": 5.0},
+        {"date": "2024-01-03T00:00:00.000Z", "close": 11.0},
+    ]
+    monkeypatch.setattr(P, "_fetch_tiingo_json", lambda t, s, e: rows)
+    pairs = P._tiingo_closes("X", date(2024, 1, 1), date(2024, 1, 3))
+    assert pairs == [(date(2024, 1, 3), 11.0)]
+
+
+# ── the one price-validity rule: finite AND > 0, at every ingest point ────────
+
+
+def test_usable_price_rejects_the_full_bad_set() -> None:
+    assert P.usable_price(10.0)
+    for bad in (0.0, -1.0, float("nan"), float("inf"), float("-inf")):
+        assert not P.usable_price(bad), bad
+
+
+def test_tiingo_series_drops_zero_and_negative_closes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A halted / bad-feed row (close 0.0 or negative) must be dropped, not fed to the return
+    # series where it fabricates a -100% then a sign-flip infinity into the drawdown/Ulcer maths.
+    rows = [
+        {"date": "2024-01-02T00:00:00.000Z", "close": 10.0},
+        {"date": "2024-01-03T00:00:00.000Z", "close": 0.0},
+        {"date": "2024-01-04T00:00:00.000Z", "close": -5.0},
+        {"date": "2024-01-05T00:00:00.000Z", "close": 12.0},
+    ]
+    monkeypatch.setattr(P, "_fetch_tiingo_json", lambda t, s, e: rows)
+    pairs = P._tiingo_closes("X", date(2024, 1, 2), date(2024, 1, 5))
+    assert pairs == [(date(2024, 1, 2), 10.0), (date(2024, 1, 5), 12.0)]
+
+
+def test_normalize_close_drops_inf_and_non_positive() -> None:
+    # dropna removes NaN but NOT ±inf, 0, or negatives — the yfinance path must drop them too,
+    # else pipeline's "providers reject non-finite upstream" claim is false for yfinance itself.
+    df = pd.DataFrame(
+        {"Close": [10.0, 0.0, -3.0, float("inf"), float("nan"), 12.0]},
+        index=pd.date_range("2024-01-02", periods=6),
+    )
+    out = P._normalize_close(df)
+    assert out is not None
+    assert list(out) == [10.0, 12.0]
+
+
+def test_series_cache_read_drops_poisoned_cells(tmp_path: Path) -> None:
+    # A corrupt / legacy <T>_series.parquet must not re-serve non-finite or non-positive closes
+    # (they bypass the parser guards). This is the most-travelled ingest path on a warm cache.
+    pd.DataFrame({
+        "date": pd.to_datetime(["2024-01-02", "2024-01-03", "2024-01-04", "2024-01-05"]),
+        "close": [float("nan"), float("inf"), 0.0, 13.0],
+        "fetched_at": pd.Timestamp(datetime.now(timezone.utc)),
+    }).to_parquet(tmp_path / "VOO_series.parquet", index=False)
+    res = fetch_series(["VOO"], date(2024, 1, 1), date(2024, 1, 5), cache_dir=tmp_path, online=False)
+    assert list(res.rows["VOO"]) == [13.0]  # only the one usable cell survives
+
+
+def test_from_cache_rejects_a_poisoned_latest_cell(tmp_path: Path) -> None:
+    asof = date(2024, 1, 5)
+    _write_cache_row(tmp_path / "VOO.parquet", asof, float("inf"),
+                     datetime.now(timezone.utc) - timedelta(minutes=5))
+    # inf > 0 is True, so a bare `> 0` guard would have served it; usable_price rejects it.
+    res = fetch_latest(["VOO"], asof_date=asof, cache_dir=tmp_path, online=False)
+    assert res.missing == ["VOO"] and res.rows == {}
+
+
+# ── the yfinance retry circuit breaker (batch-scoped) ─────────────────────────
+
+
+def test_yf_retry_disarms_after_consecutive_failures(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Under a wholesale Yahoo block (the case the retry exists for), retrying EVERY ticker
+    # only doubles request volume and burns 1.5s x N of dead sleep before the fallback.
+    # After _YF_BLOCKED_AFTER straight failures ON ONE circuit the retry must disarm.
+    calls = {"n": 0}
+    sleeps: list[float] = []
+
+    def throttled(*a: object, **k: object) -> pd.DataFrame:
+        calls["n"] += 1
+        return pd.DataFrame()  # Yahoo's throttle signature: empty, not raising
+
+    monkeypatch.setattr(P.yf, "download", throttled)
+    monkeypatch.setattr(P.time, "sleep", lambda s: sleeps.append(s))
+
+    circuit = P._RetryCircuit()
+    for _ in range(P._YF_BLOCKED_AFTER):  # each: 2 attempts + 1 sleep
+        assert P._fetch_yf_retrying("X", date(2024, 1, 1), date(2024, 1, 2), circuit=circuit) is None
+    armed_calls, armed_sleeps = calls["n"], len(sleeps)
+    assert armed_calls == 2 * P._YF_BLOCKED_AFTER
+    assert armed_sleeps == P._YF_BLOCKED_AFTER
+    assert not circuit.armed
+
+    assert P._fetch_yf_retrying("Y", date(2024, 1, 1), date(2024, 1, 2), circuit=circuit) is None
+    assert calls["n"] == armed_calls + 1  # a single attempt
+    assert len(sleeps) == armed_sleeps    # and no sleep at all
+
+
+def test_yf_success_rearms_the_circuit(monkeypatch: pytest.MonkeyPatch) -> None:
+    sleeps: list[float] = []
+    monkeypatch.setattr(P.time, "sleep", lambda s: sleeps.append(s))
+    monkeypatch.setattr(P.yf, "download", lambda *a, **k: pd.DataFrame())
+    circuit = P._RetryCircuit()
+    for _ in range(P._YF_BLOCKED_AFTER):
+        P._fetch_yf_retrying("X", date(2024, 1, 1), date(2024, 1, 2), circuit=circuit)
+    assert circuit.consecutive_failures == P._YF_BLOCKED_AFTER
+
+    monkeypatch.setattr(P.yf, "download", lambda *a, **k: _fake_yf_df(1.0, date(2024, 1, 5)))
+    assert P._fetch_yf_retrying("X", date(2024, 1, 1), date(2024, 1, 2), circuit=circuit) is not None
+    assert circuit.consecutive_failures == 0  # one success re-arms the circuit
+
+    monkeypatch.setattr(P.yf, "download", lambda *a, **k: pd.DataFrame())
+    before = len(sleeps)
+    P._fetch_yf_retrying("X", date(2024, 1, 1), date(2024, 1, 2), circuit=circuit)
+    assert len(sleeps) == before + 1  # retrying again
+
+
+def test_yf_circuit_is_batch_scoped_not_process_global(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A fresh batch (a later, unrelated MCP tool call) re-assesses from zero — a prior
+    # blocked batch must not leave the retry disabled for the next one.
+    monkeypatch.setattr(P.time, "sleep", lambda s: None)
+    monkeypatch.setattr(P.yf, "download", lambda *a, **k: pd.DataFrame())
+    blocked = P._RetryCircuit()
+    for _ in range(P._YF_BLOCKED_AFTER):
+        P._fetch_yf_retrying("X", date(2024, 1, 1), date(2024, 1, 2), circuit=blocked)
+    assert not blocked.armed
+
+    fresh_batch = P._RetryCircuit()  # what fetch_latest/fetch_series build per call
+    assert fresh_batch.armed  # starts armed regardless of the prior batch
+
+    # And a lone call with no circuit is always armed (independent).
+    calls = {"n": 0}
+
+    def count(*a: object, **k: object) -> pd.DataFrame:
+        calls["n"] += 1
+        return pd.DataFrame()
+
+    monkeypatch.setattr(P.yf, "download", count)
+    P._fetch_yf_retrying("Z", date(2024, 1, 1), date(2024, 1, 2))  # circuit=None
+    assert calls["n"] == 2  # retried
+
+
+def test_fetch_yf_retries_once_on_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A throttled Yahoo call comes back EMPTY, not raising; one spaced retry
+    # must clear the transient case (the real Desktop failure mode).
+    calls = {"n": 0}
+
+    def fake_download(*a: object, **k: object) -> pd.DataFrame:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return pd.DataFrame()  # throttled → empty frame
+        return _fake_yf_df(100.0, date(2024, 1, 5))
+
+    sleeps: list[float] = []
+    monkeypatch.setattr(P.yf, "download", fake_download)
+    monkeypatch.setattr(P.time, "sleep", lambda s: sleeps.append(s))
+    df = P._fetch_yf_retrying("VOO", date(2024, 1, 1), date(2024, 1, 6))
+    assert df is not None and not df.empty
+    assert calls["n"] == 2
+    assert sleeps == [P._YF_RETRY_WAIT]  # paced, not hammered
+
+
+def test_fetch_yf_gives_up_after_two_attempts(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A hard block stays empty on both attempts → None (falls through to Tiingo);
+    # never a third call, never an unbounded loop.
+    calls = {"n": 0}
+
+    def fake_download(*a: object, **k: object) -> pd.DataFrame:
+        calls["n"] += 1
+        return pd.DataFrame()
+
+    monkeypatch.setattr(P.yf, "download", fake_download)
+    monkeypatch.setattr(P.time, "sleep", lambda s: None)
+    assert P._fetch_yf_retrying("VOO", date(2024, 1, 1), date(2024, 1, 6)) is None
+    assert calls["n"] == 2
+
+
+def test_fetch_yf_no_retry_when_first_succeeds(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The happy path must stay a single request — no added latency per ticker.
+    calls = {"n": 0}
+
+    def fake_download(*a: object, **k: object) -> pd.DataFrame:
+        calls["n"] += 1
+        return _fake_yf_df(100.0, date(2024, 1, 5))
+
+    monkeypatch.setattr(P.yf, "download", fake_download)
+    monkeypatch.setattr(P.time, "sleep", lambda s: pytest.fail("must not sleep on success"))
+    assert P._fetch_yf_retrying("VOO", date(2024, 1, 1), date(2024, 1, 6)) is not None
+    assert calls["n"] == 1
 
 
 # ── shape / hygiene ──────────────────────────────────────────────────────
@@ -193,7 +616,7 @@ def test_offline_mode_uses_cache_only(
     )
     monkeypatch.setattr(P, "_fetch_yf", lambda *a, **k: pytest.fail("yf must not be called offline"))
     monkeypatch.setattr(
-        P, "_fetch_stooq_csv", lambda *a, **k: pytest.fail("stooq must not be called offline")
+        P, "_fetch_tiingo_json", lambda *a, **k: pytest.fail("tiingo must not be called offline")
     )
     result = fetch_latest(["VOO"], asof_date=asof, cache_dir=tmp_path, online=False)
     assert result.rows["VOO"].source == "cache"
@@ -237,7 +660,7 @@ def test_cache_refuses_future_fetched_at(
     future = datetime.now(timezone.utc) + timedelta(hours=24)
     _write_cache_row(tmp_path / "VOO.parquet", asof, 999.0, future)
     monkeypatch.setattr(P, "_fetch_yf", lambda t, s, e: _fake_yf_df(50.0, asof))
-    monkeypatch.setattr(P, "_fetch_stooq_csv", lambda t: None)
+    monkeypatch.setattr(P, "_fetch_tiingo_json", lambda t, s, e: None)
     result = fetch_latest(["VOO"], asof_date=asof, cache_dir=tmp_path)
     assert result.rows["VOO"].source == "yfinance"
     assert result.rows["VOO"].close == 50.0
@@ -258,14 +681,14 @@ def test_cache_age_clamped_to_zero() -> None:
 
 def test_prices_result_helpers() -> None:
     row_yf = PriceRow("A", date(2024, 1, 5), 1.0, "yfinance", datetime.now(timezone.utc))
-    row_stooq = PriceRow("B", date(2024, 1, 5), 2.0, "stooq", datetime.now(timezone.utc))
+    row_tiingo = PriceRow("B", date(2024, 1, 5), 2.0, "tiingo", datetime.now(timezone.utc))
     row_cache = PriceRow("C", date(2024, 1, 5), 3.0, "cache", datetime.now(timezone.utc))
     result = PricesResult(
-        rows={"A": row_yf, "B": row_stooq, "C": row_cache},
+        rows={"A": row_yf, "B": row_tiingo, "C": row_cache},
         missing=["D"],
     )
     assert result.n_yfinance == 1
-    assert result.n_stooq == 1
+    assert result.n_tiingo == 1
     assert result.n_cache == 1
     assert result.fallbacks_used == 1
 
@@ -285,7 +708,7 @@ def test_fetch_series_returns_history_with_index(
     monkeypatch.setattr(
         P, "_fetch_yf", lambda t, s, e: _fake_yf_history([100.0, 101.0, 102.0], start)
     )
-    monkeypatch.setattr(P, "_fetch_stooq_csv", lambda t: None)
+    monkeypatch.setattr(P, "_fetch_tiingo_json", lambda t, s, e: None)
     result = fetch_series(["VOO"], start, date(2024, 1, 3), cache_dir=tmp_path)
     assert "VOO" in result.rows
     s = result.rows["VOO"]
@@ -294,26 +717,27 @@ def test_fetch_series_returns_history_with_index(
     assert isinstance(s.index, pd.DatetimeIndex)
 
 
-def test_fetch_series_falls_back_to_stooq(
+def test_fetch_series_falls_back_to_tiingo(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(P, "_fetch_yf", lambda t, s, e: None)
-    csv_text = (
-        "Date,Open,High,Low,Close,Volume\n"
-        "2024-01-01,0,0,0,10.0,0\n"
-        "2024-01-02,0,0,0,11.0,0\n"
-        "2024-01-03,0,0,0,12.0,0\n"
-    )
-    monkeypatch.setattr(P, "_fetch_stooq_csv", lambda t: csv_text)
+    rows: list[dict[str, object]] = [
+        {"date": "2024-01-01T00:00:00.000Z", "close": 10.0},
+        {"date": "2024-01-02T00:00:00.000Z", "close": 11.0},
+        {"date": "2024-01-03T00:00:00.000Z", "close": 12.0},
+    ]
+    monkeypatch.setattr(P, "_fetch_tiingo_json", lambda t, s, e: rows)
     result = fetch_series(["VOO"], date(2024, 1, 1), date(2024, 1, 3), cache_dir=tmp_path)
     assert list(result.rows["VOO"].round(1)) == [10.0, 11.0, 12.0]
+    assert result.provenance["VOO"][0] == "tiingo"
+    assert result.fallbacks_used == 1
 
 
 def test_fetch_series_missing_when_all_fail(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(P, "_fetch_yf", lambda t, s, e: None)
-    monkeypatch.setattr(P, "_fetch_stooq_csv", lambda t: None)
+    monkeypatch.setattr(P, "_fetch_tiingo_json", lambda t, s, e: None)
     result = fetch_series(["NOPE"], date(2024, 1, 1), date(2024, 1, 3), cache_dir=tmp_path)
     assert result.rows == {}
     assert result.missing == ["NOPE"]
@@ -331,7 +755,7 @@ def test_fetch_series_writes_and_reuses_cache(
     assert (tmp_path / "VOO_series.parquet").exists()
     # Second call must hit cache: network wrappers now fail the test if called.
     monkeypatch.setattr(P, "_fetch_yf", lambda *a, **k: pytest.fail("yf should not be called"))
-    monkeypatch.setattr(P, "_fetch_stooq_csv", lambda *a, **k: pytest.fail("stooq should not be called"))
+    monkeypatch.setattr(P, "_fetch_tiingo_json", lambda *a, **k: pytest.fail("tiingo should not be called"))
     result = fetch_series(["VOO"], start, end, cache_dir=tmp_path)
     assert len(result.rows["VOO"]) == 3
 
@@ -342,18 +766,18 @@ def test_fetch_series_records_provenance(
     # A yfinance hit must be recorded as ("yfinance", <fetched_at>) so the CLI can
     # stamp honest provenance (P0-1) instead of a fabricated "series" label.
     monkeypatch.setattr(P, "_fetch_yf", lambda tk, s, e: _fake_yf_df(100.0, date(2024, 1, 2)))
-    monkeypatch.setattr(P, "_fetch_stooq_csv", lambda tk: "")
+    monkeypatch.setattr(P, "_fetch_tiingo_json", lambda tk, s, e: None)
     res = fetch_series(["VOO"], date(2024, 1, 1), date(2024, 1, 3),
                        cache_dir=tmp_path, online=True)
     assert "VOO" in res.rows
     assert res.provenance["VOO"][0] == "yfinance"
 
 
-def test_series_fallbacks_used_counts_stooq() -> None:
+def test_series_fallbacks_used_counts_tiingo() -> None:
     now = datetime.now(timezone.utc)
     res = SeriesResult(
         rows={"A": pd.Series(dtype=float), "B": pd.Series(dtype=float)},
-        provenance={"A": ("stooq", now), "B": ("yfinance", now)},
+        provenance={"A": ("tiingo", now), "B": ("yfinance", now)},
     )
     assert res.fallbacks_used == 1
 
@@ -384,7 +808,7 @@ def test_series_cache_stale_is_refetched(
         datetime.now(timezone.utc) - timedelta(days=3),  # stale
     )
     monkeypatch.setattr(P, "_fetch_yf", lambda t, s, e: _fake_yf_history([10.0, 11.0, 12.0], date(2024, 1, 1)))
-    monkeypatch.setattr(P, "_fetch_stooq_csv", lambda t: None)
+    monkeypatch.setattr(P, "_fetch_tiingo_json", lambda t, s, e: None)
     res = fetch_series(["VOO"], date(2024, 1, 1), date(2024, 1, 3), cache_dir=tmp_path)
     assert list(res.rows["VOO"].round(1)) == [10.0, 11.0, 12.0]  # refetched, not 1/2/3
     assert res.provenance["VOO"][0] == "yfinance"
@@ -398,7 +822,7 @@ def test_series_cache_future_stamp_is_refused(
         datetime.now(timezone.utc) + timedelta(hours=24),  # future-stamped
     )
     monkeypatch.setattr(P, "_fetch_yf", lambda t, s, e: _fake_yf_history([10.0, 11.0, 12.0], date(2024, 1, 1)))
-    monkeypatch.setattr(P, "_fetch_stooq_csv", lambda t: None)
+    monkeypatch.setattr(P, "_fetch_tiingo_json", lambda t, s, e: None)
     res = fetch_series(["VOO"], date(2024, 1, 1), date(2024, 1, 3), cache_dir=tmp_path)
     assert list(res.rows["VOO"].round(1)) == [10.0, 11.0, 12.0]  # refused → refetched
 
@@ -408,7 +832,7 @@ def test_series_cache_corrupt_is_nonfatal(
 ) -> None:
     (tmp_path / "VOO_series.parquet").write_bytes(b"this is not parquet")
     monkeypatch.setattr(P, "_fetch_yf", lambda t, s, e: _fake_yf_history([5.0, 6.0, 7.0], date(2024, 1, 1)))
-    monkeypatch.setattr(P, "_fetch_stooq_csv", lambda t: None)
+    monkeypatch.setattr(P, "_fetch_tiingo_json", lambda t, s, e: None)
     res = fetch_series(["VOO"], date(2024, 1, 1), date(2024, 1, 3), cache_dir=tmp_path)
     assert list(res.rows["VOO"].round(1)) == [5.0, 6.0, 7.0]  # unreadable → refetched
 
@@ -507,7 +931,7 @@ def test_online_latest_miss_does_not_serve_stale_series_tail(
         datetime.now(timezone.utc) - timedelta(hours=1),  # fresh, but dated 2024-01-03
     )  # no VOO.parquet → dedicated latest cache misses
     monkeypatch.setattr(P, "_fetch_yf", lambda t, s, e: _fake_yf_df(99.0, date(2024, 1, 10)))
-    monkeypatch.setattr(P, "_fetch_stooq_csv", lambda t: None)
+    monkeypatch.setattr(P, "_fetch_tiingo_json", lambda t, s, e: None)
     res = fetch_latest(["VOO"], asof_date=date(2024, 1, 10), cache_dir=tmp_path, online=True)
     assert res.rows["VOO"].source == "yfinance"  # fetched fresh, NOT the stale tail
     assert res.rows["VOO"].close == 99.0
@@ -522,7 +946,7 @@ def test_series_cache_nat_fetched_at_is_refused(
         {"date": [pd.Timestamp("2024-01-01")], "close": [5.0], "fetched_at": [pd.NaT]}
     ).to_parquet(tmp_path / "VOO_series.parquet", index=False)
     monkeypatch.setattr(P, "_fetch_yf", lambda t, s, e: _fake_yf_history([10.0, 11.0, 12.0], date(2024, 1, 1)))
-    monkeypatch.setattr(P, "_fetch_stooq_csv", lambda t: None)
+    monkeypatch.setattr(P, "_fetch_tiingo_json", lambda t, s, e: None)
     res = fetch_series(["VOO"], date(2024, 1, 1), date(2024, 1, 3), cache_dir=tmp_path)
     assert list(res.rows["VOO"].round(1)) == [10.0, 11.0, 12.0]  # refused → refetched
     assert res.provenance["VOO"][0] == "yfinance"

@@ -61,6 +61,9 @@ def _hermetic_env_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ASSET_TARGET", "")
     monkeypatch.setenv("ASSET_UNIVERSE", "")  # --warm full reads it; pin so a real .env can't leak
     monkeypatch.setenv("ASSET_CACHE_DIR", "")  # --cache-dir falls back to it; pin so .env can't leak
+    # cli.main() calls load_dotenv, so a developer's real Tiingo key would otherwise enter
+    # os.environ and let an unmocked fetch reach api.tiingo.com (cf. test_email's RESEND key).
+    monkeypatch.delenv("TIINGO_API_KEY", raising=False)
 
 
 def _today() -> str:
@@ -1007,7 +1010,7 @@ def test_offline_never_touches_the_network(
 
     monkeypatch.setattr(P, "_fetch_yf", lambda *a, **k: pytest.fail("network call in --offline"))
     monkeypatch.setattr(
-        P, "_fetch_stooq_csv", lambda *a, **k: pytest.fail("network call in --offline")
+        P, "_fetch_tiingo_json", lambda *a, **k: pytest.fail("network call in --offline")
     )
     rc = main(["--csv", str(SAMPLE), "--offline", "--cache-dir", str(tmp_path)])
     assert rc == 0
@@ -1043,7 +1046,7 @@ def test_run_summary_counts_prices_on_series_path(
             tk: pd.Series([100.0 + i * 0.1 for i in range(len(dates))], index=dates, dtype=float)
             for tk in tickers
         }
-        prov = {tk: ("stooq", datetime.now(timezone.utc)) for tk in tickers}
+        prov = {tk: ("tiingo", datetime.now(timezone.utc)) for tk in tickers}
         return SeriesResult(rows=rows, missing=[], provenance=prov)
 
     monkeypatch.setattr("app.cli.fetch_series", fake_series)
@@ -1055,7 +1058,7 @@ def test_run_summary_counts_prices_on_series_path(
     assert run["n_prices_fetched"] > 0      # was 0 before the fix
     assert run["n_prices_missing"] == 0
     assert run["n_series_fetched"] > 0
-    assert run["fallbacks_used"] == run["n_series_fetched"]  # all provenance is stooq
+    assert run["fallbacks_used"] == run["n_series_fetched"]  # all provenance is tiingo
 
 
 def test_rebalance_missing_target_file_skip_reason(

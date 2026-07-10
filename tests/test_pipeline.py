@@ -1,4 +1,5 @@
-"""Pipeline cache-warming helpers: `cache_is_cold`, `benchmark_ref_tickers`, `warm_cache`.
+"""Pipeline cache-warming helpers: `cache_is_cold`, `benchmark_ref_tickers`, `warm_cache`,
+plus `held_market_value` — the one valuation sink.
 
 The warm path is offline-first onboarding glue over the named fetch adapters, so these
 tests mock the adapters and assert which tickers each is asked for — never the network.
@@ -8,10 +9,12 @@ from __future__ import annotations
 
 import os
 import time
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import pytest
 
+from app.derive import DerivedState, Position
 from app.metadata import MetadataResult, SecurityMeta
 from app.pipeline import (
     _WARM_MARKER,
@@ -20,10 +23,36 @@ from app.pipeline import (
     cache_is_cold,
     candidate_and_held_facts,
     default_cache_dir,
+    held_market_value,
     warm_cache,
     write_demo_book,
 )
-from app.prices import PricesResult, SeriesResult
+from app.prices import PriceRow, PricesResult, SeriesResult
+
+
+@pytest.mark.parametrize(
+    ("close", "usable"),
+    [
+        (10.0, True),
+        (0.0, False),
+        (-1.0, False),
+        (float("nan"), False),
+        (float("inf"), False),   # `inf > 0` is True — the guard must test isfinite too
+        (float("-inf"), False),
+    ],
+)
+def test_held_market_value_drops_every_unusable_close(close: float, usable: bool) -> None:
+    """The valuation sink must not depend on providers rejecting bad prices upstream.
+
+    `nan > 0` is False so NaN was already dropped, but `inf > 0` is True: an inf close
+    made market value inf and every weight nan, while the book still scored fully priced.
+    """
+    state = DerivedState(positions={"VOO": Position("VOO", shares=2.0, cost_basis=100.0)})
+    prices = {"VOO": PriceRow("VOO", date(2024, 1, 5), close, "tiingo", datetime.now(timezone.utc))}
+    out = held_market_value(state, prices)
+    assert ("VOO" in out) is usable
+    if usable:
+        assert out["VOO"] == pytest.approx(20.0)
 
 
 def test_benchmark_ref_tickers_is_the_union_of_the_references() -> None:

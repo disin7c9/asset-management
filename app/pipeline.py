@@ -35,6 +35,7 @@ from app.prices import (
     fetch_latest,
     fetch_series,
     fetch_splits,
+    usable_price,
 )
 from app.returns import (
     ReturnsSummary,
@@ -172,13 +173,15 @@ def held_market_value(
 
     The single source of held-value math (holdings sizing, returns, suggestions,
     and --dump-target all go through here), so a future valuation change lands in
-    one place. A ticker absent from `prices` or with a non-positive close is
-    omitted (no usable price)."""
+    one place. A ticker absent from `prices`, or whose close is not usable (`usable_price`:
+    finite and > 0), is omitted. The provider/cache ingest points now reject bad closes at
+    the source, but this sink applies the SAME rule so it can't disagree with a sibling sink
+    (`cli` rebalance) about which tickers are priced."""
     held = state.held()
     return {
         tk: held[tk].shares * prices[tk].close
         for tk in held
-        if tk in prices and prices[tk].close > 0
+        if tk in prices and usable_price(prices[tk].close)
     }
 
 
@@ -260,7 +263,7 @@ def compute_prices_returns_risk(
 
     if series is not None and series.rows:
         # Derive each held ticker's latest price from its series tail, carrying the
-        # series' REAL provenance (cache/yfinance/stooq + true fetch time) — not a
+        # series' REAL provenance (cache/yfinance/tiingo + true fetch time) — not a
         # fabricated "series"/now() stamp, so the footer's source + age are honest.
         for tk in held:
             s = series.rows.get(tk)
@@ -286,13 +289,13 @@ def compute_prices_returns_risk(
 
     # One definition of "priced" for the whole report: a held ticker with a
     # positive, usable close — what market value (and so MWR / Modified Dietz)
-    # actually need. A ticker present in `prices` but with a non-positive or NaN
-    # close is dropped from value, so it must count as unpriced here too; else a
-    # partial book would be scored as fully priced and the money-weighted figures
-    # would print a confident wrong number. Counters + partial-status are set here
+    # actually need. A ticker present in `prices` but whose close is not finite and
+    # positive (non-positive, NaN, or ±inf) is dropped from value, so it must count as
+    # unpriced here too; else a partial book would be scored as fully priced and the
+    # money-weighted figures would print a confident wrong number. Counters + partial-status are set here
     # once, for both branches (the series counts are recorded by the caller).
     priced_held = held_market_value(state, prices)
-    prices = {tk: prices[tk] for tk in priced_held}  # drop non-positive/NaN quotes
+    prices = {tk: prices[tk] for tk in priced_held}  # drop non-finite/non-positive quotes
     missing = [tk for tk in held if tk not in priced_held]
     run["n_prices_fetched"] = len(priced_held)
     run["n_prices_missing"] = len(missing)

@@ -229,6 +229,7 @@ def _manifest(version: str) -> dict[str, object]:
                     "ASSET_CACHE_DIR": "${user_config.cache_dir}",
                     "ASSET_TARGET": "${user_config.target}",
                     "ASSET_MCP_OFFLINE": "${user_config.offline}",
+                    "TIINGO_API_KEY": "${user_config.tiingo_api_key}",
                 },
             },
         },
@@ -277,6 +278,17 @@ def _manifest(version: str) -> dict[str, object]:
                     "CLI; a cold cache then answers n/a instead of fetching."
                 ),
                 "default": False,
+                "required": False,
+            },
+            "tiingo_api_key": {
+                "type": "string",
+                "title": "Tiingo API key (optional)",
+                "description": (
+                    "A free key from tiingo.com enables a second price source when "
+                    "Yahoo Finance throttles or fails. Leave empty to fetch from "
+                    "Yahoo only."
+                ),
+                "sensitive": True,
                 "required": False,
             },
         },

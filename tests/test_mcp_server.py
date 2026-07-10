@@ -63,6 +63,9 @@ def _hermetic_mcp_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ASSET_TARGET", "")
     monkeypatch.setenv("ASSET_UNIVERSE", "")  # propose_allocation/discover read it → bundled default
     monkeypatch.setenv("ASSET_MCP_OFFLINE", "1")
+    # The auto-warm tests turn offline back off; without this a developer's real Tiingo key
+    # (loaded from .env) would let the yfinance-miss fallback reach api.tiingo.com for real.
+    monkeypatch.delenv("TIINGO_API_KEY", raising=False)
 
 
 @pytest.fixture

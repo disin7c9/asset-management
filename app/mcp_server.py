@@ -326,7 +326,7 @@ class Holding(BaseModel):
     unrealized_pnl: float | None
     realized_pnl: float = Field(description="locked-in gains: sells + dividends, net of fees")
     weight: float | None = Field(None, description="share of priced market value (0..1)")
-    price_source: str | None = Field(None, description="cache | yfinance | stooq")
+    price_source: str | None = Field(None, description="cache | yfinance | tiingo")
     price_age_hours: float | None = None
 
 
@@ -355,14 +355,14 @@ class DataProvenance(BaseModel):
     ``asof`` on a tool is the request date; THIS says when the prices are actually from
     and how stale the cache is — so a reader can weigh 'computed today' against 'from a
     close 6 days old, last fetched 40h ago'. (No 'offline' flag: a one-time cold-start
-    warm may fetch on the first call, so ``sources`` — cache vs yfinance/stooq — is the
+    warm may fetch on the first call, so ``sources`` — cache vs yfinance/tiingo — is the
     honest signal, not a blanket 'no network' claim.)"""
 
     price_asof: date | None = Field(
         None, description="date of the latest close underlying these numbers (null if unpriced)"
     )
     sources: list[str] = Field(
-        default_factory=list, description="distinct price providers used: cache | yfinance | stooq"
+        default_factory=list, description="distinct price providers used: cache | yfinance | tiingo"
     )
     stalest_fetch_hours: float | None = Field(
         None, description="age of the STALEST price used — how long since it was last fetched"

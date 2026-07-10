@@ -24,7 +24,7 @@ from app.events import CASH_TICKER, Event, load_events, load_events_report, load
 from app.log_config import setup_logging
 from app.metadata import MetadataResult, fetch_metadata
 from app.screen import CandidateScreen, screen_candidates
-from app.prices import PriceRow, SeriesResult, fetch_latest, fetch_series
+from app.prices import PriceRow, SeriesResult, fetch_latest, fetch_series, usable_price
 from app.report import (
     ReportData,
     Section,
@@ -736,7 +736,7 @@ def _compute_suggestions(
                 run["status"] = "partial"
             log.warning("--rebalance: no price for: %s", ", ".join(result.missing))
 
-    price_per_share = {tk: row.close for tk, row in combined.items() if row.close > 0}
+    price_per_share = {tk: row.close for tk, row in combined.items() if usable_price(row.close)}
     unpriced_held = sorted(tk for tk in held if tk not in price_per_share)
     if unpriced_held:
         log.warning(

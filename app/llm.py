@@ -12,7 +12,7 @@ Two backends behind one `complete()` call:
 - **Anthropic** (`provider=anthropic`): POST the Messages API.
 
 Config comes from the environment (.env) so a key never lives in code. stdlib
-`urllib` only (no SDK) — minimal deps, matching `prices.py`'s stooq fetch.
+`urllib` only (no SDK) — minimal deps, matching `prices.py`'s Tiingo fetch.
 """
 
 from __future__ import annotations

@@ -18,7 +18,7 @@ a "cheap" fund quietly isn't. Metadata moves slowly, so the TTL is a week.
 
 yfinance is the primary (spike-verified 2026-06-12 against issuer pages:
 VOO 0.03% / GLDM 0.10% / BNDX 0.07%). A second provider can slot in beside
-`_meta_from_yfinance` exactly like stooq did for prices, when needed.
+`_meta_from_yfinance` exactly like Tiingo does for prices, when needed.
 """
 
 from __future__ import annotations
