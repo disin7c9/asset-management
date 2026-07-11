@@ -361,6 +361,11 @@ class DataProvenance(BaseModel):
     price_asof: date | None = Field(
         None, description="date of the latest close underlying these numbers (null if unpriced)"
     )
+    oldest_close: date | None = Field(
+        None,
+        description="oldest close date among the prices used — when it lags price_asof, "
+        "at least one holding is valued off a staler quote than the rest",
+    )
     sources: list[str] = Field(
         default_factory=list, description="distinct price providers used: cache | yfinance | tiingo"
     )
@@ -645,6 +650,7 @@ def _data_provenance(b: _Build) -> DataProvenance:
     if rows:
         return DataProvenance(
             price_asof=max(pr.asof_date for pr in rows),
+            oldest_close=min(pr.asof_date for pr in rows),
             sources=sorted({pr.source for pr in rows}),
             stalest_fetch_hours=max(_age_hours(pr.cache_age) for pr in rows),
         )
@@ -654,12 +660,18 @@ def _data_provenance(b: _Build) -> DataProvenance:
         prov = series.provenance
         return DataProvenance(
             price_asof=max(s.index[-1].date() for s in series.rows.values()),
+            # oldest_close means "the stalest quote a HOLDING is valued at" — on this
+            # fallback branch nothing is held (that's why b.prices is empty), and
+            # series.rows spans every ticker ever traded, so min() over the tails would
+            # report a long-sold (possibly delisted) position as a stale holding. There
+            # is no referent → null, not a misleading date.
+            oldest_close=None,
             sources=sorted({src for src, _ in prov.values()}),
             stalest_fetch_hours=(
                 max(_age_hours(now - fetched) for _, fetched in prov.values()) if prov else None
             ),
         )
-    return DataProvenance(price_asof=None, sources=[], stalest_fetch_hours=None)
+    return DataProvenance(price_asof=None, oldest_close=None, sources=[], stalest_fetch_hours=None)
 
 
 # ── tools ────────────────────────────────────────────────────────────────────
@@ -778,10 +790,13 @@ def rebalance_check(mode: str = "to_total", new_cash: float = 0.0) -> RebalanceP
             asof=today, mode=mode, new_cash=new_cash, target_source=str(target_path),
             suggestions=[], unpriced=unpriced,
             note=_cold_error(
-                "Can't size a rebalance offline: held tickers lack a cached price "
+                "Can't size a rebalance offline: held tickers lack a usable current price "
                 f"({', '.join(unpriced_held)}) — the plan would be over a partial book. "
                 "Warm the cache once with `uv run python -m app --book <your-book> --warm`, "
-                "then retry."
+                "then retry. If the same ticker still has no price after warming, its last "
+                "close is likely older than the 10-day staleness floor — a delisted or "
+                "halted security that no re-fetch can price; update the book to record "
+                "what actually happened to the position instead."
             ),
         )
     held_value = {tk: held[tk].shares * price_per_share[tk] for tk in held}

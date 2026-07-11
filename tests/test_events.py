@@ -124,6 +124,28 @@ def test_load_events_defaults_when_optional_columns_absent(tmp_path: Path) -> No
     assert e.currency == "USD" and e.source == "MANUAL" and e.note == ""
 
 
+def test_load_events_non_usd_csv_row_rejected_loudly(tmp_path: Path) -> None:
+    # F4 (fresh-eyes audit 2026-07-11): the Currency column was parsed and then IGNORED —
+    # a hand-written `EUR,650.00` row booked €650 as $650, silently corrupting cost basis,
+    # P&L, and market value. A native-CSV row is the user's own accounting, so this is a
+    # hard error naming the row and currency, not a warn-and-skip that would silently
+    # change holdings (the Ghostfolio JSON path keeps warn-and-skip: imported data).
+    text = _HEADER + (
+        "2024-01-05,VOO,YAHOO,USD,365,10,buy,1,\n"
+        "2024-03-01,ASML,YAHOO,EUR,650.00,2,buy,1.50,\n"
+    )
+    with pytest.raises(ValueError, match=r"data row 2.*'EUR'.*USD-only"):
+        load_events(_csv(tmp_path, text))
+
+
+def test_load_events_currency_is_case_insensitive(tmp_path: Path) -> None:
+    # 'usd' must pass (normalized to USD); 'eur' must be refused like 'EUR'.
+    ok = _HEADER + "2024-01-05,VOO,YAHOO,usd,365,10,buy,1,\n"
+    assert load_events(_csv(tmp_path, ok))[0].currency == "USD"
+    with pytest.raises(ValueError, match="'EUR'"):
+        load_events(_csv(tmp_path, _HEADER + "2024-01-05,ASML,YAHOO,eur,650,2,buy,1,\n"))
+
+
 def test_valid_actions_are_the_seven_known_kinds() -> None:
     assert VALID_ACTIONS == {
         "buy", "sell", "dividend", "fee", "interest", "deposit", "withdraw"

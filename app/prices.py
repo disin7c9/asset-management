@@ -46,11 +46,19 @@ log = logging.getLogger(__name__)
 
 _CACHE_DIR_DEFAULT = Path("data/prices")
 _CACHE_TTL = timedelta(hours=20)  # roughly one business day
-# Offline, a stale cache is served rather than refetched (there's nothing to fetch); but don't
-# pass off a series tail older than this as a "current" price — beyond it, report the holding
-# missing rather than quote a stale close. The brief is weekly, so ~10 days covers a normal gap
-# (plus a little slack); older than that, calling the price "current" would mislead.
-_OFFLINE_PRICE_FLOOR = timedelta(days=10)
+# Don't pass off a close older than this as a "current" price — beyond it, report the holding
+# unpriced rather than quote a stale close. The brief is weekly, so ~10 days covers a normal gap
+# (plus a little slack); older than that, calling the price "current" would mislead — a
+# delisted/halted ticker's last-ever close would otherwise be served as today's value, forever.
+# Public: enforced on the offline latest path here AND on the risk-on series-tail path in
+# `pipeline.compute_prices_returns_risk` (which imports it), so the two can't disagree.
+STALE_PRICE_FLOOR = timedelta(days=10)
+# The longest NORMAL no-trading gap (weekend + a holiday cluster): a close within this many
+# days of the target date is current-enough to raise no eyebrows. Public and single-sourced
+# because two rules share it and must stay in lockstep: the series-cache end-coverage check
+# below (a cached series "covers" `end` if its last row is within the grace) and the report's
+# stale-close display (`report._stale_close_lag` starts naming close dates beyond it).
+STALE_CLOSE_GRACE = timedelta(days=4)
 
 
 @dataclass(frozen=True)
@@ -555,7 +563,7 @@ def _tiingo_closes(
 
 def _from_tiingo(ticker: str, asof: date) -> PriceRow | None:
     # Same 10-day lookback as `_from_yfinance`: a close older than that is not a
-    # "current" price anywhere else here either (cf. `_OFFLINE_PRICE_FLOOR`).
+    # "current" price anywhere else here either (cf. `STALE_PRICE_FLOOR`).
     pairs = _tiingo_closes(ticker, asof - timedelta(days=10), asof)
     if not pairs:
         return None
@@ -702,11 +710,22 @@ def _series_from_cache(
     if read is None:
         return None
     series, fetched = read
-    # The cached series must cover the requested end date to be usable as-is.
-    if series.index.max() < pd.Timestamp(end - timedelta(days=4)):
-        return None
+    # The cached series must cover the requested end date to be usable as-is — UNLESS the
+    # cache itself is fresh within TTL: then the provider had no newer rows when we asked
+    # (every caller passes end=today), so falling short of `end` means the data genuinely
+    # stops there (a delisted/halted ticker). Refetching would re-ask the network on every
+    # run, forever, for rows that will never come; serve the cache and let the pipeline's
+    # staleness floor decide whether the tail may count as a current price. A STALE short
+    # cache (reachable only via allow_stale) still returns None — offline, "no usable
+    # series" stays the honest answer there.
+    if series.index.max() < pd.Timestamp(end - STALE_CLOSE_GRACE):
+        if _now_utc() - fetched > _CACHE_TTL:
+            return None
     mask = (series.index >= pd.Timestamp(start)) & (series.index <= pd.Timestamp(end))
-    return series[mask], fetched
+    sliced = series[mask]
+    if sliced.empty:
+        return None  # nothing in-window (e.g. a short cache ending before `start`)
+    return sliced, fetched
 
 
 def _latest_from_series_cache(
@@ -728,7 +747,7 @@ def _latest_from_series_cache(
     if series.empty:
         return None
     tail = series.index[-1].date()
-    if asof - tail > _OFFLINE_PRICE_FLOOR:
+    if asof - tail > STALE_PRICE_FLOOR:
         return None  # too old to pass off as a current price, even offline
     return PriceRow(
         ticker=ticker,

@@ -466,21 +466,32 @@ def price_basis_mismatches(
     *,
     factor: float = 2.0,
 ) -> list[str]:
-    """Tickers whose trade execution price disagrees with the price *history* by
-    more than `factor`× on the trade date — the fingerprint of an unhandled stock
-    split.
+    """Tickers whose trades cannot be reconciled with their price *history*: the
+    execution price disagrees with the history by more than `factor`× on the trade
+    date (the fingerprint of an unhandled stock split), OR the trade predates the
+    history entirely (a left-truncated series). Both poison the time-weighted series
+    the same way, so both get the same treatment — the caller excludes the ticker
+    from TWR + risk and warns.
 
-    The log records **raw** share counts and execution prices; yfinance closes
-    are **split-adjusted**. So for a ticker that split during its holding period,
-    shares × price is inconsistent across the split and `build_daily_returns`
-    fabricates a return (e.g. a 10:1 split shows the buy at ~10× the adjusted
-    close → a spurious +900% day). A clean ≥2:1 split leaves a ratio far beyond
-    any intraday fill-vs-close gap, so a generous `factor` flags splits without
-    false-positiving on normal moves. The caller excludes the flagged ticker from
-    the time-weighted series (TWR + risk) — the honest stopgap until v1.x adjusts
-    share counts for corporate actions. Buys and sells carry an execution price;
-    dividend/fee rows do not. Returns a sorted list (empty when nothing suspect).
-    Pure.
+    **Split fingerprint.** The log records **raw** share counts and execution prices;
+    yfinance closes are **split-adjusted**. So for a ticker that split during its
+    holding period, shares × price is inconsistent across the split and
+    `build_daily_returns` fabricates a return (e.g. a 10:1 split shows the buy at
+    ~10× the adjusted close → a spurious +900% day). A clean ≥2:1 split leaves a
+    ratio far beyond any intraday fill-vs-close gap, so a generous `factor` flags
+    splits without false-positiving on normal moves.
+
+    **Left-truncated history.** A trade with no price at-or-before its date (a
+    provider serving a shorter history than the holding period) was once skipped
+    here — but its cash lands on the union calendar before the ticker contributes
+    any value, so the portfolio curve dips by ~the position's cost and "recovers"
+    when the series begins: a fabricated ~−100%/+100% day pair straight into
+    max-DD/Ulcer/CDaR/TWR. The right edge has its own guard (`_share_index_day`
+    drops trades past the LAST priced day); this is the matching left-edge guard.
+
+    Buys and sells carry an execution price; dividend/fee rows do not. A ticker with
+    no series at all is not flagged — it never enters the value curve, so there is
+    nothing to poison. Returns a sorted list (empty when nothing suspect). Pure.
     """
     suspect: set[str] = set()
     for ev in events:
@@ -491,6 +502,7 @@ def price_basis_mismatches(
             continue
         at_or_before = s.index[s.index <= pd.Timestamp(ev.date)]
         if len(at_or_before) == 0:
+            suspect.add(ev.ticker)  # trade predates the first priced day (left-truncated)
             continue
         close = float(s.loc[at_or_before[-1]])
         if close <= 0:

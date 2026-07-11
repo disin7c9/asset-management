@@ -32,14 +32,19 @@ from app.mcp_server import _VERSION, mcp
 from app.pipeline import _WARM_MARKER
 
 
-def _warm_series_cache(cache: Path, ticker: str, base: float, n: int = 320) -> None:
-    """Write a fresh <T>_series.parquet ending ~today so an OFFLINE read succeeds.
+def _warm_series_cache(cache: Path, ticker: str, base: float) -> None:
+    """Write a fresh <T>_series.parquet spanning 2024-01-01..today so an OFFLINE read
+    succeeds AND the history covers the fixture book's 2024-01-02 trades — a series
+    starting after a trade is now flagged left-truncated and excluded from TWR/risk (F3),
+    and a stale tail is refused as a current price (F1), so the fixture must look like
+    real, complete data.
 
     A gentle oscillation + drift gives real drawdowns and finite risk ratios (a
     monotonic series would make Calmar non-finite). ``fetched_at`` is backdated a
     minute (still fresh within TTL) so a sub-second backward clock jiggle (WSL/CI)
     can't read the just-written cache as 'in the future' and refuse it."""
-    idx = pd.bdate_range(end=pd.Timestamp.today().normalize(), periods=n)
+    idx = pd.bdate_range("2024-01-01", pd.Timestamp.today().normalize())
+    n = len(idx)
     vals = [base * (1.0 + 0.03 * math.sin(i / 4.0) + 0.0003 * i) for i in range(n)]
     df = pd.DataFrame(
         {
@@ -530,8 +535,12 @@ def test_risk_report_undefined_ratio_is_null(
     )
     cache = tmp_path / "cache"
     cache.mkdir()
-    idx = pd.bdate_range(end=pd.Timestamp.today().normalize(), periods=320)
-    rising = pd.Series([100.0 * (1.0 + 0.001 * i) for i in range(320)], index=idx, dtype=float)
+    # Spans the 2024-01-02 buy (a series starting after the trade would be F3-excluded
+    # from risk) and ends today (a stale tail would be F1-unpriced).
+    idx = pd.bdate_range("2024-01-01", pd.Timestamp.today().normalize())
+    rising = pd.Series(
+        [100.0 * (1.0 + 0.001 * i) for i in range(len(idx))], index=idx, dtype=float
+    )
     prices_mod._write_series_cache("UP", rising, cache)
     monkeypatch.delenv("ASSET_CSV", raising=False)
     monkeypatch.setenv("ASSET_BOOK", str(csv))
@@ -772,13 +781,18 @@ def test_risk_report_carries_provenance(warm_book: Path) -> None:
 
 
 def test_provenance_price_asof_matches_holdings(warm_book: Path) -> None:
-    # The rollup's newest close date equals the latest per-holding price date — one
-    # honest 'as of' for the whole tool, derived from the same prices.
+    # The rollup's newest close date equals the latest close the fixture cache holds —
+    # one honest 'as of' for the whole tool, derived from the same prices. The expected
+    # date is derived from the FIXTURE's own construction (bdate_range snaps to the last
+    # business day), NOT from the wall clock: on a Saturday the honest answer is Friday's
+    # close, and asserting equality with today made this test fail every weekend.
     res = _call("portfolio_summary")
     sc = res.structuredContent
     assert sc is not None
-    # every holding priced from the same fresh cache → the rollup asof is that date
-    assert sc["provenance"]["price_asof"] == sc["returns"]["asof"]
+    last_bday = pd.bdate_range(end=pd.Timestamp.today().normalize(), periods=1)[-1]
+    assert sc["provenance"]["price_asof"] == last_bday.date().isoformat()
+    # both holdings share the one fixture cache → the oldest close is the same date
+    assert sc["provenance"]["oldest_close"] == sc["provenance"]["price_asof"]
 
 
 def test_provenance_stalest_is_the_max_age_not_the_min(
@@ -805,6 +819,30 @@ def test_provenance_stalest_is_the_max_age_not_the_min(
     assert prov.stalest_fetch_hours == pytest.approx(50.0, abs=0.2)  # the older fetch wins
 
 
+def test_provenance_oldest_close_is_the_min_not_the_max() -> None:
+    # The F2 fix (fresh-eyes audit 2026-07-11): price_asof reports the NEWEST close, so a
+    # single stale holding among fresh ones was invisible in the receipt. oldest_close must
+    # report the other end — the min — or the one field added to expose staleness would
+    # itself hide it.
+    from datetime import date, datetime, timedelta, timezone
+
+    from app.derive import DerivedState
+    from app.mcp_server import _Build, _data_provenance
+    from app.prices import PriceRow
+
+    now = datetime.now(timezone.utc)
+    today = date.today()
+    fresh = PriceRow("AAA", today, 100.0, "cache", now)
+    stale = PriceRow("BBB", today - timedelta(days=900), 50.0, "cache", now)
+    b = _Build(
+        state=DerivedState(), prices={"AAA": fresh, "BBB": stale},
+        returns=None, risk=None, missing=[], dollar_dd=None,
+    )
+    prov = _data_provenance(b)
+    assert prov.price_asof == today
+    assert prov.oldest_close == today - timedelta(days=900)
+
+
 def test_provenance_falls_back_to_series_when_no_current_holdings() -> None:
     # A fully-exited book: risk_report computes real numbers from the price HISTORY while
     # b.prices (current holdings) is empty. Provenance must stamp the series, not return an
@@ -829,6 +867,11 @@ def test_provenance_falls_back_to_series_when_no_current_holdings() -> None:
     assert prov.sources == ["cache"]  # stamped from the series, not all-null
     assert prov.price_asof == idx[-1].date()
     assert prov.stalest_fetch_hours == pytest.approx(3.0, abs=0.2)
+    # oldest_close means "the stalest quote a HOLDING is valued at"; nothing is held on
+    # this branch and the series set includes long-sold tickers, so it must be null —
+    # a min over the tails would report a sold (possibly delisted) position as a stale
+    # holding and invite a false narration (review finding #5).
+    assert prov.oldest_close is None
 
 
 def test_provenance_empty_when_no_data_at_all() -> None:

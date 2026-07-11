@@ -1039,7 +1039,9 @@ def test_run_summary_counts_prices_on_series_path(
     # fallbacks_used must reflect the series provenance.
     import pandas as pd
 
-    dates = pd.bdate_range("2024-01-01", periods=400)
+    # end=today: a stale tail would be refused as a current price (F1) and n_prices_fetched
+    # would honestly read 0 — this test is about the counters, not the floor.
+    dates = pd.bdate_range(end=pd.Timestamp.today().normalize(), periods=400)
 
     def fake_series(tickers, *a, **k):  # type: ignore[no-untyped-def]
         rows = {
@@ -1194,12 +1196,20 @@ def test_nonpositive_priced_holding_suppresses_money_weighted(
     # number computed over a partial book — while path-based TWR is preserved.
     import pandas as pd
 
-    dates = pd.bdate_range("2024-01-01", periods=400)
+    # Spans the SAMPLE book's first trade (2023-01-05) through today, with prices near
+    # each ticker's real recorded fills: a series starting after a trade is excluded
+    # from TWR (F3), a stale tail is unpriced (F1), and a fill >2× off the series flags
+    # as a split mismatch — this test needs TWR alive and ONLY the VOO tail unusable.
+    dates = pd.bdate_range("2023-01-01", pd.Timestamp.today().normalize())
+    base = {"VOO": 400.0, "BND": 72.0, "IAU": 45.0, "VEA": 40.0}
 
     def fake_series(tickers, *a, **k):  # type: ignore[no-untyped-def]
         rows = {}
         for tk in tickers:
-            s = pd.Series([100.0 + i * 0.1 for i in range(400)], index=dates, dtype=float)
+            b = base.get(tk, 100.0)
+            s = pd.Series(
+                [b * (1.0 + 0.0003 * i) for i in range(len(dates))], index=dates, dtype=float
+            )
             if tk == "VOO":          # one held ticker gets an unusable tail price
                 s = s.copy()
                 s.iloc[-1] = float("nan")
@@ -1242,11 +1252,11 @@ def test_unhandled_split_ticker_excluded_from_twr_and_noted(
         "2024-02-01,VOO,buy,5,100,0\n",
         encoding="utf-8",
     )
-    dates = pd.bdate_range("2024-01-02", periods=400)
+    dates = pd.bdate_range("2024-01-02", pd.Timestamp.today().normalize())  # fresh tail (F1)
 
     def fake_series(tickers, *a, **k):  # type: ignore[no-untyped-def]
         rows = {
-            tk: pd.Series([100.0 + i * 0.05 for i in range(400)], index=dates, dtype=float)
+            tk: pd.Series([100.0 + i * 0.05 for i in range(len(dates))], index=dates, dtype=float)
             for tk in tickers
         }
         prov = {tk: ("cache", datetime.now(timezone.utc)) for tk in tickers}
@@ -1282,13 +1292,13 @@ def test_cash_pseudo_ticker_not_fetched_no_false_partial(
         "2024-06-03,CASH,withdraw,0,200,0\n",
         encoding="utf-8",
     )
-    dates = pd.bdate_range("2024-01-02", periods=400)
+    dates = pd.bdate_range("2024-01-02", pd.Timestamp.today().normalize())  # fresh tail (F1)
     asked: list[str] = []
 
     def fake_series(tickers, *a, **k):  # type: ignore[no-untyped-def]
         asked.extend(tickers)
         rows = {
-            tk: pd.Series([100.0 + i * 0.05 for i in range(400)], index=dates, dtype=float)
+            tk: pd.Series([100.0 + i * 0.05 for i in range(len(dates))], index=dates, dtype=float)
             for tk in tickers
         }
         prov = {tk: ("cache", datetime.now(timezone.utc)) for tk in tickers}
@@ -1322,11 +1332,11 @@ def test_split_handled_by_adjustment_keeps_ticker_in_twr(
         "2024-02-01,VOO,buy,5,100,0\n",
         encoding="utf-8",
     )
-    dates = pd.bdate_range("2024-01-02", periods=400)
+    dates = pd.bdate_range("2024-01-02", pd.Timestamp.today().normalize())  # fresh tail (F1)
 
     def fake_series(tickers, *a, **k):  # type: ignore[no-untyped-def]
         rows = {
-            tk: pd.Series([100.0 + i * 0.05 for i in range(400)], index=dates, dtype=float)
+            tk: pd.Series([100.0 + i * 0.05 for i in range(len(dates))], index=dates, dtype=float)
             for tk in tickers
         }
         prov = {tk: ("cache", datetime.now(timezone.utc)) for tk in tickers}
@@ -1352,11 +1362,15 @@ def test_split_handled_by_adjustment_keeps_ticker_in_twr(
 
 
 def _flat_series(tickers, *_a, **_k):  # type: ignore[no-untyped-def]
+    # Ends at TODAY, like live data: the pipeline refuses a series tail older than the
+    # staleness floor as a current price (F1), so a fixture frozen in the past would
+    # leave every holding unpriced.
     import pandas as pd
 
-    dates = pd.bdate_range("2024-01-01", periods=300)
+    dates = pd.bdate_range("2024-01-01", pd.Timestamp.today().normalize())
+    n = len(dates)
     rows = {
-        tk: pd.Series([100.0 + i * 0.1 for i in range(300)], index=dates, dtype=float)
+        tk: pd.Series([100.0 + i * 0.1 for i in range(n)], index=dates, dtype=float)
         for tk in tickers
     }
     prov = {tk: ("cache", datetime.now(timezone.utc)) for tk in tickers}
@@ -1366,12 +1380,13 @@ def _flat_series(tickers, *_a, **_k):  # type: ignore[no-untyped-def]
 def _split_vol_series(tickers, *_a, **_k):  # type: ignore[no-untyped-def]
     import pandas as pd
 
-    dates = pd.bdate_range("2024-01-01", periods=300)
+    dates = pd.bdate_range("2024-01-01", pd.Timestamp.today().normalize())  # fresh tail (F1)
+    n = len(dates)
     rows = {}
     for tk in tickers:  # BND/IAU calm, the rest bumpy → different volatilities
         step = 0.05 if tk in ("BND", "IAU") else 8.0
         rows[tk] = pd.Series(
-            [100.0 + (i % 2) * step for i in range(300)], index=dates, dtype=float
+            [100.0 + (i % 2) * step for i in range(n)], index=dates, dtype=float
         )
     return SeriesResult(rows=rows, missing=[], provenance={})
 
@@ -1448,11 +1463,11 @@ def test_allocate_surfaces_omitted_holding(
     # rebalance it would be sold. The preview must surface that before the user acts.
     import pandas as pd
 
-    dates = pd.bdate_range("2024-01-01", periods=300)
+    dates = pd.bdate_range("2024-01-01", pd.Timestamp.today().normalize())  # fresh tail (F1)
 
     def drop_voo(tickers, *_a, **_k):  # type: ignore[no-untyped-def]
         rows = {
-            tk: pd.Series([100.0 + i * 0.1 for i in range(300)], index=dates, dtype=float)
+            tk: pd.Series([100.0 + i * 0.1 for i in range(len(dates))], index=dates, dtype=float)
             for tk in tickers if tk != "VOO"
         }
         missing = ["VOO"] if "VOO" in tickers else []

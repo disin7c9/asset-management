@@ -28,6 +28,7 @@ from app.derive import DerivedState, derive
 from app.events import CASH_TICKER, Event, load_events
 from app.metadata import MetadataResult, SecurityMeta, fetch_metadata
 from app.prices import (
+    STALE_PRICE_FLOOR,
     PriceRow,
     PricesResult,
     SeriesResult,
@@ -218,6 +219,7 @@ def compute_prices_returns_risk(
     risk: RiskSummary | None = None
     true_twr: float | None = None
     twr_excluded: list[str] = []
+    stale_tails: list[str] = []  # held tickers whose series tail is beyond the floor
     dollar_dd: DollarDrawdown | None = None
     daily: pd.Series[float] | None = None
 
@@ -231,23 +233,48 @@ def compute_prices_returns_risk(
         series = fetch_series(traded, start, today, cache_dir=cache_dir, online=online)
         record_series_fetch(run, series)
         if series.rows:
-            # Safety net for a price-basis mismatch: the log holds raw share counts while
-            # yfinance prices are split-adjusted. Splits ARE adjusted upstream
-            # (corporate_actions), but if that can't reconcile — an unfetched/unavailable
-            # split, or an off-market recorded entry price — the time-weighted series would
-            # mix bases and fabricate a return, so exclude such a ticker from TWR + risk (and
-            # warn); MWR / Modified Dietz, computed from cash flows, are unaffected.
-            twr_series = series.rows
-            twr_excluded = price_basis_mismatches(events, series.rows)
-            if twr_excluded:
+            # A currently-HELD ticker whose series tail is older than the floor (a
+            # delisted / halted position) must leave the time-weighted series too, not
+            # just the spot-price dict below: `value_curve` forward-fills the last close
+            # across the gap, so risk/TWR would otherwise carry the position flat at the
+            # very quote the pricing loop refuses — biasing volatility and drawdown
+            # shallower, unflagged. Sold positions are exempt: zero shares after the
+            # sale contribute nothing to the curve, and their history is real history.
+            for tk in sorted(held):
+                s = series.rows.get(tk)
+                if s is None or s.empty:
+                    continue
+                tail = s.index[-1].date()
+                if today - tail > STALE_PRICE_FLOOR:
+                    stale_tails.append(tk)
+                    log.warning(
+                        "%s: last available close is from %s (%d days before %s) — "
+                        "delisted, halted, or renamed? Refusing to value it at that "
+                        "stale price; the holding is reported unpriced and excluded "
+                        "from TWR & risk instead.",
+                        tk, tail, (today - tail).days, today,
+                    )
+            # Safety net for a trade the price history can't reconcile: either a basis
+            # mismatch (the log holds raw share counts while yfinance prices are split-
+            # adjusted; splits ARE adjusted upstream, but an unfetched split or an
+            # off-market entry price can still disagree) or a trade that predates the
+            # history (a left-truncated series). Both would fabricate a return into the
+            # time-weighted series, so exclude such a ticker from TWR + risk (and warn);
+            # MWR / Modified Dietz, computed from cash flows, are unaffected.
+            mismatched = price_basis_mismatches(events, series.rows)
+            if mismatched:
                 log.warning(
-                    "excluding %s from TWR & risk: the recorded execution price disagrees "
-                    "with the split-adjusted price history — an unfetched/unavailable split "
-                    "or an off-market entry price. The time-weighted series would mix raw "
-                    "share counts with adjusted prices and fabricate a return; MWR / Modified "
-                    "Dietz are unaffected.",
-                    ", ".join(twr_excluded),
+                    "excluding %s from TWR & risk: a trade can't be reconciled with the "
+                    "price history — the recorded execution price disagrees with the "
+                    "split-adjusted history (an unfetched/unavailable split or an "
+                    "off-market entry price), or the trade predates the history's first "
+                    "day (a truncated feed). Either would fabricate a return into the "
+                    "time-weighted series; MWR / Modified Dietz are unaffected.",
+                    ", ".join(mismatched),
                 )
+            twr_excluded = sorted(set(mismatched) | set(stale_tails))
+            twr_series = series.rows
+            if twr_excluded:
                 twr_series = {
                     tk: s for tk, s in series.rows.items() if tk not in twr_excluded
                 }
@@ -268,6 +295,15 @@ def compute_prices_returns_risk(
         for tk in held:
             s = series.rows.get(tk)
             if s is not None and not s.empty:
+                if tk in stale_tails:
+                    # The same staleness floor the offline latest path enforces (already
+                    # detected and warned above): a tail that old is a last-EVER close,
+                    # not a current price. Minting a PriceRow from it would value the
+                    # holding — and size rebalance trades — at a dead quote. Leaving it
+                    # unpriced routes it into the honesty machinery below (missing →
+                    # status "partial", MWR/Dietz and dollar-DD suppressed, rebalance
+                    # refused), and the exclusion above keeps it out of TWR & risk.
+                    continue
                 source, fetched_at = series.provenance.get(
                     tk, ("cache", datetime.now(timezone.utc))
                 )

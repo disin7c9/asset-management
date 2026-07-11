@@ -1,5 +1,6 @@
 """Pipeline cache-warming helpers: `cache_is_cold`, `benchmark_ref_tickers`, `warm_cache`,
-plus `held_market_value` — the one valuation sink.
+plus `held_market_value` — the one valuation sink — and the staleness floor on
+`compute_prices_returns_risk`'s series-tail pricing.
 
 The warm path is offline-first onboarding glue over the named fetch adapters, so these
 tests mock the adapters and assert which tickers each is asked for — never the network.
@@ -7,14 +8,17 @@ tests mock the adapters and assert which tickers each is asked for — never the
 
 from __future__ import annotations
 
+import math
 import os
 import time
 from datetime import date, datetime, timezone
 from pathlib import Path
 
+import pandas as pd
 import pytest
 
-from app.derive import DerivedState, Position
+from app.derive import DerivedState, Position, derive
+from app.events import Event
 from app.metadata import MetadataResult, SecurityMeta
 from app.pipeline import (
     _WARM_MARKER,
@@ -22,6 +26,7 @@ from app.pipeline import (
     benchmark_ref_tickers,
     cache_is_cold,
     candidate_and_held_facts,
+    compute_prices_returns_risk,
     default_cache_dir,
     held_market_value,
     warm_cache,
@@ -53,6 +58,174 @@ def test_held_market_value_drops_every_unusable_close(close: float, usable: bool
     assert ("VOO" in out) is usable
     if usable:
         assert out["VOO"] == pytest.approx(20.0)
+
+
+# ── the staleness floor on series-tail pricing (F1, fresh-eyes audit 2026-07-11) ──
+
+
+def _wavy_series(base: float, *, tail_age_days: int, n: int = 300) -> "pd.Series[float]":
+    """A daily close series whose LAST row is ~tail_age_days before today. The gentle
+    oscillation keeps drawdowns/ratios finite; values stay within ±~12% of base so a
+    buy priced off the series can't trip the 2× basis-mismatch guard."""
+    end = pd.Timestamp.today().normalize() - pd.Timedelta(days=tail_age_days)
+    idx = pd.bdate_range(end=end, periods=n)
+    vals = [base * (1.0 + 0.03 * math.sin(i / 4.0) + 0.0003 * i) for i in range(n)]
+    return pd.Series(vals, index=idx)
+
+
+def _buy(s: "pd.Series[float]", ticker: str, i: int = 10) -> Event:
+    """A buy executed AT the series' own close on its i-th day — basis-consistent."""
+    return Event(
+        date=s.index[i].date(), ticker=ticker, action="buy",
+        quantity=10.0, price=float(s.iloc[i]), fee=0.0,
+    )
+
+
+def _run_pipeline(
+    series_by_ticker: dict[str, "pd.Series[float]"],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> tuple[dict[str, object], object]:
+    """compute_prices_returns_risk over mocked fetch_series → (run dict, result tuple)."""
+    now = datetime.now(timezone.utc)
+    result = SeriesResult(
+        rows=dict(series_by_ticker),
+        missing=[],
+        provenance={tk: ("cache", now) for tk in series_by_ticker},
+    )
+    monkeypatch.setattr("app.pipeline.fetch_series", lambda *a, **k: result)
+    events = [_buy(s, tk) for tk, s in sorted(series_by_ticker.items())]
+    run: dict[str, object] = {
+        "n_series_fetched": 0, "n_series_missing": 0, "fallbacks_used": 0, "status": "ok",
+    }
+    out = compute_prices_returns_risk(
+        events, derive(events), no_risk=False, offline=True,
+        cache_dir=tmp_path, today=date.today(), run=run,
+    )
+    return run, out
+
+
+def test_stale_series_tail_is_refused_as_a_current_price(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # THE audit P0 (F1): a delisted/halted ticker's series ends at its last-ever close, and
+    # the series-tail path minted a "current" PriceRow from it with no age check — ATVI was
+    # valued at its 2023 close, 33 months on, with status "ok". Past the 10-day floor the
+    # holding must flow into the partial-pricing machinery instead: unpriced, status
+    # "partial", felt-dollar drawdown suppressed, money-weighted returns suppressed —
+    # AND excluded from TWR & risk (review finding #1: value_curve forward-fills the last
+    # close across the gap, so leaving the dead series in the curve would let the risk
+    # panel quietly value the position at the very quote the pricing loop refuses).
+    run, (prices, returns, risk, missing, twr_excluded, dollar_dd, _series, daily) = (
+        _run_pipeline(
+            {"LIVE": _wavy_series(100.0, tail_age_days=0),
+             "DEAD": _wavy_series(90.0, tail_age_days=30)},
+            monkeypatch, tmp_path,
+        )
+    )
+    assert prices is not None and "LIVE" in prices and "DEAD" not in prices
+    assert missing == ["DEAD"]
+    assert twr_excluded == ["DEAD"]     # out of the risk/TWR curve, not flat-carried in it
+    assert risk is not None             # the LIVE-only panel still computes
+    assert run["status"] == "partial"
+    assert dollar_dd is None            # incomplete P&L curve → n/a, not a confident number
+    assert returns is not None and returns.money_weighted_annualized is None
+
+
+def test_sold_position_with_a_dead_history_stays_in_twr(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The stale-tail exclusion is for HELD positions only: a ticker sold before its data
+    # ended contributes zero shares (hence zero value) after the sale, and its held-period
+    # history is real history — excluding it would silently drop a genuine past position
+    # from the time-weighted record.
+    live = _wavy_series(100.0, tail_age_days=0)
+    dead = _wavy_series(90.0, tail_age_days=30)
+    now = datetime.now(timezone.utc)
+    result = SeriesResult(
+        rows={"LIVE": live, "DEAD": dead},
+        missing=[],
+        provenance={tk: ("cache", now) for tk in ("LIVE", "DEAD")},
+    )
+    monkeypatch.setattr("app.pipeline.fetch_series", lambda *a, **k: result)
+    events = [
+        _buy(live, "LIVE"),
+        _buy(dead, "DEAD", i=10),
+        Event(date=dead.index[50].date(), ticker="DEAD", action="sell",
+              quantity=10.0, price=float(dead.iloc[50]), fee=0.0),  # fully closed
+    ]
+    run: dict[str, object] = {
+        "n_series_fetched": 0, "n_series_missing": 0, "fallbacks_used": 0, "status": "ok",
+    }
+    prices, _returns, risk, missing, twr_excluded, dollar_dd, _series, _daily = (
+        compute_prices_returns_risk(
+            events, derive(events), no_risk=False, offline=True,
+            cache_dir=tmp_path, today=date.today(), run=run,
+        )
+    )
+    assert twr_excluded == []           # sold → exempt from the stale-tail exclusion
+    assert missing == [] and run["status"] == "ok"
+    assert prices is not None and set(prices) == {"LIVE"}  # DEAD isn't held, needs no price
+    assert risk is not None and dollar_dd is not None
+
+
+def test_fresh_series_tail_still_prices_normally(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Sibling lock: a tail a business-day-or-three old (any normal weekend/holiday gap)
+    # is well inside the floor — the F1 refusal must not degrade the everyday case.
+    run, (prices, returns, _risk, missing, _twr_excl, dollar_dd, _series, _daily) = (
+        _run_pipeline(
+            {"AAA": _wavy_series(100.0, tail_age_days=0),
+             "BBB": _wavy_series(50.0, tail_age_days=0)},
+            monkeypatch, tmp_path,
+        )
+    )
+    assert prices is not None and set(prices) == {"AAA", "BBB"}
+    assert missing == []
+    assert run["status"] == "ok"
+    assert dollar_dd is not None
+    assert returns is not None and returns.money_weighted_annualized is not None
+
+
+def test_left_truncated_series_is_excluded_not_a_phantom_crash(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # F3 end-to-end: TRUNC's history starts ~100 business days ago but its buy is ~a year
+    # old (a provider serving a shorter history than the holding). Before the left-edge
+    # guard, the buy's cash preceded any TRUNC value in the curve → a fabricated ~−100%
+    # day into max-DD/Ulcer/TWR. Now the ticker gets the split-mismatch treatment:
+    # excluded from the time-weighted series (and dollar-DD suppressed), while it stays
+    # PRICED — its tail is fresh, so holdings/market value are unaffected.
+    live = _wavy_series(100.0, tail_age_days=0)          # 300 bdays, covers its buy
+    trunc = _wavy_series(90.0, tail_age_days=0, n=100)   # starts AFTER the buy below
+    now = datetime.now(timezone.utc)
+    result = SeriesResult(
+        rows={"LIVE": live, "TRUNC": trunc},
+        missing=[],
+        provenance={tk: ("cache", now) for tk in ("LIVE", "TRUNC")},
+    )
+    monkeypatch.setattr("app.pipeline.fetch_series", lambda *a, **k: result)
+    events = [
+        _buy(live, "LIVE"),
+        Event(date=live.index[10].date(), ticker="TRUNC", action="buy",
+              quantity=10.0, price=90.0, fee=0.0),  # predates trunc.index[0]
+    ]
+    run: dict[str, object] = {
+        "n_series_fetched": 0, "n_series_missing": 0, "fallbacks_used": 0, "status": "ok",
+    }
+    prices, _returns, risk, missing, twr_excluded, dollar_dd, _series, daily = (
+        compute_prices_returns_risk(
+            events, derive(events), no_risk=False, offline=True,
+            cache_dir=tmp_path, today=date.today(), run=run,
+        )
+    )
+    assert twr_excluded == ["TRUNC"]
+    assert prices is not None and set(prices) == {"LIVE", "TRUNC"}  # still valued
+    assert missing == [] and run["status"] == "ok"
+    assert daily is not None and float(daily.min()) > -0.5  # no fabricated crash day
+    assert risk is not None
+    assert dollar_dd is None  # P&L curve omits TRUNC → suppressed, not confidently wrong
 
 
 def test_benchmark_ref_tickers_is_the_union_of_the_references() -> None:

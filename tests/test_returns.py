@@ -500,3 +500,23 @@ def test_price_basis_mismatches_handles_reverse_split_and_edges() -> None:
         Event(date(2024, 3, 1), "OK", "dividend", quantity=0.0, price=0.0, cash=5.0, fee=0.0),
     ]
     assert price_basis_mismatches(events, series) == ["RVRS"]
+
+
+def test_price_basis_mismatches_flags_a_trade_before_the_history_starts() -> None:
+    # F3 (fresh-eyes audit 2026-07-11): a series beginning AFTER the first buy used to be
+    # skipped (`continue` on no price at-or-before the trade) — but the buy's cash lands on
+    # the union calendar before the ticker has any value, fabricating a ~−100%/+100% day
+    # pair into the risk panel. The left edge must flag like the split fingerprint does.
+    dates = pd.date_range("2024-02-01", periods=5, freq="D")  # starts AFTER the buys below
+    series = {
+        "TRUNC": pd.Series([90.0] * 5, index=dates, dtype=float),
+        "FULL": pd.Series([100.0] * 5, index=dates, dtype=float),
+    }
+    events = [
+        Event(date(2024, 1, 10), "TRUNC", "buy", quantity=10.0, price=90.0, fee=0.0),
+        Event(date(2024, 2, 2), "FULL", "buy", quantity=10.0, price=100.0, fee=0.0),
+    ]
+    assert price_basis_mismatches(events, series) == ["TRUNC"]
+    # A later, in-history trade doesn't un-flag the ticker: the early one still poisons.
+    events.append(Event(date(2024, 2, 3), "TRUNC", "buy", quantity=1.0, price=90.0, fee=0.0))
+    assert price_basis_mismatches(events, series) == ["TRUNC"]

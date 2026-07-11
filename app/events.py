@@ -321,10 +321,12 @@ def _rows_to_events(rows: list[dict[str, Any]]) -> list[Event]:
     This is the single ingest seam, so every malformed row is caught HERE with a clear
     `ValueError` (which `--dry-run` and `load_book` already turn into a clean 'cannot import'
     + rc 2) rather than crashing downstream or booking a phantom trade: Action/Date/Code must
-    be present (guards a truncated row), and a buy/sell must carry a strictly-positive Price
-    and Quantity (guards an empty cell → silent $0, or a negative → shares added on a sell).
-    Ghostfolio rows are normalized upstream (never None; out-of-scope rows already skipped), so
-    this validation only bites malformed native CSV."""
+    be present (guards a truncated row), a buy/sell must carry a strictly-positive Price
+    and Quantity (guards an empty cell → silent $0, or a negative → shares added on a sell),
+    and Currency must be USD (guards a hand-written EUR row silently booked as dollars 1:1).
+    Ghostfolio rows are normalized upstream (never None; out-of-scope rows — including
+    non-USD — already skipped with a warning), so this validation only bites malformed
+    native CSV."""
     events: list[Event] = []
     for i, row in enumerate(rows, start=1):
         action = _parse_action(_require(row, "Action", rownum=i))
@@ -351,6 +353,22 @@ def _rows_to_events(rows: list[dict[str, Any]]) -> list[Event]:
         else:
             cash = 0.0
 
+        # USD-only, enforced — not just documented. This column was once parsed and then
+        # ignored, so a hand-written `EUR,650.00` row booked €650 as $650: cost basis,
+        # realized P&L, market value, and every cash flow silently wrong. A hard error
+        # (not warn-and-skip) because a native row is the user's own accounting — dropping
+        # it would silently change holdings. The Ghostfolio JSON path warns-and-skips its
+        # non-USD activities upstream instead (imported data, established behavior).
+        currency = (row.get("Currency") or "USD").strip().upper() or "USD"
+        if currency != "USD":
+            msg = (
+                f"data row {i} ({action} {code}): currency {currency!r} is not supported — "
+                "this tool is USD-only. A non-USD amount would be booked as dollars 1:1 "
+                "and silently corrupt cost basis, P&L, and market value; convert the row "
+                "to USD or remove it."
+            )
+            raise ValueError(msg)
+
         events.append(
             Event(
                 date=_parse_date(date_str),
@@ -360,7 +378,7 @@ def _rows_to_events(rows: list[dict[str, Any]]) -> list[Event]:
                 price=price,
                 fee=_to_float(row.get("Fee")),
                 cash=cash,
-                currency=(row.get("Currency") or "USD").strip() or "USD",
+                currency=currency,
                 source=(row.get("DataSource") or "MANUAL").strip() or "MANUAL",
                 note=(row.get("Note") or "").strip(),
             )

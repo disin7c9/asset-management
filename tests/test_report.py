@@ -236,6 +236,66 @@ def test_provenance_footer_real_source_and_deterministic(state) -> None:
     assert "20.0h" in out1   # P0-1: real age, not "0s"
 
 
+def test_stale_close_surfaces_in_footer_and_holdings_grid(state) -> None:
+    # F2 (fresh-eyes audit 2026-07-11): fetch age alone hid a stale QUOTE — a close from
+    # 2023 downloaded a second ago read "(age: 1s)". A close older than the floor must
+    # surface both in the footer (close-date range + ⚠) and beside the holding it prices.
+    gen = datetime(2026, 6, 4, 12, 0, tzinfo=timezone.utc)
+    px = {
+        "VOO": PriceRow("VOO", date(2026, 6, 3), 600.0, "cache", gen - timedelta(seconds=1)),
+        "BND": PriceRow("BND", date(2023, 10, 13), 94.42, "cache", gen - timedelta(seconds=1)),
+    }
+    out = render_text(build_report_data(state, px, generated_at=gen))
+    assert "closes 2026-06-03 .. 2023-10-13 ⚠" in out
+    assert "⚠ BND: price is the close from 2023-10-13" in out
+    assert "⚠ VOO" not in out  # the fresh row stays clean
+
+
+def test_near_floor_close_shows_dates_without_the_alarm(state) -> None:
+    # Between the 4-day display threshold and the 10-day floor (a legitimate offline
+    # cache tail): the close dates become visible, but no ⚠ — this is disclosure, not
+    # an error.
+    gen = datetime(2026, 6, 10, 12, 0, tzinfo=timezone.utc)
+    old = date(2026, 6, 4)  # 6 days before gen: > 4d display threshold, ≤ 10d floor
+    px = {
+        "VOO": PriceRow("VOO", old, 600.0, "cache", gen - timedelta(hours=1)),
+        "BND": PriceRow("BND", old, 73.0, "cache", gen - timedelta(hours=1)),
+    }
+    out = render_text(build_report_data(state, px, generated_at=gen))
+    assert "closes 2026-06-04" in out  # same date on both → single date, not a range
+    assert "2026-06-04 ⚠" not in out   # within the floor → no alarm mark
+
+
+def test_stale_close_display_uses_the_report_date_not_the_utc_render_day(state) -> None:
+    # Review finding #7: the pipeline gates staleness on the LOCAL as-of date while the
+    # render instant is UTC — near local midnight they are different days. The display
+    # must anchor on `asof` (the pipeline's day), not generated_at.date(): a KST morning
+    # run (UTC still on yesterday) would otherwise understate every close's lag by a day.
+    gen = datetime(2026, 6, 9, 22, 0, tzinfo=timezone.utc)  # 07:00 KST on 2026-06-10
+    asof = date(2026, 6, 10)                                 # the pipeline's local today
+    old = date(2026, 6, 5)  # 5 days before asof (shown); only 4 before gen.date() (hidden)
+    px = {
+        "VOO": PriceRow("VOO", old, 600.0, "cache", gen - timedelta(hours=1)),
+        "BND": PriceRow("BND", old, 73.0, "cache", gen - timedelta(hours=1)),
+    }
+    out = render_text(build_report_data(state, px, generated_at=gen, asof=asof))
+    assert "closes 2026-06-05" in out           # judged against asof: 5d > the 4d grace
+    assert "5d before this report" in out       # the grid note uses the same anchor
+
+
+def test_current_closes_keep_the_footer_clean(state) -> None:
+    # The everyday case (closes within a weekend/holiday gap of the report date) must
+    # not grow a closes suffix — the stale display is for stale prices only.
+    gen = datetime(2026, 6, 4, 12, 0, tzinfo=timezone.utc)
+    px = {
+        "VOO": PriceRow("VOO", date(2026, 6, 3), 600.0, "cache", gen - timedelta(hours=1)),
+        "BND": PriceRow("BND", date(2026, 6, 2), 73.0, "cache", gen - timedelta(hours=1)),
+    }
+    out = render_text(build_report_data(state, px, generated_at=gen))
+    assert "closes" not in out
+    assert "⚠" not in out
+
+
 def test_suggestions_lead_and_render(state, prices, returns, risk) -> None:
     sugs = [
         Suggestion("VOO", "sell", 1000.0 / 300, 1000.0, 0.60, 0.50, "to_total",

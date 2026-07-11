@@ -897,6 +897,73 @@ def test_series_cache_stale_served_offline(tmp_path: Path) -> None:
     assert res.provenance["VOO"][0] == "cache"
 
 
+# ── fresh-but-short series cache (F6a, fresh-eyes audit 2026-07-11) ──────────
+
+
+def test_series_cache_fresh_but_short_is_served_not_refetched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A delisted/halted ticker's series can never cover `end` (its data simply stops), so
+    # the coverage check sent it back to the network on EVERY run, forever. A cache fetched
+    # fresh-within-TTL that still falls short means the provider had no newer rows — serve
+    # it; the pipeline's staleness floor decides whether the tail counts as a current price.
+    today = date.today()
+    dead_days = [(today - timedelta(days=n)).isoformat() for n in (32, 31, 30)]
+    _write_series_cache(
+        tmp_path / "ATVI_series.parquet", dead_days, [93.0, 94.0, 94.42],
+        datetime.now(timezone.utc) - timedelta(hours=1),  # FRESH fetch, short data
+    )
+    monkeypatch.setattr(P, "_fetch_yf", lambda *a, **k: pytest.fail("yf must not be re-asked"))
+    monkeypatch.setattr(
+        P, "_fetch_tiingo_json", lambda *a, **k: pytest.fail("tiingo must not be re-asked")
+    )
+    res = fetch_series(["ATVI"], today - timedelta(days=40), today, cache_dir=tmp_path)
+    assert res.missing == []
+    assert res.provenance["ATVI"][0] == "cache"
+    assert float(res.rows["ATVI"].iloc[-1]) == 94.42
+
+
+def test_series_cache_stale_and_short_is_refetched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The freshness carve-out is TTL-bounded: once the short cache ages past the TTL the
+    # provider IS re-asked (≈ one fetch per day), catching a resumed/late-filled feed.
+    today = date.today()
+    dead_days = [(today - timedelta(days=n)).isoformat() for n in (32, 31, 30)]
+    _write_series_cache(
+        tmp_path / "ATVI_series.parquet", dead_days, [93.0, 94.0, 94.42],
+        datetime.now(timezone.utc) - timedelta(days=3),  # STALE fetch → re-ask
+    )
+    monkeypatch.setattr(
+        P, "_fetch_yf",
+        lambda t, s, e: _fake_yf_history([10.0, 11.0, 12.0], today - timedelta(days=2)),
+    )
+    monkeypatch.setattr(P, "_fetch_tiingo_json", lambda t, s, e: None)
+    res = fetch_series(["ATVI"], today - timedelta(days=40), today, cache_dir=tmp_path)
+    assert res.provenance["ATVI"][0] == "yfinance"  # went live, not the old cache
+
+
+def test_series_cache_fresh_but_entirely_before_start_is_refetched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Guard on the carve-out: a fresh-but-short cache whose data ends BEFORE the requested
+    # window must not serve an empty slice — that's a cache miss, go live.
+    today = date.today()
+    old_days = [(today - timedelta(days=n)).isoformat() for n in (60, 59, 58)]
+    _write_series_cache(
+        tmp_path / "VOO_series.parquet", old_days, [1.0, 2.0, 3.0],
+        datetime.now(timezone.utc) - timedelta(hours=1),  # fresh, but out of window
+    )
+    monkeypatch.setattr(
+        P, "_fetch_yf",
+        lambda t, s, e: _fake_yf_history([10.0, 11.0, 12.0], today - timedelta(days=2)),
+    )
+    monkeypatch.setattr(P, "_fetch_tiingo_json", lambda t, s, e: None)
+    res = fetch_series(["VOO"], today - timedelta(days=40), today, cache_dir=tmp_path)
+    assert res.provenance["VOO"][0] == "yfinance"
+    assert list(res.rows["VOO"].round(1)) == [10.0, 11.0, 12.0]
+
+
 def test_latest_series_future_stamp_still_refused_offline(tmp_path: Path) -> None:
     # Age-tolerance must NOT weaken the future-stamp guard: a future fetched_at is
     # corruption / clock-skew, not mere staleness, so it is rejected even offline.

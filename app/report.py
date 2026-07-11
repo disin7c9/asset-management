@@ -29,7 +29,7 @@ from app.backtest import BacktestLeg, BacktestResult, BenchmarkResult
 from app.derive import DerivedState
 from app.discover import Discovery
 from app.metadata import MetadataResult
-from app.prices import PriceRow
+from app.prices import STALE_CLOSE_GRACE, STALE_PRICE_FLOOR, PriceRow
 from app.returns import ReturnsSummary
 from app.risk import NOISY_THRESHOLD_DAYS, DollarDrawdown, DrawdownInfo, MetricCI, RiskSummary
 from app.screen import CandidateScreen
@@ -144,12 +144,15 @@ def build_report_data(
     When present, SUGGESTED ACTIONS leads (it's the call-to-action the user opens
     the brief for); the drawdown-first risk/return context follows.
 
-    `asof` dates the report (its title and the ``reports/<asof>.md`` filename).
-    `generated_at` is the run's wall-clock instant, used for the provenance
-    footer's price-age and "as of HH:MM" stamp. BOTH are passed by the
-    composition root so this function is **pure** (same inputs → same output) —
-    no hidden clock read. The lone `datetime.now()` fallback below is for callers
-    that don't supply one (tests); cli always passes the real value.
+    `asof` dates the report (its title, the ``reports/<asof>.md`` filename, and the
+    stale-close comparisons in the holdings grid + footer — the SAME local date the
+    pipeline's staleness floor gated on, so the display can never disagree with the
+    gate across a midnight/UTC boundary). `generated_at` is the run's wall-clock
+    instant, used for the provenance footer's fetch-age and "as of HH:MM" stamp.
+    BOTH are passed by the composition root so this function is **pure** (same
+    inputs → same output) — no hidden clock read. The lone `datetime.now()`
+    fallback below is for callers that don't supply one (tests); cli always passes
+    the real value.
     """
     prices = prices or {}
     missing_tickers = missing_tickers or []
@@ -172,7 +175,7 @@ def build_report_data(
     if returns is not None and returns.period_days > 0:
         sections.append(_section_returns(returns, twr_excluded))
     if state.positions or prices:  # skip the empty holdings table on a no-book (backtest-only) run
-        sections.append(_section_holdings(state, prices))
+        sections.append(_section_holdings(state, prices, report_date=asof))
     if metadata is not None and (metadata.rows or metadata.missing):
         sections.append(_section_securities(metadata, asof))
     if candidates:
@@ -188,7 +191,7 @@ def build_report_data(
             sections.append(benchmark_summary)
         sections.append(_section_benchmark(benchmark))
 
-    footer = _footer_section(prices, missing_tickers, gen)
+    footer = _footer_section(prices, missing_tickers, gen, report_date=asof)
     if footer is not None:
         sections.append(footer)
 
@@ -316,8 +319,10 @@ def _section_returns(
     if twr_excluded:
         lines.append(
             f"  ⚠ excluded from TWR & risk: {', '.join(twr_excluded)} "
-            "(recorded price disagrees with split-adjusted history — an unfetched/unavailable "
-            "split or an off-market entry price; MWR/Dietz unaffected)."
+            "(the price history can't cover this position — an unfetched split, an "
+            "off-market entry price, a history starting after the first trade, or a "
+            "last close older than the staleness floor; money-weighted figures come "
+            "from cash flows, not this series)."
         )
     if any(
         v is None or not math.isfinite(v)
@@ -328,7 +333,9 @@ def _section_returns(
     return Section("RETURNS (annualized, 252-day basis)", tuple(lines))
 
 
-def _section_holdings(state: DerivedState, prices: dict[str, PriceRow]) -> Section:
+def _section_holdings(
+    state: DerivedState, prices: dict[str, PriceRow], *, report_date: date
+) -> Section:
     held = state.held()
     lines = [
         f"{'ticker':7}{'shares':>10}{'avg cost':>10}{'price':>9}"
@@ -339,6 +346,7 @@ def _section_holdings(state: DerivedState, prices: dict[str, PriceRow]) -> Secti
     total_mkt = 0.0
     total_unreal = 0.0
     n_priced = 0
+    stale_notes: list[str] = []
     for tk in sorted(held):
         p = held[tk]
         price = prices.get(tk)
@@ -351,6 +359,14 @@ def _section_holdings(state: DerivedState, prices: dict[str, PriceRow]) -> Secti
             price_str, mkt_str, unreal_str = (
                 f"{price.close:9.2f}", f"{mkt:13.2f}", f"{unreal:+12.2f}"
             )
+            lag = _stale_close_lag(price.asof_date, report_date)
+            if lag is not None:
+                # A row valued off a quote from last week (or older) must say so
+                # next to the number (shared trigger: _stale_close_lag).
+                stale_notes.append(
+                    f"  ⚠ {tk}: price is the close from {price.asof_date} "
+                    f"({lag.days}d before this report)"
+                )
         else:
             price_str, mkt_str, unreal_str = f"{_NA:>9}", f"{_NA:>13}", f"{_NA:>12}"
         lines.append(
@@ -358,6 +374,7 @@ def _section_holdings(state: DerivedState, prices: dict[str, PriceRow]) -> Secti
             f"{mkt_str}{unreal_str}{state.realized[tk]:+12.2f}"
         )
     lines.append("-" * 73)
+    lines.extend(stale_notes)
 
     cost = state.total_cost_basis()
     real = state.total_realized()
@@ -568,15 +585,30 @@ def _section_benchmark(bm: BenchmarkResult) -> Section:
 
 
 def _footer_section(
-    prices: dict[str, PriceRow], missing_tickers: list[str], generated_at: datetime
+    prices: dict[str, PriceRow],
+    missing_tickers: list[str],
+    generated_at: datetime,
+    *,
+    report_date: date,
 ) -> Section | None:
     lines: list[str] = []
     if missing_tickers:
         lines.append(f"Prices unavailable for: {', '.join(sorted(missing_tickers))}")
     if prices:
-        lines.append(_provenance_footer(prices, generated_at))
+        lines.append(_provenance_footer(prices, generated_at, report_date=report_date))
     lines.append(_DISCLAIMER)
     return Section("", tuple(lines))
+
+
+def _stale_close_lag(close: date, report_date: date) -> timedelta | None:
+    """How far a close lags the report date, when beyond the normal market gap
+    (`prices.STALE_CLOSE_GRACE` — a weekend + holiday cluster stays None). The ONE
+    trigger for both stale-close displays — the holdings-grid row notes and the
+    footer's close-date range — so the two can never disagree about which quote
+    deserves a flag. `report_date` is the report's as-of date (the same local date
+    the pipeline's staleness floor gated on), NOT the UTC render instant."""
+    lag = report_date - close
+    return lag if lag > STALE_CLOSE_GRACE else None
 
 
 def _format_timedelta(td: timedelta) -> str:
@@ -590,12 +622,23 @@ def _format_timedelta(td: timedelta) -> str:
     return f"{total / 86400:.1f}d"
 
 
-def _provenance_footer(prices: dict[str, PriceRow], generated_at: datetime) -> str:
+def _provenance_footer(
+    prices: dict[str, PriceRow], generated_at: datetime, *, report_date: date
+) -> str:
     """One-line summary of where the prices came from + how fresh they are.
 
-    Age is measured against `generated_at` (the run instant), not the wall clock,
-    so the footer is deterministic given (prices, generated_at) and the age is the
-    *real* staleness (now − the price's true fetched_at), not a fabricated 0s."""
+    Fetch age is measured against `generated_at` (the run instant), not the wall
+    clock, so the footer is deterministic given its inputs and the age is the *real*
+    staleness (now − the price's true fetched_at), not a fabricated 0s.
+
+    Fetch age alone can hide a stale quote — a close from years ago downloaded one
+    second ago reads "(age: 1s)". So when any close date lags `report_date` beyond
+    the market-gap grace (`_stale_close_lag`), the close-date range is appended too;
+    beyond `STALE_PRICE_FLOOR` it gets a ⚠ (the pipeline refuses such prices
+    upstream, so the ⚠ arm is a display-side safety net, not the primary defense).
+    The close lag uses `report_date` — the pipeline's own as-of day — NOT
+    `generated_at.date()`: the render instant is UTC, and near local midnight its
+    date is a different day than the one the staleness floor gated on."""
     by_source: Counter[str] = Counter(p.source for p in prices.values())
     src_parts = ", ".join(f"{n} {s}" for s, n in sorted(by_source.items()))
     ages = [max(generated_at - p.fetched_at, timedelta(0)) for p in prices.values()]
@@ -606,7 +649,20 @@ def _provenance_footer(prices: dict[str, PriceRow], generated_at: datetime) -> s
     else:
         fresh = f"{_format_timedelta(newest)} .. {_format_timedelta(oldest)} old"
     asof_now = generated_at.strftime("%Y-%m-%d %H:%M UTC")
-    return f"Prices: {src_parts}  (age: {fresh} as of {asof_now})"
+    closes = ""
+    close_dates = [p.asof_date for p in prices.values()]
+    if close_dates:
+        oldest_close, newest_close = min(close_dates), max(close_dates)
+        lag = _stale_close_lag(oldest_close, report_date)
+        if lag is not None:
+            mark = " ⚠" if lag > STALE_PRICE_FLOOR else ""
+            span = (
+                f"{newest_close} .. {oldest_close}"
+                if newest_close != oldest_close
+                else f"{oldest_close}"
+            )
+            closes = f"; closes {span}{mark}"
+    return f"Prices: {src_parts}  (age: {fresh} as of {asof_now}{closes})"
 
 
 # ── renderers: ReportData → str (one per output format) ─────────────────────
