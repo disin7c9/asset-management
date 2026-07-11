@@ -341,12 +341,12 @@ Confidence bands come from a moving-block bootstrap. Drawdown is *investment* (t
 
 ### Discovery & the curated universe
 
-`--discover` maps your holdings to roles (US large, emerging markets, TIPS, REITs, …), finds the roles you hold ≤3% of, takes the biggest funds in each from a **curated universe** (`data/universe.csv`, ~375 low-cost ETFs), and runs them through the **same screen** as `--screen` — printing a DISCOVERY panel, each candidate with its verdict (PASS/WARN/FAIL) and reasons. `--discover reit,tips` limits the roles; add `--narrate` for a fenced note ranking the picks by role-fit. A PASS is "sane, cheap, liquid, and genuinely different from what you hold" — never a prediction.
+`--discover` maps your holdings to roles (US large, emerging markets, TIPS, REITs, …), finds the roles you hold ≤3% of, takes the biggest funds in each from a **curated universe** (bundled `app/data/universe.csv`, ~375 low-cost ETFs), and runs them through the **same screen** as `--screen` — printing a DISCOVERY panel, each candidate with its verdict (PASS/WARN/FAIL) and reasons. `--discover reit,tips` limits the roles; add `--narrate` for a fenced note ranking the picks by role-fit. A PASS is "sane, cheap, liquid, and genuinely different from what you hold" — never a prediction.
 
 The universe is **auto-built** (and refreshable) — no hand-maintenance:
 
 ```bash
-uv run python scripts/build_universe.py --auto --out data/universe.csv
+uv run python scripts/build_universe.py --auto --out app/data/universe.csv
 ```
 
 It pulls the largest US ETFs per asset-class category from a screener (by fund *size*, not past returns — chasing performance is exactly the trap this avoids), drops leveraged/inverse, and keeps a small curated set for the few categories a screener can't isolate. Point `--discover` at your own list with `ASSET_UNIVERSE=path/to/universe.csv` in `.env`.
@@ -384,7 +384,7 @@ asset-management/
 │   ├── email.py      send the HTML brief via Resend (--send)
 │   ├── cli.py        argparse + entry composition + delivery routing + structured run log
 │   ├── mcp_server.py read-only stdio MCP server: 8 tools over the core (offline; one-time cold-call auto-warm, ASSET_MCP_OFFLINE=1 opts out)
-│   ├── universe.py   curated ETF universe loader (Candidate + roles); data/universe.csv, auto-built
+│   ├── universe.py   curated ETF universe loader (Candidate + roles); app/data/universe.csv, auto-built
 │   ├── discover.py   book → role gaps → top-by-AUM candidates for the screen (--discover, propose-only)
 │   ├── log_config.py logging setup
 │   ├── __main__.py   python -m app

@@ -201,7 +201,7 @@ def main(argv: list[str] | None = None) -> int:
         const="",
         default=None,
         help="suggest NEW tickers for the roles your book is light in, from the curated "
-        "universe (data/universe.csv), each judged by the same screen. Bare --discover "
+        "universe (bundled app/data/universe.csv), each judged by the same screen. Bare --discover "
         "covers every gap; --discover reit,tips targets specific roles. Needs the price "
         "pipeline; propose-only (no --rebalance/--backtest/--allocate in the same run).",
     )
@@ -994,11 +994,14 @@ def _warm_cache(
 
 def _load_universe(status_key: str, run: dict[str, Any]) -> list[Candidate] | None:
     """Load the curated universe — `ASSET_UNIVERSE` overrides (like `ASSET_BOOK`), else the
-    bundled `data/universe.csv`. On failure: log, set ``run[status_key]``, return None.
+    bundled `app/data/universe.csv`. Package-relative, NOT repo-relative: an installed run
+    (uvx / pip / the .mcpb bundle) has no checkout, only the wheel — the file must ship
+    inside the package (the demo book solved the same problem as a code constant).
+    On failure: log, set ``run[status_key]``, return None.
     Shared by `--discover` and the preset allocator."""
     universe_path = (
         _env_path("ASSET_UNIVERSE")
-        or Path(__file__).resolve().parent.parent / "data" / "universe.csv"
+        or Path(__file__).resolve().parent / "data" / "universe.csv"
     )
     try:
         return load_universe(universe_path)

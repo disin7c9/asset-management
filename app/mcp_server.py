@@ -261,12 +261,13 @@ def _load_offline(book_path: Path, cache: Path) -> tuple[list[Event], DerivedSta
 
 def _universe_path() -> Path:
     """The curated ETF universe `discover_gaps` reads. ``ASSET_UNIVERSE`` overrides the
-    default ``data/universe.csv`` (mirrors the CLI's override)."""
+    default ``app/data/universe.csv`` (mirrors the CLI's override). Package-relative so
+    an installed run (the .mcpb bundle, pip) finds the copy shipped inside the wheel."""
     raw = os.environ.get("ASSET_UNIVERSE", "").strip()
     if raw:
         p = Path(raw).expanduser()
         return p if p.is_absolute() else _REPO_ROOT / p
-    return _REPO_ROOT / "data" / "universe.csv"
+    return Path(__file__).resolve().parent / "data" / "universe.csv"
 
 
 # ── the one offline build (shared by every tool) ─────────────────────────────

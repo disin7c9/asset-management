@@ -332,7 +332,7 @@ def main() -> None:
     # are NOT here — the bundle carries GENERATED dev-free versions (see bundle_pyproject).
     files: list[Path] = [
         ROOT / "README.md",
-        ROOT / "data" / "universe.csv",  # discover_gaps / propose_allocation read it
+        ROOT / "app" / "data" / "universe.csv",  # discover_gaps / propose_allocation read it
         ROOT / "data" / "sample_data" / "transactions.csv",  # the demo default book
         *sorted((ROOT / "app").glob("*.py")),
     ]

@@ -1,5 +1,7 @@
 """Tests for the curated-universe loader (app/universe.py). Offline — fixture CSVs via
-tmp_path, plus a guard that the *committed* data/universe.csv always loads cleanly.
+tmp_path, plus guards that the *committed* app/data/universe.csv always loads cleanly and
+lives inside the package (the wheel ships only app/, so a repo-root path would strand
+installed runs).
 """
 
 from __future__ import annotations
@@ -66,8 +68,22 @@ def test_blank_rows_skipped_and_ticker_normalized(tmp_path: Path) -> None:
 def test_committed_universe_is_valid(caplog: pytest.LogCaptureFixture) -> None:
     # The real file must load cleanly: NO skipped rows (no warnings), known roles, name+summary.
     with caplog.at_level(logging.WARNING, logger="app.universe"):
-        u = load_universe(_REPO / "data" / "universe.csv")
+        u = load_universe(_REPO / "app" / "data" / "universe.csv")
     assert len(u) >= 10
     assert roles_in(u) <= ROLES
     assert all(c.name and c.summary for c in u)
     assert "skipping the row" not in caplog.text  # the committed file has no bad rows
+
+
+def test_bundled_universe_ships_inside_the_package(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The default the CLI/MCP resolve must live INSIDE app/ — the wheel packages only the
+    # app/ tree, so a repo-root data/ path exists in a checkout but NOT in an installed run
+    # (uvx / pip / .mcpb): --allocate presets and --discover would die "universe unavailable"
+    # exactly where the README's zero-setup demo sends a stranger.
+    import app
+    from app.mcp_server import _universe_path
+
+    monkeypatch.delenv("ASSET_UNIVERSE", raising=False)
+    default = _universe_path()
+    assert default.is_relative_to(Path(app.__file__).resolve().parent)
+    assert default.is_file()

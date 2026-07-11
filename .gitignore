@@ -16,12 +16,12 @@ __pycache__/
 .venv/
 venv/
 
-# Local data: private by default. Only data/sample_data/ + data/universe.csv are tracked
-# (the bundled example CSV + the curated discovery universe the CLI + tests use); everything
-# else under data/ — real broker exports in my_data/, the price cache in prices/ — stays local.
+# Local data: private by default. Only data/sample_data/ is tracked (the bundled example
+# CSV); everything else under data/ — real broker exports in my_data/, the price cache in
+# prices/ — stays local. The curated discovery universe lives INSIDE the package
+# (app/data/universe.csv) so installed runs (uvx / pip / .mcpb) get it from the wheel.
 data/*
 !data/sample_data/
-!data/universe.csv
 # Ghostfolio's own AGPL-3.0 test fixtures — kept locally for reference/validation only;
 # NOT ours to redistribute under this repo's license. Our tests use self-made fixtures.
 data/sample_data/sample.csv

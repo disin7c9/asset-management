@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Dev tool (NOT runtime) — seed/refresh ``data/universe.csv`` from yfinance.
+"""Dev tool (NOT runtime) — seed/refresh ``app/data/universe.csv`` from yfinance.
 
 For each ticker: fetch the fund's name + Morningstar-style category + business summary,
 best-effort map the category to our role vocabulary, and emit a universe CSV row for
@@ -9,8 +9,8 @@ app never rebuilds it at runtime. Anything the mapping can't place is tagged ``R
 uncommitted-unchecked — yfinance categories are messy and sometimes absent.
 
 Usage:
-    python scripts/build_universe.py VOO BND IAU VEA            # seed these tickers (-> stdout)
-    python scripts/build_universe.py --from data/universe.csv   # refresh the existing tickers
+    python scripts/build_universe.py VOO BND IAU VEA                # seed these tickers (-> stdout)
+    python scripts/build_universe.py --from app/data/universe.csv   # refresh the existing tickers
     python scripts/build_universe.py VWO LQD --out /tmp/seed.csv
 """
 
