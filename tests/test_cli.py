@@ -895,7 +895,7 @@ def test_narrate_does_not_pull_book_into_pure_backtest(
     assert rc == 0
     assert "=== BACKTEST" in out
     assert "=== HOLDINGS ===" not in out                       # book-free: no portfolio loaded
-    assert _run_summary(caplog)["source"] == "(no book; backtest-only)"
+    assert _run_summary(caplog)["source"] == "(no book)"
     assert "nothing to narrate" in caplog.text                 # no book SUMMARY, no benchmark note
 
 
@@ -930,7 +930,7 @@ def test_narrate_backtest_benchmark_is_book_free(
     out = capsys.readouterr().out
     assert rc == 0
     assert "=== HOLDINGS ===" not in out                       # book-free: no personal portfolio
-    assert _run_summary(caplog)["source"] == "(no book; backtest-only)"
+    assert _run_summary(caplog)["source"] == "(no book)"
     assert "couldn't tell them apart" in out                   # the benchmark note still rendered
     assert _run_summary(caplog)["benchmark_narrate"] == "test-model (paid)"
 
@@ -1774,6 +1774,70 @@ def test_onboard_rejected_with_screen_or_discover() -> None:
         main(["--csv", str(SAMPLE), "--screen", "QQQM", "--onboard"])
     with pytest.raises(SystemExit):
         main(["--csv", str(SAMPLE), "--discover", "--onboard"])
+
+
+# ── the bookless proposers: --onboard / --allocate <preset> with no book at all ──────────
+# The step-0 newcomer has no transaction log yet — that's WHO onboarding is for. The
+# presets are holdings-optional by design (every role falls back to a universe default),
+# so the CLI contract lets them run bookless; only the reweight rules still demand a book.
+
+
+def test_allocate_preset_runs_without_a_book(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str],
+) -> None:
+    # No --book, no ASSET_BOOK (autouse fixture pins it "") → pure universe defaults,
+    # fetched from nothing: an empty state holds no tickers, so no price round-trip.
+    out_csv = tmp_path / "starter.csv"
+    with caplog.at_level(logging.INFO):
+        rc = main(["--allocate", "moderate", "--allocate-out", str(out_csv)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "PROPOSED ALLOCATION: moderate" in out
+    w = _weights_from(out_csv)
+    assert abs(sum(w.values()) - 100.0) < 0.1  # a complete, normalized starting target
+    summary = _run_summary(caplog)
+    assert summary["allocate"] == "moderate"
+    assert summary["source"] == "(no book)"
+    assert summary["n_prices_fetched"] == 0  # nothing held → nothing priced
+
+
+def test_onboard_runs_without_a_book(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str],
+) -> None:
+    # The quiz itself is the step-0 entry point — it must not demand the transaction
+    # log its own persona doesn't have yet.
+    _answer_with(monkeypatch, ["1", "1", "1"])
+    with caplog.at_level(logging.INFO):
+        rc = main(["--onboard"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "Matched posture: CONSERVATIVE" in out
+    assert "PROPOSED ALLOCATION: conservative" in out
+    assert _run_summary(caplog)["onboard"] == "conservative"
+
+
+def test_allocate_reweight_without_a_book_errors_naming_why(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # equal_weight / inverse_vol re-weight CURRENT holdings — bookless they are
+    # meaningless. The error must say why AND teach the bookless alternative.
+    with pytest.raises(SystemExit) as excinfo:
+        main(["--allocate", "equal_weight"])
+    assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    assert "re-weights your CURRENT holdings" in err
+    assert "run with no book" in err  # the presets/--onboard escape is named
+
+
+def test_bookless_allocate_with_a_book_action_still_needs_the_book(
+    tmp_path: Path,
+) -> None:
+    # The exemption is scoped to the proposal itself: stacking a book action
+    # (--save reports YOUR holdings) onto a bookless proposal keeps the book contract.
+    with pytest.raises(SystemExit) as excinfo:
+        main(["--allocate", "moderate", "--save"])
+    assert excinfo.value.code == 2
 
 
 def test_onboard_matches_the_equivalent_allocate_preset(

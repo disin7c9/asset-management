@@ -297,8 +297,9 @@ def main(argv: list[str] | None = None) -> int:
         choices=sorted(VALID_RULES | PRESETS),
         default=None,
         help="propose a target allocation with this rule. equal_weight / inverse_vol "
-        "re-weight your CURRENT holdings; moderate / conservative / aggressive build a "
-        "strategic role-bucket template (your fund per role, or a universe default). Prints "
+        "re-weight your CURRENT holdings (book required); moderate / conservative / "
+        "aggressive build a strategic role-bucket template (your fund per role, or a "
+        "universe default) and run with no book at all — before your first trade. Prints "
         "the weights + writes them to --allocate-out if given. Propose-only — review, then run "
         "--backtest / --rebalance against the file in a SEPARATE command.",
     )
@@ -307,8 +308,9 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="step 0: answer 3 plain-language risk questions in the terminal and get a "
         "starting allocation matched to your answers (the conservative/moderate/aggressive "
-        "preset engine picks itself). Interactive — combine with --demo to try it on the "
-        "bundled example book, and --allocate-out FILE to save the result. Propose-only.",
+        "preset engine picks itself). Interactive; needs no book — with none, every role "
+        "fills from the curated universe. Add --allocate-out FILE to save the result. "
+        "Propose-only.",
     )
     parser.add_argument(
         "--allocate-out",
@@ -378,10 +380,17 @@ def main(argv: list[str] | None = None) -> int:
     # plain `--backtest --narrate` has nothing book-free to say (the SUMMARY is book-derived
     # and gated on a loaded book below). Listing it here would drag ASSET_BOOK — the user's
     # real portfolio — into a run documented as book-free (a privacy leak).
+    # --onboard and the preset --allocate rules are exempt too: they PROPOSE a role-bucket
+    # template and are holdings-OPTIONAL by design — with no book every role fills from the
+    # curated universe (the step-0 newcomer, before the first trade); a book, when present,
+    # only anchors each role on the fund already held. The two REWEIGHT rules
+    # (equal_weight / inverse_vol) read current holdings by definition, so they stay
+    # book-required — a dedicated error below says why, not just "pass a book".
     needs_book = bool(
-        args.rebalance or args.allocate or args.onboard or args.dump_target or args.save
+        args.rebalance or args.dump_target or args.save
         or args.send or args.metadata or args.screen or args.discover is not None
         or args.dry_run
+        or (args.allocate is not None and args.allocate not in PRESETS)
     )
     # Personal defaults from .env (gitignored; loaded above). ASSET_BOOK (or ASSET_CSV,
     # back-compat) fills --book for runs that want a book; a pure `--backtest --target` run
@@ -410,17 +419,25 @@ def main(argv: list[str] | None = None) -> int:
             parser.error(f"--demo needs a writable cache dir: {exc}")
     if args.book is None and (needs_book or not args.backtest):
         args.book = _env_path("ASSET_BOOK") or _env_path("ASSET_CSV")
+    if args.book is None and args.allocate is not None and args.allocate not in PRESETS:
+        parser.error(
+            f"--allocate {args.allocate} re-weights your CURRENT holdings, so it needs your "
+            "book (--book PATH, or ASSET_BOOK in .env); the presets (conservative | moderate "
+            "| aggressive) and --onboard propose from the curated universe and run with no "
+            "book at all"
+        )
     if args.book is None and needs_book:
         parser.error(
             "this run needs your transaction file — pass --book PATH (a Ghostfolio-compatible "
             "CSV or a Ghostfolio JSON export; or try the bundled example via --demo; "
             "or set ASSET_BOOK in .env). "
-            "Only '--backtest --target FILE' runs without --book."
+            "Only '--backtest --target FILE' and the bookless proposers "
+            "(--onboard, --allocate <preset>) run without --book."
         )
     today = date.today()  # one as-of date for the title, the filename, and the log
     run: dict[str, Any] = {
         "date": today.isoformat(),
-        "source": str(args.book) if args.book is not None else "(no book; backtest-only)",
+        "source": str(args.book) if args.book is not None else "(no book)",
         "n_events_replayed": 0,
         "n_prices_fetched": 0,
         "n_prices_missing": 0,
@@ -456,14 +473,17 @@ def main(argv: list[str] | None = None) -> int:
     if args.dry_run:
         return _dry_run(args, run)
 
-    # Nothing to do: no book and no notional backtest → guide, don't fabricate a brief.
-    if args.book is None and not args.backtest:
+    # Nothing to do: no book and no book-free action (notional backtest, or the bookless
+    # proposers --onboard / --allocate <preset>) → guide, don't fabricate a brief.
+    if args.book is None and not args.backtest and not args.allocate and not args.onboard:
         sys.stdout.write(
             "No portfolio given. Pass --book PATH (a Ghostfolio-compatible CSV or a Ghostfolio "
             "JSON export) to see your brief, e.g.\n"
             "  uv run python -m app --book your_transactions.csv\n"
             "or test-drive a bundled example portfolio first (no setup needed):\n"
             "  uv run python -m app --demo\n"
+            "or, before your first trade, get a STARTING allocation (3 questions, no book):\n"
+            "  uv run python -m app --onboard\n"
             "or set ASSET_BOOK=path/to/your-book in .env to make it the default.\n"
             "(to backtest a target without a book: --backtest --target FILE; "
             "see --help for all options)\n"

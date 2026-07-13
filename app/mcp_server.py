@@ -1033,7 +1033,11 @@ def _build_proposal(pset: str, benchmark: str, today: date) -> ProposedAllocatio
     validated preset; `benchmark` is validated here."""
     bench = _one_of(benchmark, BENCHMARKS, "benchmark", allow_none=True)
     b = _build(no_risk=True, today=today)
-    if not b.prices:
+    # Held-but-unpriced (cold cache) → refuse: silently ignoring real holdings would
+    # propose as if they didn't exist. An EMPTY book is different — the step-0 newcomer
+    # with no trades yet — and needs no prices at all: every role fills from the curated
+    # universe (mirrors the CLI's bookless --onboard / --allocate <preset>).
+    if b.state.held() and not b.prices:
         raise ValueError(_cold_error(
             "proposing an allocation needs your holdings priced from the cache, which is empty. "
             "Warm it once with `uv run python -m app --book <your-book> --warm`, then retry."

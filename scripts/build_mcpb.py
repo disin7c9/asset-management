@@ -143,6 +143,7 @@ def _manifest(version: str) -> dict[str, object]:
             "give it a minute and retry — the provisioning keeps running.*"
         ),
         "author": {"name": "disin7c9", "url": "https://github.com/disin7c9"},
+        "license": "AGPL-3.0-or-later",
         "repository": {"type": "git", "url": "https://github.com/disin7c9/asset-management"},
         "keywords": ["portfolio", "etf", "drawdown", "finance", "read-only", "backtest"],
         # Declare the tool surface (display metadata per MANIFEST.md — the runtime list
@@ -332,6 +333,7 @@ def main() -> None:
     # are NOT here — the bundle carries GENERATED dev-free versions (see bundle_pyproject).
     files: list[Path] = [
         ROOT / "README.md",
+        ROOT / "LICENSE",  # AGPL-3.0 — end users get the license text with the bundle
         ROOT / "app" / "data" / "universe.csv",  # discover_gaps / propose_allocation read it
         ROOT / "data" / "sample_data" / "transactions.csv",  # the demo default book
         *sorted((ROOT / "app").glob("*.py")),

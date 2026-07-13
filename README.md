@@ -44,10 +44,8 @@ or from a clone: `uv sync && uv run python -m app --demo` (needs Python 3.12 and
 **The full tour** (still the bundled book, ~a minute online) — the two commands below show the tool's characteristic features end to end: a preset target is *proposed*, then *validated* against a known 60-40 reference with a walk-forward held-out verdict, and threshold-band rebalance suggestions are laid out with the named rule behind every line, plus per-fund facts:
 
 ```bash
-uvx --from git+https://github.com/disin7c9/asset-management asset-management \
-    --demo --allocate moderate --allocate-out demo_target.csv
-uvx --from git+https://github.com/disin7c9/asset-management asset-management \
-    --demo --backtest --target demo_target.csv --benchmark 60-40 --rebalance bands --metadata
+uvx --from git+https://github.com/disin7c9/asset-management asset-management --demo --allocate moderate --allocate-out demo_target.csv
+uvx --from git+https://github.com/disin7c9/asset-management asset-management --demo --backtest --target demo_target.csv --benchmark 60-40 --rebalance bands --metadata
 ```
 
 Note what it *doesn't* say: the verdict reads like "no clear drawdown difference from 60-40; the paired bootstrap does not confirm the gap" when the evidence is thin — never "beats the benchmark". When the output earns your trust, the four steps below point it at your own money.
@@ -88,7 +86,7 @@ After that, `--offline` runs and the Claude Desktop addon serve entirely from th
 Most of the decision features (`--rebalance`, `--backtest`, the walk-forward checks) work toward a **target allocation** — a small CSV (`Ticker,Weight`) that *you* own and edit. Three ways to get one, by where you're starting from:
 
 - **You already hold a portfolio** → `--dump-target target.csv` writes your **current** allocation; edit it toward the mix you want. (A target is a *complete spec* — see [Rebalance modes](#rebalance-modes) for the exit semantics.)
-- **Start from a risk posture** → `--onboard` asks three plain questions in the terminal (horizon / loss response / cash buffer) and builds the matched preset; or pick it yourself with `--allocate conservative|moderate|aggressive`. Save with `--allocate-out target.csv`. These are strategic **role-bucket templates** (stocks / bonds / diversifiers split by posture, core-satellite within each bucket): a role you already hold resolves to *your* largest fund in it, a role you're missing is filled with a sensible default ETF from the curated universe.
+- **Start from a risk posture** → `--onboard` asks three plain questions in the terminal (horizon / loss response / cash buffer) and builds the matched preset; or pick it yourself with `--allocate conservative|moderate|aggressive`. Save with `--allocate-out target.csv`. Both run **with no book at all** — before your first trade, every role fills from the curated universe. These are strategic **role-bucket templates** (stocks / bonds / diversifiers split by posture, core-satellite within each bucket): a role you already hold resolves to *your* largest fund in it, a role you're missing is filled with a sensible default ETF from the curated universe.
 - **Explore and build it yourself** → `--discover` suggests screened ETFs for the roles you're light in; `--screen QQQM,SCHD` judges any candidate against your book (cost, liquidity, age, overlap, and whether it actually diversified *your* worst drawdowns). Then write the CSV by hand.
 
 Two simpler re-weighting rules also exist — `--allocate equal_weight` (1/N; the robust baseline) and `--allocate inverse_vol` (each holding contributes roughly the same *risk* rather than the same dollars; cap any single weight with `--allocate-cap 0.30`). Deliberately **not** included: return-forecasting optimizers (mean-variance / max-Sharpe) — they overfit, so they stay behind an *edge* gate for a later version.
@@ -108,8 +106,7 @@ simulates your target and the reference over their common history (notional $10k
 One command covers the routine check-in — the status brief, suggested actions when a band is breached, the backtest + benchmark verdict, and fund facts:
 
 ```bash
-uv run python -m app --book your.csv --backtest --target target.csv \
-  --benchmark permanent --rebalance bands --metadata        # + --narrate --save --send to taste
+uv run python -m app --book your.csv --backtest --target target.csv --benchmark permanent --rebalance bands --metadata        # + --narrate --save --send to taste
 ```
 
 - Pick the `--benchmark` reference nearest **your** posture (`60-40` / `all-weather` / `permanent`).
@@ -279,23 +276,6 @@ uv run python -m app --book your.csv --send        # also email the brief as HTM
 
 A `target.csv` is one you create with `--dump-target` / `--allocate-out` (or use `data/sample_data/target.csv`). `--allocate` is **propose-only** and cannot be combined with `--rebalance`/`--backtest`.
 
-### Rebalance modes
-
-A **target is a complete spec** (`--target path`, columns `Ticker,Weight`; weights are relative and normalized): any held ticker **not** listed is treated as an exit and sold to $0. So `--target` is *required* with `--rebalance` (no silent default), and the run **warns** listing any held tickers the target omits. To **close a position on purpose**, give it weight `0` — that's an explicit, warning-free exit; *omitting* it does the same but triggers the safety warning (the tool can't tell "forgot" from "meant it"). Modes:
-
-- `to_total` — sell + buy to hit the target exactly (cash-neutral; deploys `--new-cash` too)
-- `cash_flow_only` — invest `--new-cash` into underweights; never sell (tax-friendly)
-- `fixed_dca` — buy the target mix with `--new-cash`, ignoring drift
-- `bands` — like `to_total` but only act when a ticker's drift exceeds its band; rebalances existing holdings only (ignores `--new-cash`). The band is the **smaller** of an absolute `--band` (default 5pp) or `--band-rel` × the ticker's target weight (the **"5/25 rule"**, default 25%) — so a small sleeve isn't handed a band many times its own size; a 0% target → 0 band → always exits
-
-### Backtest details
-
-`--backtest --target T.csv` runs a **notional $10,000** historical simulation of that target and prints a **BACKTEST** panel comparing **rebalanced** (schedule via `--rebalance-every {monthly,quarterly,annually}`, default quarterly) vs **buy-and-hold** — drawdown-first (max drawdown, Ulcer, CDaR — each with a bootstrap CI), plus Sharpe/Sortino and returns. It's *notional*: it starts a clean $10k at the target weights on the earliest date all tickers have prices (`--backtest-start` to override), so it tests the *strategy*, independent of your actual buy timing. Labeled **a historical simulation, not a prediction**.
-
-A fixed rebalance policy fits no parameters, so the whole history is out-of-sample-clean (nothing to overfit). The **walk-forward train/test *selection*** machinery — needed only once a strategy *searches* (tunes parameters or picks among candidates: an optimizer, or an *edge* timing strategy) — is deliberately deferred; a **discipline-vs-edge gate** enforces that any future edge strategy must pass a walk-forward backtest before it may surface a suggestion. Today's rebalance modes are all *discipline*, so they suggest freely.
-
-With `--benchmark`, the held-out verdict resolves through three named gates: the **Ulcer gain** must clear a noise margin, **CDaR** (the worst-tail average) may tie but must not contradict the direction, and a **paired moving-block bootstrap CI** must confirm it — otherwise `inconclusive`, with the blocking gate named in the reason. Max drawdown and volatility are reported as context, voting nowhere: a single worst event is an extreme-value statistic, far too noisy on a short history to decide anything.
-
 ### Example output
 
 The shape `--demo` prints (drawdown leads, then risk-adjusted ratios, then returns, then holdings):
@@ -338,6 +318,24 @@ Generated by asset-management. Figures are deterministic and reconciled against 
 ```
 
 Confidence bands come from a moving-block bootstrap. Drawdown is *investment* (time-weighted) drawdown, not account-balance drawdown. The panel also reports **Gains given back** — the largest dollar decline in your cumulative market profit (the felt "how much did I watch evaporate"); it's flow-neutral, so deposits, withdrawals, and transfers don't distort it. Each run also emits one structured JSON log line (`run_summary`) on stderr: `{date, source, n_events_replayed, n_prices_fetched, n_prices_missing, n_series_fetched, n_series_missing, fallbacks_used, status, report_saved, email_sent, rebalance, backtest, allocate, dump_target, metadata, screen, narrate, discover, discover_narrate, benchmark_narrate, warm, onboard, dry_run}` (with `email_detail`/`error` present when relevant).
+
+### Rebalance modes
+
+A **target is a complete spec** (`--target path`, columns `Ticker,Weight`; weights are relative and normalized): any held ticker **not** listed is treated as an exit and sold to $0. So `--target` is *required* with `--rebalance` (no silent default), and the run **warns** listing any held tickers the target omits. To **close a position on purpose**, give it weight `0` — that's an explicit, warning-free exit; *omitting* it does the same but triggers the safety warning (the tool can't tell "forgot" from "meant it"). Modes:
+
+- `to_total` — sell + buy to hit the target exactly (cash-neutral; deploys `--new-cash` too)
+- `cash_flow_only` — invest `--new-cash` into underweights; never sell (tax-friendly)
+- `fixed_dca` — buy the target mix with `--new-cash`, ignoring drift
+- `bands` — like `to_total` but only act when a ticker's drift exceeds its band; rebalances existing holdings only (ignores `--new-cash`). The band is the **smaller** of an absolute `--band` (default 5pp) or `--band-rel` × the ticker's target weight (the **"5/25 rule"**, default 25%) — so a small sleeve isn't handed a band many times its own size; a 0% target → 0 band → always exits
+
+### Backtest details
+
+`--backtest --target T.csv` runs a **notional $10,000** historical simulation of that target and prints a **BACKTEST** panel comparing **rebalanced** (schedule via `--rebalance-every {monthly,quarterly,annually}`, default quarterly) vs **buy-and-hold** — drawdown-first (max drawdown, Ulcer, CDaR — each with a bootstrap CI), plus Sharpe/Sortino and returns. It's *notional*: it starts a clean $10k at the target weights on the earliest date all tickers have prices (`--backtest-start` to override), so it tests the *strategy*, independent of your actual buy timing. Labeled **a historical simulation, not a prediction**.
+
+A fixed rebalance policy fits no parameters, so the whole history is out-of-sample-clean (nothing to overfit). The **walk-forward train/test *selection*** machinery — needed only once a strategy *searches* (tunes parameters or picks among candidates: an optimizer, or an *edge* timing strategy) — is deliberately deferred; a **discipline-vs-edge gate** enforces that any future edge strategy must pass a walk-forward backtest before it may surface a suggestion. Today's rebalance modes are all *discipline*, so they suggest freely.
+
+With `--benchmark`, the held-out verdict resolves through three named gates: the **Ulcer gain** must clear a noise margin, **CDaR** (the worst-tail average) may tie but must not contradict the direction, and a **paired moving-block bootstrap CI** must confirm it — otherwise `inconclusive`, with the blocking gate named in the reason. Max drawdown and volatility are reported as context, voting nowhere: a single worst event is an extreme-value statistic, far too noisy on a short history to decide anything.
+
 
 ### Discovery & the curated universe
 
@@ -415,4 +413,4 @@ uv run --with quantstats python reconcile/reconcile_quantstats.py   # metric cro
 
 ## License
 
-Personal project, no license granted. All rights reserved.
+[AGPL-3.0-or-later](LICENSE). Free to use, modify, and self-host — including commercially. The one condition: if you distribute a modified version, or run one as a network service for others, you must publish your modified source under the same license. (Same license Ghostfolio uses.)

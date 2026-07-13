@@ -1055,3 +1055,35 @@ def test_starter_allocation_unknown_answer_is_clean_error(warm_book: Path) -> No
         "horizon": "someday", "loss_response": "hold", "cash_buffer": "partly",
     })
     assert res.isError and "someday" in _error_text(res)
+
+
+def test_starter_allocation_empty_book_needs_no_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The step-0 persona: a book with no trades yet over a stone-cold cache. Nothing is
+    # held, so nothing needs pricing — every role fills from the curated universe
+    # (mirrors the CLI's bookless --onboard). The cold refusal is only for HELD books.
+    empty = tmp_path / "empty.csv"
+    empty.write_text("Date,Code,Action,Quantity,Price,Fee\n", encoding="utf-8")
+    cache = tmp_path / "cache"
+    cache.mkdir()  # empty → cold
+    monkeypatch.setenv("ASSET_BOOK", str(empty))
+    monkeypatch.setenv("ASSET_CACHE_DIR", str(cache))
+    res = _call("starter_allocation", {
+        "horizon": "over_10_years", "loss_response": "hold",
+        "cash_buffer": "comfortably", "benchmark": "none",
+    })
+    assert not res.isError, _error_text(res)
+    sc = res.structuredContent
+    assert sc is not None
+    assert len(sc["proposal"]["weights"]) > 0  # pure universe defaults, no prices needed
+
+
+def test_propose_allocation_held_book_cold_cache_still_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The empty-book carve-out must NOT loosen the held case: real holdings the cache
+    # can't price would be silently ignored by the proposal — refuse with the warm hint.
+    _cold_book(tmp_path, monkeypatch)
+    res = _call("propose_allocation", {"preset": "moderate", "benchmark": "none"})
+    assert res.isError and "warm" in _error_text(res).lower()
