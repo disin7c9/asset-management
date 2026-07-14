@@ -151,3 +151,37 @@ def test_mcp_server_starts_in_module_mode_offline() -> None:
     )
     assert "ModuleNotFoundError" not in proc.stderr
     assert "Traceback" not in proc.stderr
+
+
+def test_privacy_policy_url_resolves_to_a_real_readme_anchor() -> None:
+    # The connectors directory rejects a local connector whose privacy policy is missing —
+    # and a dead link is indistinguishable from a live one until a human clicks it. The
+    # manifest points at a README anchor, so decorating that heading (an emoji shifts the
+    # slug GitHub generates) would silently break the submission. Pin it: the fragment must
+    # resolve, either to an explicit <a id> or to a heading whose GitHub slug matches.
+    import re
+
+    manifest = _load_build_mcpb()._manifest("9.9.9")
+    urls = manifest["privacy_policies"]
+    assert urls, "the manifest declares no privacy policy"
+
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+
+    def github_slug(title: str) -> str:  # verified against GitHub's markdown API
+        title = title.strip().lower()
+        return re.sub(r"\s", "-", re.sub(r"[^\w\s-]", "", title))
+
+    targets = {github_slug(t) for t in re.findall(r"^#{1,6} (.+)$", readme, re.M)}
+    targets |= set(re.findall(r'<a id="([^"]+)"></a>', readme))
+
+    for url in urls:
+        assert url.startswith("https://"), f"{url} must be HTTPS"
+        _, _, fragment = url.partition("#")
+        assert fragment, f"{url} names no anchor"
+        assert fragment in targets, (
+            f"privacy policy URL points at #{fragment}, which no README heading or anchor "
+            f"provides — the directory submission would fail on a dead link"
+        )
+    assert re.search(r"^#{1,6} .*Privacy Policy", readme, re.M | re.I), (
+        "README has no Privacy Policy section"
+    )
