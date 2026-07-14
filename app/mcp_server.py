@@ -44,7 +44,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from importlib.metadata import PackageNotFoundError, version as _pkg_version
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
@@ -62,8 +62,8 @@ from app.pipeline import (
     warm_cache,
     write_demo_book,
 )
-from app.allocate import PRESETS, build_preset_target
-from app.onboard import posture_from_answers
+from app.allocate import PRESETS, PresetName, build_preset_target
+from app.onboard import CashBuffer, Horizon, LossResponse, posture_from_answers
 from app.backtest import (
     BENCHMARKS,
     BenchmarkVerdict as BenchmarkWord,  # the verdict-word Literal; aliased to avoid the model name
@@ -114,6 +114,13 @@ def _cold_error(msg: str) -> str:
     steer the model away from inventing the number."""
     return msg + _NO_ESTIMATE
 
+# The benchmark arg's domain: the canonical references + the literal 'none' that skips
+# validation. Spelled out (not derived) because a schema enum must be a static type;
+# tests/test_mcp_server.py pins it against backtest.BENCHMARKS so a new reference can't
+# be added without surfacing here.
+BenchmarkArg = Literal["60-40", "all-weather", "permanent", "none"]
+
+
 # Read-only, closed-world (no external side effects), idempotent — the honest hints
 # for a Claude client (Claude reads readOnlyHint to know the tool only observes).
 # The human-readable `title` is what a client shows in a tool menu; the connectors
@@ -162,15 +169,25 @@ def _env_raw(var: str, *, fallback: str | None = None) -> str | None:
     return raw or None
 
 
-def _one_of(raw: str, choices: Collection[str], what: str, *, allow_none: bool = False) -> str:
+def _one_of[T: str](
+    raw: T, choices: Collection[str], what: str, *, allow_none: bool = False
+) -> T:
     """Normalize a client-supplied enum token (strip + lowercase) and validate it against
     ``choices``. One validator for every MCP enum arg (mode / preset / benchmark) so the
     normalization and error wording can't drift across tools. ``allow_none`` also accepts the
     literal ``'none'`` (the benchmark arg uses it to skip validation). Returns the normalized
-    token; raises ValueError (→ a clean MCP error) listing the valid options."""
+    token; raises ValueError (→ a clean MCP error) listing the valid options.
+
+    Still load-bearing for the **prompts** (`should_i_rebalance`, `propose_a_posture`), whose
+    args are bare ``str`` — MCP prompt arguments can't carry a schema enum, so a starter would
+    otherwise open on a tool error. The **tools** now type these args as ``Literal``, and pydantic
+    rejects a bad token before the body runs, which makes the call there a belt-and-braces no-op
+    (and costs the old strip/lower tolerance: 'Moderate' is now a validation error, not a
+    normalization). Generic in ``T`` so a ``Literal`` arg keeps its narrow type through the call
+    instead of widening back to ``str``; pass ``allow_none`` only where ``T`` admits ``'none'``."""
     val = raw.strip().lower()
     if val in choices or (allow_none and val == "none"):
-        return val
+        return cast("T", val)
     options = ", ".join(sorted(choices)) + (" or 'none'" if allow_none else "")
     raise ValueError(f"unknown {what} {raw!r} — pick one of: {options}")
 
@@ -774,7 +791,7 @@ def risk_report() -> RiskReport:
     "suggest all-HOLD when it is 0. Offline + read-only — it suggests, never trades. A NEW "
     "target ticker can't be sized offline (no cached price); those appear under 'unpriced'.",
 )
-def rebalance_check(mode: str = "to_total", new_cash: float = 0.0) -> RebalancePlan:
+def rebalance_check(mode: Mode = "to_total", new_cash: float = 0.0) -> RebalancePlan:
     mode = _one_of(mode, VALID_MODES, "rebalance mode")
     if not math.isfinite(new_cash) or new_cash < 0:
         raise ValueError(f"new_cash must be a finite number >= 0, got {new_cash}")
@@ -806,7 +823,7 @@ def rebalance_check(mode: str = "to_total", new_cash: float = 0.0) -> RebalanceP
             ),
         )
     held_value = {tk: held[tk].shares * price_per_share[tk] for tk in held}
-    sugg = suggest(cast("Mode", mode), held_value, price_per_share, target, new_cash=new_cash)
+    sugg = suggest(mode, held_value, price_per_share, target, new_cash=new_cash)
     trades = [
         Trade(
             ticker=s.ticker, action=s.action, shares=s.shares, dollars=s.dollars,
@@ -1025,7 +1042,9 @@ def _benchmark_verdict(
     "returned; the verdict needs the reference tickers cached, else it's null with a warm note. "
     "Pass benchmark='none' to skip validation.",
 )
-def propose_allocation(preset: str = "moderate", benchmark: str = "60-40") -> ProposedAllocation:
+def propose_allocation(
+    preset: PresetName = "moderate", benchmark: BenchmarkArg = "60-40"
+) -> ProposedAllocation:
     today = date.today()
     pset = _one_of(preset, PRESETS, "preset")
     return _build_proposal(pset, benchmark, today)
@@ -1093,7 +1112,10 @@ class StarterAllocation(BaseModel):
     "hand-designed starting posture, never a recommendation or a return forecast.",
 )
 def starter_allocation(
-    horizon: str, loss_response: str, cash_buffer: str, benchmark: str = "60-40"
+    horizon: Horizon,
+    loss_response: LossResponse,
+    cash_buffer: CashBuffer,
+    benchmark: BenchmarkArg = "60-40",
 ) -> StarterAllocation:
     # Pure rubric (app.onboard) picks the posture; ValueError names the valid tokens for a
     # bad answer, so the fence's honesty carries to onboarding too.

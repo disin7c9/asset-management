@@ -5,7 +5,16 @@ from __future__ import annotations
 import pytest
 
 from app.allocate import PRESETS
-from app.onboard import MAX_SCORE, QUESTIONS, posture_from_answers
+from typing import get_args
+
+from app.onboard import (
+    MAX_SCORE,
+    QUESTIONS,
+    CashBuffer,
+    Horizon,
+    LossResponse,
+    posture_from_answers,
+)
 
 
 def test_questions_shape() -> None:
@@ -18,6 +27,15 @@ def test_questions_shape() -> None:
         assert sorted(o.score for o in q.options) == [0, 1, 2]
         assert all(o.label and o.note for o in q.options)
     assert MAX_SCORE == 6
+
+
+def test_answer_literals_match_the_rubrics_option_keys() -> None:
+    # The Literals are what the MCP tool publishes as its schema enum. If an Option.key is
+    # renamed here and the Literal isn't, the tool would advertise a token the rubric rejects.
+    by_key = {q.key: tuple(o.key for o in q.options) for q in QUESTIONS}
+    assert get_args(Horizon) == by_key["horizon"]
+    assert get_args(LossResponse) == by_key["loss_response"]
+    assert get_args(CashBuffer) == by_key["cash_buffer"]
 
 
 def test_every_posture_reachable() -> None:

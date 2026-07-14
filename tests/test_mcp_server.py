@@ -267,6 +267,35 @@ def test_onboarding_answer_tokens_are_in_sync_with_the_rubric() -> None:
             assert opt.key in desc, f"{opt.key} missing from starter_allocation description"
 
 
+def test_every_constrained_arg_publishes_its_choices_as_a_schema_enum() -> None:
+    # A bare `string` arg leaves the model GUESSING a token the tool will then reject —
+    # exactly how starter_allocation failed in Claude Desktop. Each constrained arg must
+    # advertise its domain in the JSON schema, not merely in the description prose.
+    from app.allocate import PRESETS
+    from app.backtest import BENCHMARKS
+    from app.onboard import QUESTIONS
+    from app.strategy import VALID_MODES
+
+    schemas = {t.name: t.inputSchema["properties"] for t in _list_tools().tools}
+    onboard_tokens = {q.key: {o.key for o in q.options} for q in QUESTIONS}
+    expected = {
+        ("rebalance_check", "mode"): VALID_MODES,
+        ("propose_allocation", "preset"): PRESETS,
+        ("propose_allocation", "benchmark"): BENCHMARKS | {"none"},
+        ("starter_allocation", "benchmark"): BENCHMARKS | {"none"},
+        ("starter_allocation", "horizon"): onboard_tokens["horizon"],
+        ("starter_allocation", "loss_response"): onboard_tokens["loss_response"],
+        ("starter_allocation", "cash_buffer"): onboard_tokens["cash_buffer"],
+    }
+    for (tool, arg), choices in expected.items():
+        spec = schemas[tool][arg]
+        enum = spec.get("enum") or next(
+            (a["enum"] for a in spec.get("anyOf", []) if "enum" in a), None
+        )
+        assert enum is not None, f"{tool}.{arg} publishes no enum — the model must guess it"
+        assert set(enum) == set(choices), f"{tool}.{arg} enum drifted from its canonical set"
+
+
 def test_env_path_treats_template_residue_as_unset(monkeypatch: pytest.MonkeyPatch) -> None:
     # An MCPB host may substitute an UNSET optional user_config as the literal
     # "${user_config.x}" string. That must route to the "not set" guidance, never to

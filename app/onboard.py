@@ -15,8 +15,17 @@ assistant asks, but THIS module scores).
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
 from app.allocate import PresetName
+
+# The legal answer token per question — the canonical set QUESTIONS below is built from.
+# Typed (not bare `str`) so callers that publish a schema — the MCP tool — advertise the
+# choices as an enum instead of leaving a model to guess a token the rubric will reject.
+# tests/test_onboard.py pins each one against its Question's Option keys.
+Horizon = Literal["under_3_years", "3_to_10_years", "over_10_years"]
+LossResponse = Literal["sell", "hold", "buy_more"]
+CashBuffer = Literal["no", "partly", "comfortably"]
 
 
 @dataclass(frozen=True)
