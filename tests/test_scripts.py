@@ -34,9 +34,13 @@ def test_manifest_launch_line_dodges_both_launch_traps() -> None:
     # The sanctioned shape is the official uv example's: a ROOT-level launcher script.
     # Also locked OUT: "--no-dev" — Desktop provisions <ext>/.venv itself WITH dev
     # groups it decides on; a pruning launch sync fights it (os-error-32 lock loop).
+    # Locked IN: "--no-sync" — `--frozen` alone still SYNCS the env at launch, and that
+    # launch-time sync is the writer that races Desktop's provisioning over pywin32's
+    # locked .data dir; --no-sync makes launch touch nothing (the zero-tools regression fix).
     m = _load_build_mcpb()._manifest("9.9.9")
     args = m["server"]["mcp_config"]["args"]
-    assert args == ["run", "--frozen", "--directory", "${__dirname}", "server_entry.py"]
+    assert args == ["run", "--no-sync", "--frozen", "--directory", "${__dirname}", "server_entry.py"]
+    assert "--no-dev" not in args  # the pruning flag that fought the host sync stays out
     assert m["server"]["entry_point"] == "server_entry.py"
 
 

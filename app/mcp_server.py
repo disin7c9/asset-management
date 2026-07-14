@@ -116,7 +116,12 @@ def _cold_error(msg: str) -> str:
 
 # Read-only, closed-world (no external side effects), idempotent — the honest hints
 # for a Claude client (Claude reads readOnlyHint to know the tool only observes).
-_READ_ONLY = ToolAnnotations(readOnlyHint=True, idempotentHint=True, openWorldHint=False)
+# The human-readable `title` is what a client shows in a tool menu; the connectors
+# directory rejects a submission whose tools don't carry one.
+def _read_only(title: str) -> ToolAnnotations:
+    return ToolAnnotations(
+        title=title, readOnlyHint=True, idempotentHint=True, openWorldHint=False
+    )
 
 mcp: FastMCP = FastMCP(
     "asset-management",
@@ -679,7 +684,7 @@ def _data_provenance(b: _Build) -> DataProvenance:
 
 
 @mcp.tool(
-    annotations=_READ_ONLY,
+    annotations=_read_only("Portfolio summary"),
     description="The user's current holdings + P&L + annualized returns (offline, "
     "read-only). Use to answer 'what do I hold / how am I doing'.",
 )
@@ -705,7 +710,7 @@ def portfolio_summary() -> PortfolioSummary:
 
 
 @mcp.tool(
-    annotations=_READ_ONLY,
+    annotations=_read_only("Risk report (drawdown-first)"),
     description="Drawdown-first risk panel for the held portfolio: max drawdown "
     "(depth/dates/recovery + CI), Ulcer, CDaR, and Sharpe/Sortino/Calmar with bootstrap "
     "confidence intervals. Offline, read-only. Use to answer 'how risky / how deep are "
@@ -759,7 +764,7 @@ def risk_report() -> RiskReport:
 
 
 @mcp.tool(
-    annotations=_READ_ONLY,
+    annotations=_read_only("Rebalance check"),
     description="Buy/sell/hold suggestions to move current holdings toward the target "
     "allocation (ASSET_TARGET). There are exactly 4 modes: 'to_total' (rebalance the whole "
     "book back to target weights — ALSO deploys new_cash into the rebalance if you pass it) and "
@@ -824,7 +829,7 @@ def rebalance_check(mode: str = "to_total", new_cash: float = 0.0) -> RebalanceP
 
 
 @mcp.tool(
-    annotations=_READ_ONLY,
+    annotations=_read_only("Securities facts"),
     description="Published fund facts for each of the user's holdings (offline, read-only): "
     "type (ETF vs stock), expense ratio, AUM, average volume, age, category. Use to answer "
     "'what am I paying / how big / how liquid / how old are my funds'. Reads the 7-day "
@@ -855,7 +860,7 @@ def securities_facts() -> SecuritiesFacts:
 
 
 @mcp.tool(
-    annotations=_READ_ONLY,
+    annotations=_read_only("Discover gaps"),
     description="Roles the user's portfolio is light in (≤3% of market value) and the largest "
     "low-cost ETFs that fill each (offline, read-only, propose-only). Use to answer 'what am I "
     "missing / what could I consider adding'. The candidate listing is deterministic; for the "
@@ -890,7 +895,7 @@ def discover_gaps() -> DiscoveryGaps:
 
 
 @mcp.tool(
-    annotations=_READ_ONLY,
+    annotations=_read_only("Screen a candidate"),
     description="Judge a NEW ticker against the user's book (offline, read-only, propose-only): "
     "cost, liquidity, age, concentration, overlap with what they hold, and whether it diversified "
     "their past drawdowns — each with a reason and the figures behind it. Use to answer 'is "
@@ -1010,7 +1015,7 @@ def _benchmark_verdict(
 
 
 @mcp.tool(
-    annotations=_READ_ONLY,
+    annotations=_read_only("Propose an allocation"),
     description="Propose a strategic target allocation for a risk posture (conservative / "
     "moderate / aggressive) over the user's book + the curated universe, and validate it "
     "against a canonical reference (60-40 / all-weather / permanent) with a walk-forward "
@@ -1076,7 +1081,7 @@ class StarterAllocation(BaseModel):
 
 
 @mcp.tool(
-    annotations=_READ_ONLY,
+    annotations=_read_only("Find my starting allocation"),
     description="Turn a new user's risk answers into a starting allocation. Pass the three "
     "onboarding answers — horizon ('under_3_years' | '3_to_10_years' | 'over_10_years'), "
     "loss_response ('sell' | 'hold' | 'buy_more'), cash_buffer ('no' | 'partly' | "

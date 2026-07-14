@@ -154,21 +154,38 @@ Expose your portfolio to an AI assistant (Claude Desktop, Claude Code, …) as *
 - **`propose_allocation`** — a strategic target for a posture (`conservative`/`moderate`/`aggressive`) over your book + the universe, validated against a reference with the same walk-forward, Ulcer-first held-out verdict — propose-only, numbers from the core, never a recommendation.
 - **`starter_allocation`** — new to this? answer three plain risk questions → a starting posture and its validated proposal (the onboarding path into `propose_allocation`).
 
-**One-click install (Claude Desktop):** grab `asset-management-<version>.mcpb` from the
-[Releases page](https://github.com/disin7c9/asset-management/releases) (or build it yourself:
-`uv run python scripts/build_mcpb.py`), then Claude Desktop → Settings → Extensions →
-**Install Extension…** → pick the file. The install dialog asks for your transaction file
-(pre-filled with the **bundled demo portfolio** so you can explore on fake data first), a
-price-cache folder, an optional target CSV, a strict-offline toggle, and an optional
-[Tiingo](https://www.tiingo.com) API key (the second price source for when Yahoo throttles).
-Nothing else to install — Claude Desktop's `uv` runtime resolves Python and the locked
-dependencies itself.
+**Install (Claude Desktop):** Settings → Developer → **Edit Config**, and add:
 
-**First launch is slow — this is expected.** On install, that `uv` runtime builds a ~360 MB
-Python environment (pandas / NumPy / PyArrow / SciPy) before the server can answer, so give it
-**2–5 minutes the first time** and don't worry if the extension briefly shows as *disconnected*
-while it works. Every launch after that starts in under a second; the first tool call then warms
-the price cache once (~30–60s), and that cache lives in your home folder so it survives reinstalls.
+```json
+{
+  "mcpServers": {
+    "asset-management": {
+      "command": "uvx",
+      "args": ["--from", "git+https://github.com/disin7c9/asset-management",
+               "asset-management-mcp"],
+      "env": { "ASSET_BOOK": "C:\\path\\to\\your\\transactions.csv" }
+    }
+  }
+}
+```
+
+Restart Claude Desktop. You need [uv](https://docs.astral.sh/uv/) on your PATH and nothing else —
+`uvx` resolves Python and the locked dependencies itself. **The first launch is slow** (it builds
+a ~500 MB environment: pandas / NumPy / PyArrow), so give it a minute; every launch after starts
+in seconds. The first tool call then warms the price cache once (~30–60s), and that cache lives
+in your home folder, so it survives reinstalls. Works on the free plan.
+
+Drop `ASSET_BOOK` to explore the **bundled demo portfolio** on fake data first. Other optional
+env: `ASSET_TARGET` (a target CSV — `rebalance_check` needs it), `ASSET_CACHE_DIR`,
+`ASSET_MCP_OFFLINE=1`, and `TIINGO_API_KEY` (a second price source for when Yahoo throttles).
+
+**The `.mcpb` bundle — Claude Code only, for now.** Build it with `uv run python
+scripts/build_mcpb.py` → `dist/asset-management-<version>.mcpb`, and install it in one click via
+Settings → Extensions. Its tools work in **Claude Code**. They do **not** work in Claude
+Desktop's chat window: Desktop does not offer tools from *sideloaded* extensions to the model —
+they appear in the tool menu, keep their permission toggles, and are simply never called.
+Directory-installed extensions and config-registered servers both work, which is why the config
+route above is the one to use for chat.
 
 **In chat:** open the **+** menu for ready-made starters — *Portfolio checkup*, *What's my
 drawdown?*, *Should I rebalance?*, *Fill my gaps*, *Find my starting allocation*, *Propose a
@@ -177,24 +194,24 @@ enforced guarantees, versioned, shipped with the code): attach it from the same 
 or, in clients that let the model read resources itself, just ask "can I trust these
 numbers?" and it answers from the manifest instead of improvising.
 
-**If the extension says "Unable to connect":** check `%APPDATA%\Claude\logs\main.log` —
-- `Failed to read version of python binary "python3"/"python" … 9009`: your Claude
-  Desktop build refuses to start uv extensions without *a* system Python answering on
-  PATH (even though the extension ships its own). Install any Python 3 (`winget install
-  Python.Python.3.12`) **and** turn OFF the two `python` App Execution Aliases
-  (Settings → Apps → Advanced app settings → App execution aliases) — Microsoft's Store
-  stubs otherwise keep answering the probe with garbage. Restart Claude Desktop.
-- `No MCP config found for extension … skipping`: Desktop only launches the server once
-  the Configure form has been **saved**, and it ignores the pre-filled defaults until
-  then — but the Save button stays disabled if you change nothing. Toggle any field
-  (e.g. *Strictly offline* on and off) so Save activates, save, restart Claude Desktop.
-- An *install* failing with `os error 32` (file in use): don't rapid-retry — fully quit
-  Claude Desktop, re-open, install once; or use the registration route below.
-- Extension connects and the **+** starters attach, but the model says it has no tools
-  and the tools menu is empty: the extension itself is fine — check your Claude Desktop
-  configuration for the signed-in *account* (Settings → Extensions and the chat's tools
-  menu). In our testing the same machine behaved differently under two accounts on the
-  same plan, so if another account is available, trying it isolates the problem fast.
+### If something goes wrong
+
+- **The tools appear in the menu, but Claude never calls them.** You installed the `.mcpb`
+  bundle. Claude Desktop's chat window does not offer tools from *sideloaded* extensions to the
+  model — the menu and the permission toggles are drawn from the extension itself, so everything
+  *looks* connected while the model is never told the tools exist. Remove the extension and use
+  the config route above.
+- **The server never appears at all.** Claude Desktop resolves `"command"` on your PATH and
+  can't find `uvx`. Install [uv](https://docs.astral.sh/uv/) and restart Desktop, or put the
+  absolute path in `"command"` (Windows: `C:\Users\<you>\.local\bin\uvx.exe`).
+- **It sits *disconnected* on the very first launch.** That launch is building the environment
+  (~500 MB). Give it a minute, then restart Claude Desktop. Later launches take seconds.
+- **Every figure comes back `n/a`.** The price cache is cold and `ASSET_MCP_OFFLINE=1` is
+  forbidding the fetch that would warm it. Drop that variable, or warm the cache once from the
+  CLI: `uvx --from git+https://github.com/disin7c9/asset-management asset-management --book your.csv --warm`.
+- **(`.mcpb` only) `No MCP config found for extension … skipping`.** Desktop won't launch the
+  server until the Configure form is *saved* — and Save stays disabled until you change
+  something. Toggle any field, save, restart.
 
 Or run the server directly / register it with Claude Code:
 
@@ -410,6 +427,17 @@ Together they validate the whole pipeline: ghostfolio confirms the holdings/valu
 uv run --with quantstats python reconcile/reconcile_quantstats.py   # metric cross-check
 # end-to-end (ghostfolio): see reconcile/RESULTS.md
 ```
+
+## Privacy Policy
+
+This tool runs entirely on your own machine. **It has no backend, no account, and no telemetry** — the author receives nothing, ever.
+
+- **What it collects.** Nothing. Your transaction log, derived holdings, and price cache are read and written only on your computer, at the paths you pass (`--book`, `--cache-dir`, or `ASSET_BOOK` / `ASSET_CACHE_DIR`). Nothing is uploaded, and no usage data, crash report, or analytics is emitted.
+- **What leaves your machine, and only these.** (1) **Price and fund data requests** — ticker symbols are sent to [Yahoo Finance](https://finance.yahoo.com) and, if you set `TIINGO_API_KEY`, to [Tiingo](https://www.tiingo.com), to fetch quotes, history, splits, and published fund facts. Ticker symbols only — never your quantities, cost basis, or balances. (2) **Narration**, `--narrate`, which is **off by default**: if you turn it on and supply your own LLM key, portfolio *figures* are sent to the provider you chose (OpenAI-compatible or Anthropic) to be written up as prose. The `ASSET_NARRATE_TIER` dial controls how much detail is sent; `local` keeps it on your machine. Turn it off and no LLM is contacted at all.
+- **Storage and retention.** The price cache lives in `.asset-management/prices` in your home folder (or `ASSET_CACHE_DIR`) and persists until you delete it. Reports written with `--save` go to `reports/`. Everything is a plain file you own; delete the folders and the data is gone. The author holds no copy and cannot.
+- **Third-party sharing.** None. The author shares nothing because the author has nothing. Data sent to Yahoo, Tiingo, or your chosen LLM provider is governed by that provider's own privacy policy.
+- **The MCP server.** Read-only, bound to your configured book, with no file-path arguments and no write tools. It performs two bounded, opt-out network fetches (a one-time cold-cache warm and an on-demand fetch when you screen an uncached ticker); `ASSET_MCP_OFFLINE=1` disables both. It sends nothing anywhere else.
+- **Contact.** Open an issue at [github.com/disin7c9/asset-management/issues](https://github.com/disin7c9/asset-management/issues).
 
 ## License
 

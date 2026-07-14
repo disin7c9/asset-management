@@ -93,7 +93,17 @@ def bundle_pyproject() -> str:
 def _bundle_lock(stage: Path) -> str:
     """Regenerate ``uv.lock`` against the trimmed pyproject (in ``stage``), so the
     bundle's ``uv run --frozen`` sees a lockfile that MATCHES its pyproject — uv
-    refuses a frozen run against a stale lock. Then verify no dev tool survived."""
+    refuses a frozen run against a stale lock. Then verify no dev tool survived.
+
+    Seed the stage with the repo's TESTED lock first: a bare ``uv lock`` in an empty
+    temp dir re-resolves every ``>=`` clean to the newest-at-build-time release, so the
+    bundle silently shipped versions the suite never ran against (mcp 1.28.1 while CI
+    tested 1.27.2). With the repo lock present, uv keeps the existing runtime pins
+    (no upgrade without ``--upgrade``) and only prunes the now-unreferenced dev group —
+    so the bundle ships exactly what was validated. Ship == test."""
+    (stage / "uv.lock").write_text(
+        (ROOT / "uv.lock").read_text(encoding="utf-8"), encoding="utf-8"
+    )
     subprocess.run(
         ["uv", "lock", "--directory", str(stage)], check=True, capture_output=True
     )
@@ -146,6 +156,13 @@ def _manifest(version: str) -> dict[str, object]:
         "license": "AGPL-3.0-or-later",
         "repository": {"type": "git", "url": "https://github.com/disin7c9/asset-management"},
         "keywords": ["portfolio", "etf", "drawdown", "finance", "read-only", "backtest"],
+        # Required by the connectors directory for LOCAL connectors — a missing or
+        # incomplete privacy policy is an automatic rejection. Must be HTTPS, and the
+        # README section it points at must cover collection, use/storage, third-party
+        # sharing, retention, and contact.
+        "privacy_policies": [
+            "https://github.com/disin7c9/asset-management#privacy-policy",
+        ],
         # Declare the tool surface (display metadata per MANIFEST.md — the runtime list
         # still comes from tools/list). Some Desktop builds appear to expose only
         # DECLARED capabilities to the chat (the prompts_generated lesson below); the
@@ -214,12 +231,28 @@ def _manifest(version: str) -> dict[str, object]:
                 # probes any python token against the system PATH → exit 9009 on
                 # Python-less machines → "Unable to connect" everywhere).
                 #
-                # NO --no-dev and NO UV_PROJECT_ENVIRONMENT (click-test lesson, 07-03):
-                # Claude Desktop provisions <extension>/.venv ITSELF at install. A
-                # pruning launch flag makes our `uv run` fight the host's sync — an
-                # endless os-error-32 lock loop. Launch ACCEPTS the host env as-is.
+                # --no-sync: the launch must NOT provision the venv. `uv run --frozen`
+                # still SYNCS the environment at launch (--frozen only pins the LOCKFILE,
+                # not the env — verified: a --frozen launch against a fresh venv still
+                # prints "Installed N packages"). That launch-time sync is the second
+                # concurrent writer that races Claude Desktop's own install-time
+                # provisioning over pywin32's DLL-locked `.data` dir → the repeating
+                # `failed to remove directory pywin32-312.data: os error 32` install loop
+                # ("another process is using the file"): a not-yet-dead prior server holds
+                # pywin32's DLLs open, so a fresh sync can't rewrite the venv. `mcp` pulls
+                # pywin32 on Windows (uv.lock, marker sys_platform=='win32'), so it can't be
+                # dropped — the fix is to stop syncing at launch. --no-sync execs against
+                # the EXISTING venv and touches nothing, so an ordinary relaunch can never
+                # resync-and-race. It implies --frozen (kept for clarity). Desktop
+                # provisions <extension>/.venv at install; if the very first launch beats
+                # that, the server fails fast → the user restarts once (long_description
+                # already says so) — an in-process retry can't import late-installed deps.
+                # STILL NO --no-dev / NO UV_PROJECT_ENVIRONMENT (host owns the env; --no-sync
+                # is not a pruning flag, it defers to the host env entirely), root-level
+                # script only, and never the token "python" (host probes it → 9009).
                 "args": [
                     "run",
+                    "--no-sync",
                     "--frozen",
                     "--directory",
                     "${__dirname}",

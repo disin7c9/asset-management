@@ -1,6 +1,6 @@
 [project]
 name = "asset-management"
-version = "2.11.0"
+version = "2.11.2"
 description = "Personal asset-management tool: transaction-log holdings, drawdown-first reporting with confidence bands, multi-source price provenance."
 license = "AGPL-3.0-or-later"
 requires-python = ">=3.12,<3.13"
@@ -17,6 +17,7 @@ dependencies = [
 
 [project.scripts]
 asset-management = "app.cli:main"
+asset-management-mcp = "app.mcp_server:run"
 
 [dependency-groups]
 dev = [
