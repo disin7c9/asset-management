@@ -150,7 +150,20 @@ PATH=/home/you/.local/bin:/usr/bin:/bin
 0 8 * * 1  cd /path/to/asset-management && uv run python -m app --book your.csv --backtest --target target.csv --benchmark permanent --rebalance bands --metadata --save --send >> reports/cron.log 2>&1
 ```
 
-(cron only fires while the machine is on at that moment — on WSL, Windows Task Scheduler running `wsl.exe` is the always-fires alternative. No WSL? The tool is pure Python — the same command runs in native PowerShell, scheduled with Task Scheduler.) Every key the tool reads is listed in [Configuration](#-configuration--every-key-in-one-place).
+(cron only fires while the machine is on at that moment — on WSL, Windows Task Scheduler running `wsl.exe` is the always-fires alternative.) Every key the tool reads is listed in [Configuration](#-configuration--every-key-in-one-place).
+
+On Windows without WSL, everything above works unchanged (`uv` brings its own Python — install it with `irm https://astral.sh/uv/install.ps1 | iex`, clone, write `.env`, run). Only the scheduler differs:
+
+```powershell
+# the Windows counterpart of the cron line above, from your clone.
+# -StartWhenAvailable: a Monday the machine was asleep runs on wake instead of skipping.
+Register-ScheduledTask -TaskName "asset-brief" `
+  -Trigger (New-ScheduledTaskTrigger -Weekly -DaysOfWeek Monday -At 8:00am) `
+  -Settings (New-ScheduledTaskSettingsSet -StartWhenAvailable) `
+  -Action (New-ScheduledTaskAction -Execute "$env:USERPROFILE\.local\bin\uv.exe" `
+    -Argument "run python -m app --book your.csv --backtest --target target.csv --benchmark permanent --rebalance bands --metadata --save --send" `
+    -WorkingDirectory "C:\path\to\asset-management")
+```
 
 ## 🔍 Why you can trust the numbers
 
@@ -207,7 +220,8 @@ Expose your portfolio to an AI assistant (Claude Desktop, Claude Code, …) as *
   "mcpServers": {
     "asset-management": {
       "command": "uvx",
-      "args": ["--from", "git+https://github.com/disin7c9/asset-management",
+      "args": ["--from",
+               "https://github.com/disin7c9/asset-management/releases/download/v2.11.4/asset_management-2.11.4-py3-none-any.whl",
                "asset-management-mcp"],
       "env": {
         "ASSET_BOOK": "C:\\path\\to\\your\\transactions.csv",
@@ -223,7 +237,9 @@ Restart Claude Desktop. You need [uv](https://docs.astral.sh/uv/) on your PATH a
 `uvx` resolves Python and the locked dependencies itself. **The first launch is slow** (it builds
 a ~500 MB environment: pandas / NumPy / PyArrow), so give it a minute; every launch after starts
 in seconds. The first tool call then warms the price cache once (~30–60s), and that cache lives
-in your home folder, so it survives reinstalls. Works on the free plan.
+in your home folder, so it survives reinstalls. Works on the free plan. The URL pins a release —
+nothing changes under you between launches; to upgrade, swap both version numbers for the
+[newest release](https://github.com/disin7c9/asset-management/releases/latest).
 
 **Every `env` entry is optional — delete what you don't use.** Drop `ASSET_BOOK` to explore the
 **bundled demo portfolio** on fake data first. `ASSET_TARGET` is what `rebalance_check` compares
@@ -265,6 +281,12 @@ numbers?" and it answers from the manifest instead of improvising.
   absolute path in `"command"` (Windows: `C:\Users\<you>\.local\bin\uvx.exe`).
 - **It sits *disconnected* on the very first launch.** That launch is building the environment
   (~500 MB). Give it a minute, then restart Claude Desktop. Later launches take seconds.
+- **The first launch dies with `os error 32` ("another process is using the file").** Windows:
+  while uv builds the environment, another process — usually the antivirus scanner — briefly
+  holds a freshly written file in uv's cache, and the install loses the race. Run the `uvx`
+  command from the config once in a terminal yourself (if it trips again, just rerun it — a
+  retry costs nothing there). When it sits silent, the environment is built: Ctrl-C, restart
+  Desktop. Every launch after reuses the built environment and never races.
 - **Every figure comes back `n/a`.** The price cache is cold and `ASSET_MCP_OFFLINE=1` is
   forbidding the fetch that would warm it. Drop that variable, or warm the cache once from the
   CLI: `uvx --from git+https://github.com/disin7c9/asset-management asset-management --book your.csv --warm`.

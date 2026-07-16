@@ -185,3 +185,26 @@ def test_privacy_policy_url_resolves_to_a_real_readme_anchor() -> None:
     assert re.search(r"^#{1,6} .*Privacy Policy", readme, re.M | re.I), (
         "README has no Privacy Policy section"
     )
+
+
+def test_readme_desktop_config_pins_the_current_release_wheel() -> None:
+    # The Desktop install config pins the release-wheel URL — a git+ source re-resolves on
+    # every launch, and on Windows that install work races whatever holds freshly written
+    # cache files (os error 32, hit live 2026-07-16; the wheel form is the fix). The cost of
+    # a pin is that it goes stale silently: bump pyproject, forget the README, and every new
+    # Desktop user installs the previous release. Fail the gate until the README catches up.
+    import re
+    import tomllib
+
+    with (ROOT / "pyproject.toml").open("rb") as fh:
+        version = tomllib.load(fh)["project"]["version"]
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    pins = re.findall(
+        r"releases/download/v([\d.]+)/asset_management-([\d.]+)-py3-none-any\.whl", readme
+    )
+    assert pins, "README no longer shows the release-wheel Desktop config"
+    for tag, wheel in pins:
+        assert tag == version and wheel == version, (
+            f"README pins wheel {wheel} (tag v{tag}) but pyproject says {version} — "
+            f"new Desktop installs would get the old release"
+        )
