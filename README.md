@@ -52,6 +52,7 @@ Holdings are *derived* from an append-only transaction log (date, ticker, action
   - [📈 Backtest details](#-backtest-details)
   - [🔭 Discovery & the curated universe](#-discovery--the-curated-universe)
   - [📝 Narration (optional plain-language summary)](#-narration-optional-plain-language-summary)
+  - [🔑 Configuration — every key in one place](#-configuration--every-key-in-one-place)
 - [🔧 Project](#-project)
   - [🧪 Develop](#-develop)
   - [📁 Layout](#-layout)
@@ -149,7 +150,7 @@ PATH=/home/you/.local/bin:/usr/bin:/bin
 0 8 * * 1  cd /path/to/asset-management && uv run python -m app --book your.csv --backtest --target target.csv --benchmark permanent --rebalance bands --metadata --save --send >> reports/cron.log 2>&1
 ```
 
-(cron only fires while the machine is on at that moment — on WSL, Windows Task Scheduler running `wsl.exe` is the always-fires alternative.)
+(cron only fires while the machine is on at that moment — on WSL, Windows Task Scheduler running `wsl.exe` is the always-fires alternative. No WSL? The tool is pure Python — the same command runs in native PowerShell, scheduled with Task Scheduler.) Every key the tool reads is listed in [Configuration](#-configuration--every-key-in-one-place).
 
 ## 🔍 Why you can trust the numbers
 
@@ -208,7 +209,11 @@ Expose your portfolio to an AI assistant (Claude Desktop, Claude Code, …) as *
       "command": "uvx",
       "args": ["--from", "git+https://github.com/disin7c9/asset-management",
                "asset-management-mcp"],
-      "env": { "ASSET_BOOK": "C:\\path\\to\\your\\transactions.csv" }
+      "env": {
+        "ASSET_BOOK": "C:\\path\\to\\your\\transactions.csv",
+        "ASSET_TARGET": "C:\\path\\to\\your\\target.csv",
+        "TIINGO_API_KEY": "your-free-tiingo-key(optional_secondary_source)"
+      }
     }
   }
 }
@@ -220,9 +225,13 @@ a ~500 MB environment: pandas / NumPy / PyArrow), so give it a minute; every lau
 in seconds. The first tool call then warms the price cache once (~30–60s), and that cache lives
 in your home folder, so it survives reinstalls. Works on the free plan.
 
-Drop `ASSET_BOOK` to explore the **bundled demo portfolio** on fake data first. Other optional
-env: `ASSET_TARGET` (a target CSV — `rebalance_check` needs it), `ASSET_CACHE_DIR`,
-`ASSET_MCP_OFFLINE=1`, and `TIINGO_API_KEY` (a second price source for when Yahoo throttles).
+**Every `env` entry is optional — delete what you don't use.** Drop `ASSET_BOOK` to explore the
+**bundled demo portfolio** on fake data first. `ASSET_TARGET` is what `rebalance_check` compares
+your holdings against (without it, that one tool errors with a hint). `TIINGO_API_KEY` (free
+account) adds the second price source for when Yahoo throttles. Rarer: `ASSET_CACHE_DIR` (move
+the price cache), `ASSET_MCP_OFFLINE=1` (never fetch — for an already-warmed cache). **No LLM key
+goes here**: the assistant reading these tools *is* the narrator; the server itself never calls a
+model.
 
 **The `.mcpb` bundle — Claude Code only, for now.** Build it with `uv run python
 scripts/build_mcpb.py` → `dist/asset-management-<version>.mcpb`, and install it in one click via
@@ -415,6 +424,44 @@ ASSET_NARRATE_TIER=paid                  # free | paid | local — privacy dial 
 ```
 
 **Privacy dial.** The `tier` controls what leaves your machine. On **`free`** (the default — for keys from providers whose free tiers may train on your inputs) only *coarse qualitative bands* ("moderate", "solid") are sent; your exact dollar amounts, returns, and dates stay home and are filled in locally. On **`paid`** (providers that contractually don't train on your data) the exact figures are sent for richer wording. A third tier, **`local`**, is for a model running on your own machine (Ollama / llama.cpp at `http://localhost` — also `::1` or `host.docker.internal`): it sends exact figures too, since nothing leaves the machine, and it's honored only against a genuine local endpoint (otherwise it falls back to `free`). The dial **fails safe**: only an explicit `paid` or `local` ever sends exact values — a blank or misspelled tier stays on `free`, and on `free` the tool logs a one-line reminder that the provider may train on what it is sent. If narration isn't configured, or the model call fails, the brief simply prints without the SUMMARY.
+
+### 🔑 Configuration — every key in one place
+
+All configuration is environment variables. Running from a checkout, set them once in a
+gitignored `.env` at the repo root; running via `uvx` (no checkout to read a `.env` from), set
+the same names as real environment variables — or in the Claude Desktop config's `env` block.
+Explicit flags always win.
+
+```bash
+# your book + target (Steps 1 & 3)
+ASSET_BOOK=data/my_data/transactions.csv
+ASSET_TARGET=data/my_data/target.csv
+
+# prices — optional free second source for when Yahoo throttles (Step 2)
+TIINGO_API_KEY=...
+
+# email delivery for --send (Step 4)
+RESEND_API_KEY=...
+REPORT_TO=you@example.com
+# REPORT_FROM=briefs@yourdomain.com   # optional; defaults to Resend's onboarding sender
+
+# narration for --narrate (optional — your own LLM key; see Narration above)
+ASSET_NARRATE_PROVIDER=anthropic      # or: openai (any OpenAI-compatible endpoint)
+ASSET_NARRATE_MODEL=claude-haiku-4-5
+ASSET_NARRATE_KEY=sk-...
+# ASSET_NARRATE_BASE_URL=https://...  # provider=openai only
+# ASSET_NARRATE_TIER=free             # free (default: only coarse bands leave) | paid (exact figures) | local
+
+# MCP addon only
+# ASSET_MCP_OFFLINE=1                 # never fetch — for an already-warmed cache
+
+# rarely needed
+# ASSET_CACHE_DIR=/somewhere/else     # move the price cache
+# ASSET_UNIVERSE=path/to/universe.csv # your own discovery universe
+```
+
+Nothing here is required: every feature that needs a key says so when you invoke it, and
+degrades cleanly without it.
 
 ## 🔧 Project
 
