@@ -28,7 +28,7 @@ from mcp.types import (
 from pydantic import AnyUrl
 
 from app import prices as prices_mod
-from app.mcp_server import _VERSION, mcp
+from app.mcp_server import _VERSION, Returns, mcp
 from app.pipeline import _WARM_MARKER
 
 
@@ -370,6 +370,24 @@ def test_risk_report(warm_book: Path) -> None:
     assert sc["max_drawdown"]["depth"] <= 0.0
     for metric in ("sharpe", "sortino", "calmar", "ulcer_index", "cdar"):
         assert {"point", "low", "high"} <= set(sc[metric])
+    # The TWR rides on the daily history this panel already loads — this is the ONE
+    # tool that exposes it (portfolio_summary skips the history); a null here on a
+    # long-history book would mean it got computed-then-dropped again (v2.11.4).
+    assert sc["true_twr_annualized"] is not None
+    assert math.isfinite(sc["true_twr_annualized"])
+
+
+def test_summary_twr_field_points_to_risk_report(warm_book: Path) -> None:
+    """portfolio_summary's TWR is ALWAYS null (it never loads the price history); the
+    published field description must send the model to risk_report, or the null reads
+    as 'unavailable' with no path to the figure (hit live in Claude Desktop, 2026-07-16)."""
+    res = _call("portfolio_summary")
+    assert not res.isError, _error_text(res)
+    sc = res.structuredContent
+    assert sc is not None
+    assert sc["returns"]["true_twr_annualized"] is None
+    desc = Returns.model_fields["true_twr_annualized"].description
+    assert desc is not None and "risk_report" in desc
 
 
 def test_rebalance_check(warm_book: Path, monkeypatch: pytest.MonkeyPatch) -> None:

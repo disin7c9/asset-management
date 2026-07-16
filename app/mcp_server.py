@@ -364,11 +364,17 @@ class Totals(BaseModel):
 
 class Returns(BaseModel):
     """Annualized returns (252-day basis). Null when the window is too short to
-    annualize honestly, or the book isn't fully priced (money-weighted figures)."""
+    annualize honestly, or the book isn't fully priced (money-weighted figures).
+    ``true_twr_annualized`` is additionally null whenever the daily price history
+    wasn't loaded — see the field note."""
 
     period_start: date
     asof: date
-    true_twr_annualized: float | None
+    true_twr_annualized: float | None = Field(
+        description="annualized time-weighted return — needs the daily price history, "
+        "which the fast portfolio_summary deliberately skips, so it is ALWAYS null "
+        "there; call risk_report for this figure"
+    )
     money_weighted_annualized: float | None
     modified_dietz_annualized: float | None
 
@@ -443,6 +449,12 @@ class RiskReport(BaseModel):
     asof: date
     n_days: int
     is_noisy: bool = Field(description="True when under ~2 trading years — bands are wide")
+    true_twr_annualized: float | None = Field(
+        None,
+        description="annualized time-weighted return (252-day basis) from the same daily "
+        "series as this panel — the one tool that carries it; null only when the window "
+        "is too short to annualize (< 20 return-days)",
+    )
     max_drawdown: MaxDrawdown
     ulcer_index: CI | None = Field(None, description="RMS drawdown (positive magnitude)")
     cdar: CI | None = Field(None, description="mean of the worst-5% drawdowns (positive magnitude)")
@@ -730,8 +742,9 @@ def portfolio_summary() -> PortfolioSummary:
     annotations=_read_only("Risk report (drawdown-first)"),
     description="Drawdown-first risk panel for the held portfolio: max drawdown "
     "(depth/dates/recovery + CI), Ulcer, CDaR, and Sharpe/Sortino/Calmar with bootstrap "
-    "confidence intervals. Offline, read-only. Use to answer 'how risky / how deep are "
-    "the drawdowns'.",
+    "confidence intervals, plus the annualized time-weighted return (it rides on the "
+    "same daily history). Offline, read-only. Use to answer 'how risky / how deep are "
+    "the drawdowns' — and for the time-weighted return portfolio_summary can't compute.",
 )
 def risk_report() -> RiskReport:
     today = date.today()
@@ -749,6 +762,9 @@ def risk_report() -> RiskReport:
         asof=today,
         n_days=rk.n_days,
         is_noisy=rk.is_noisy,
+        true_twr_annualized=(
+            b.returns.true_twr_annualized if b.returns is not None else None
+        ),
         max_drawdown=MaxDrawdown(
             depth=dd.depth,
             depth_ci_low=rk.max_drawdown_ci.low,
