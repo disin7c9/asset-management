@@ -1,6 +1,6 @@
 # asset-management
 
-[![gate](https://github.com/disin7c9/asset-management/actions/workflows/ci.yml/badge.svg)](https://github.com/disin7c9/asset-management/actions/workflows/ci.yml)
+[![gate](https://github.com/disin7c9/asset-management/actions/workflows/ci.yml/badge.svg)](https://github.com/disin7c9/asset-management/actions/workflows/ci.yml) [![asset-management MCP server](https://glama.ai/mcp/servers/disin7c9/asset-management/badges/score.svg)](https://glama.ai/mcp/servers/disin7c9/asset-management)
 
 **TL;DR:** `uvx --from git+https://github.com/disin7c9/asset-management asset-management --demo` — a drawdown-first portfolio brief on a bundled example book, one command, no setup. USD-only, long-only stock/ETF; you keep your own transaction log.
 
@@ -201,6 +201,8 @@ uv run --with quantstats python reconcile/reconcile_quantstats.py   # metric cro
 ```
 
 ## 💬 Chat with your portfolio — the Claude Desktop addon (read-only MCP)
+
+[![asset-management MCP server](https://glama.ai/mcp/servers/disin7c9/asset-management/badges/card.svg)](https://glama.ai/mcp/servers/disin7c9/asset-management)
 
 Expose your portfolio to an AI assistant (Claude Desktop, Claude Code, …) as **read-only tools** it can call — so you can "chat with your portfolio" while every number still comes from the validated core, not the model. The server is **read-only** — no write tools, bound to your `ASSET_BOOK` book (no file-path args) — and offline **except two bounded, opt-out fetches**: a cold cache **auto-warms the core set once** (your tickers + benchmark refs, ~30–60s), and screening/proposing a ticker that isn't cached fetches it on demand. Set `ASSET_MCP_OFFLINE=1` to disable both (for an *already-warmed* cache; pointed at a cold one it just degrades to honest `n/a`). Eight tools:
 
