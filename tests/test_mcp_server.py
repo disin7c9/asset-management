@@ -645,7 +645,8 @@ def test_discover_gaps(warm_book: Path, monkeypatch: pytest.MonkeyPatch) -> None
     uni.write_text(
         "ticker,name,role,summary\n"
         "VNQ,Vanguard Real Estate ETF,reit,US REITs\n"
-        "VWO,Vanguard FTSE Emerging Markets ETF,em-equity,Emerging markets\n",
+        "VWO,Vanguard FTSE Emerging Markets ETF,em-equity,Emerging markets\n"
+        "VGT,Vanguard Information Technology ETF,sector-equity,Tech sector\n",
         encoding="utf-8",
     )
     monkeypatch.setenv("ASSET_UNIVERSE", str(uni))
@@ -658,8 +659,57 @@ def test_discover_gaps(warm_book: Path, monkeypatch: pytest.MonkeyPatch) -> None
     g = with_cands[0]
     assert {"role", "current_exposure", "candidates"} <= set(g)
     assert all(c["ticker"] and c["role"] == g["role"] for c in g["candidates"])
+    # The satellite role never reads as a gap over MCP (no include_satellites arg here),
+    # so VGT stays out of the candidate set.
+    assert all(gg["role"] != "sector-equity" for gg in sc["gaps"])
     assert {c["ticker"] for gg in with_cands for c in gg["candidates"]} == {"VNQ", "VWO"}
     assert sc["unpriced_holdings"] == []  # AAA/BBB are priced → no partial-book caveat
+
+
+def test_discover_gaps_shelves_and_drill(
+    warm_book: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The shelf mirror is additive: the default call names unsurfaced shelves with counts
+    # (never picking one); role= + flavor= drills a named shelf; the satellite role maps.
+    uni = warm_book / "universe.csv"
+    uni.write_text(
+        "ticker,name,role,summary,core,flavor\n"
+        "IEF,iShares 7-10 Year Treasury,treasury,7-10y US Treasuries,1,intermediate\n"
+        "VGIT,Vanguard Interm Treasury,treasury,intermediate,1,intermediate\n"
+        "GOVT,iShares US Treasury,treasury,whole market,1,intermediate\n"
+        "TLT,iShares 20+ Year Treasury,treasury,20y+,1,long\n"
+        "VGLT,Vanguard Long Treasury,treasury,long,1,long\n"
+        "VGT,Vanguard Information Tech,sector-equity,tech sector,1,tech\n"
+        "XLV,Health Care Select,sector-equity,health sector,1,health\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("ASSET_UNIVERSE", str(uni))
+    res = _call("discover_gaps")
+    assert not res.isError, _error_text(res)
+    sc = res.structuredContent
+    assert sc is not None
+    tre = next(g for g in sc["gaps"] if g["role"] == "treasury")
+    assert [c["ticker"] for c in tre["candidates"]] == ["IEF", "VGIT", "GOVT"]
+    assert tre["lead_flavor"] == "intermediate"
+    assert {(s["flavor"], s["n"]) for s in tre["other_shelves"]} == {("long", 2)}
+    assert all(g["role"] != "sector-equity" for g in sc["gaps"])  # satellite: never default
+
+    res = _call("discover_gaps", {"role": "treasury", "flavor": "long"})
+    assert not res.isError, _error_text(res)
+    sc = res.structuredContent
+    assert sc is not None
+    assert [c["ticker"] for c in sc["gaps"][0]["candidates"]] == ["TLT", "VGLT"]
+
+    res = _call("discover_gaps", {"role": "sector-equity"})
+    assert not res.isError, _error_text(res)
+    sc = res.structuredContent
+    assert sc is not None
+    sec = sc["gaps"][0]
+    assert sec["candidates"] == []  # the map, not a shortlist
+    assert {(s["flavor"], s["n"]) for s in sec["other_shelves"]} == {("tech", 1), ("health", 1)}
+
+    res = _call("discover_gaps", {"flavor": "long"})  # flavor without role
+    assert res.isError
 
 
 def test_screen_candidate_cached(warm_book: Path, monkeypatch: pytest.MonkeyPatch) -> None:

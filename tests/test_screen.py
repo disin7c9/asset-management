@@ -320,3 +320,62 @@ def test_diversifier_values_are_typed() -> None:
     c = _check(_screen_one(close=clone, port=port), "diversifier")
     assert abs(c.values["rho"] - 1.0) < 1e-9
     assert "downside_rho" in c.values
+
+
+# --- own-drawdown (v2.12): the candidate's OWN worst fall, disclosed as a number ---
+
+def _flat_then_drop(n_flat: int, n_low: int, level: float) -> "pd.Series[float]":
+    vals = [100.0] * n_flat + [level] * n_low
+    idx = pd.bdate_range("2020-01-02", periods=len(vals))
+    return pd.Series(vals, index=idx, dtype=float)
+
+
+def test_own_drawdown_warns_when_deeper_than_the_book() -> None:
+    # The disclosure the diversifier check can't make: a fund can PASS on correlation
+    # while carrying drawdowns deeper than anything the book has lived through.
+    from app.risk import max_drawdown
+    from app.screen import _check_own_drawdown
+
+    cand = _flat_then_drop(400, 400, 52.0)          # its own worst fall: -48%
+    book_dd = max_drawdown(_flat_then_drop(400, 400, 90.0))  # the book's worst: -10%
+    r = _check_own_drawdown(cand, book_dd)
+    assert r.status == "warn"
+    assert "deeper than your book" in r.reason
+    assert r.values is not None and r.values["depth"] < -0.4
+
+
+def test_own_drawdown_passes_when_shallower_and_states_both_figures() -> None:
+    from app.risk import max_drawdown
+    from app.screen import _check_own_drawdown
+
+    cand = _flat_then_drop(400, 400, 95.0)          # -5%
+    book_dd = max_drawdown(_flat_then_drop(400, 400, 80.0))  # -20%
+    r = _check_own_drawdown(cand, book_dd)
+    assert r.status == "pass"
+    assert "your book's worst" in r.reason
+
+
+def test_own_drawdown_equity_scale_warns_even_without_book_context() -> None:
+    from app.screen import _check_own_drawdown
+
+    r = _check_own_drawdown(_flat_then_drop(400, 400, 60.0), None)  # -40%, no book dd
+    assert r.status == "warn"
+    assert "equity-scale" in r.reason
+
+
+def test_own_drawdown_short_history_is_na_not_false_comfort() -> None:
+    from app.screen import _check_own_drawdown
+
+    r = _check_own_drawdown(_flat_then_drop(60, 60, 99.0), None)  # ~6 months of history
+    assert r.status == "n/a"
+    assert "too short" in r.reason
+
+
+def test_own_drawdown_non_date_index_degrades_not_raises() -> None:
+    # The screen contract: degrade per-check, never raise — even on an index with no dates.
+    from app.screen import _check_own_drawdown
+
+    s = pd.Series([100.0, 50.0, 60.0] * 300, dtype=float)  # RangeIndex
+    r = _check_own_drawdown(s, None)
+    assert r.status == "n/a"
+    assert "date index" in r.reason

@@ -210,7 +210,7 @@ Expose your portfolio to an AI assistant (Claude Desktop, Claude Code, …) as *
 - **`risk_report`** — drawdown-first risk: max drawdown (depth/dates/recovery), Ulcer, CDaR, Sharpe/Sortino/Calmar, all with bootstrap confidence intervals.
 - **`rebalance_check`** — buy/sell/hold suggestions toward your `ASSET_TARGET` (it suggests, never trades; refuses to size over a partially-cached book).
 - **`securities_facts`** — published fund facts per holding (expense ratio, AUM, volume, age, category).
-- **`discover_gaps`** — suggest NEW ETFs for the roles you hold ≤3% of (propose-only; needs `--warm full`).
+- **`discover_gaps`** — suggest NEW ETFs for the roles you hold ≤3% of; optional `role`/`flavor` args drill one shelf (propose-only; judge a pick with `screen_candidate`).
 - **`screen_candidate`** — judge a NEW candidate ticker against your book (diversifier/cost/liquidity/age/overlap, each with a reason).
 - **`propose_allocation`** — a strategic target for a posture (`conservative`/`moderate`/`aggressive`) over your book + the universe, validated against a reference with the same walk-forward, Ulcer-first held-out verdict — propose-only, numbers from the core, never a recommendation.
 - **`starter_allocation`** — new to this? answer three plain risk questions → a starting posture and its validated proposal (the onboarding path into `propose_allocation`).
@@ -223,7 +223,7 @@ Expose your portfolio to an AI assistant (Claude Desktop, Claude Code, …) as *
     "asset-management": {
       "command": "uvx",
       "args": ["--from",
-               "https://github.com/disin7c9/asset-management/releases/download/v2.11.4/asset_management-2.11.4-py3-none-any.whl",
+               "https://github.com/disin7c9/asset-management/releases/download/v2.12.0/asset_management-2.12.0-py3-none-any.whl",
                "asset-management-mcp"],
       "env": {
         "ASSET_BOOK": "C:\\path\\to\\your\\transactions.csv",
@@ -422,7 +422,9 @@ With `--benchmark`, the held-out verdict resolves through three named gates: the
 
 ### 🔭 Discovery & the curated universe
 
-`--discover` maps your holdings to roles (US large, emerging markets, TIPS, REITs, …), finds the roles you hold ≤3% of, takes the biggest funds in each from a **curated universe** (bundled `app/data/universe.csv`, ~375 low-cost ETFs), and runs them through the **same screen** as `--screen` — printing a DISCOVERY panel, each candidate with its verdict (PASS/WARN/FAIL) and reasons. `--discover reit,tips` limits the roles; add `--narrate` for a fenced note ranking the picks by role-fit. A PASS is "sane, cheap, liquid, and genuinely different from what you hold" — never a prediction.
+`--discover` maps your holdings to roles (US large, emerging markets, TIPS, REITs, …), finds the roles you hold ≤3% of, takes the biggest **core** funds in each from a **curated universe** (bundled `app/data/universe.csv`, ~375 low-cost ETFs), and runs them through the **same screen** as `--screen` — printing a DISCOVERY panel, each candidate with its verdict (PASS/WARN/FAIL) and reasons. `--discover reit,tips` limits the roles; add `--narrate` for a fenced note ranking the picks by role-fit. A PASS is "sane, cheap, liquid, and genuinely different from what you hold" — never a prediction.
+
+Four honesty rules keep the panel from overreaching. A **gap means no dedicated fund** — broad funds you hold may already include the role at market weight (a total-market fund already holds mid/smalls; an aggregate bond fund already holds treasuries and IG corporates), so the panel says so instead of implying a hole. **Candidates come in shelves of near-substitutes** — each universe row carries a machine-readable `flavor` (its *shelf*: a treasury duration, a sector, REIT geography), and every menu shows one shelf's comparable funds (≥3, a genuine choice) while *naming* the role's other shelves with counts instead of hiding or ranking them; the default shelf is the one the presets already buy from, so it carries no new opinion, and drilling any other is one flag away (`--discover treasury:long`). **Core funds surface first** — a `core` flag (plain blend / diversified / investment-grade vs a Growth/Value style, single region, or high-yield tilt) keeps a junk-bond fund from ever filling a "corporate-bond gap" by AUM accident; core-less shelves stay index lines until you name them (`--discover corporate-bond:high-yield` is consent to see junk, labeled as junk). And **the sector/thematic aisle is never flagged as a gap** — not holding a tech bet is a stance, not a hole; `--discover sector-equity` hands you the shelf *map* (tech · semis · clean-energy · …) and refuses to pick a sector, because that choice is yours; drill a shelf to screen its funds. A custom universe without the new columns simply degrades to the plain behavior.
 
 The universe is **auto-built** (and refreshable) — no hand-maintenance:
 
@@ -523,7 +525,7 @@ asset-management/
 │   ├── cli.py        argparse + entry composition + delivery routing + structured run log
 │   ├── mcp_server.py read-only stdio MCP server: 8 tools over the core (offline; one-time cold-call auto-warm, ASSET_MCP_OFFLINE=1 opts out)
 │   ├── universe.py   curated ETF universe loader (Candidate + roles); app/data/universe.csv, auto-built
-│   ├── discover.py   book → role gaps → top-by-AUM candidates for the screen (--discover, propose-only)
+│   ├── discover.py   book → role gaps → shelf menus: lead-shelf default / full menu / index / drill (--discover, propose-only)
 │   ├── log_config.py logging setup
 │   ├── __main__.py   python -m app
 │   └── __init__.py

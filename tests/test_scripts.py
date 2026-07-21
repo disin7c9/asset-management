@@ -208,3 +208,31 @@ def test_readme_desktop_config_pins_the_current_release_wheel() -> None:
             f"README pins wheel {wheel} (tag v{tag}) but pyproject says {version} — "
             f"new Desktop installs would get the old release"
         )
+
+
+def test_build_universe_core_seed_map() -> None:
+    # The core/tilt seed the universe refresh writes (human-reviewed after): Growth/Value
+    # styles, single regions, and high-yield are tilts; blends/diversified/IG are core, and
+    # so are the sector categories — there the ROLE is the tilt, every fund represents it.
+    # A hole in this map would reseed junk as core on the next refresh.
+    spec = importlib.util.spec_from_file_location(
+        "build_universe", ROOT / "scripts" / "build_universe.py"
+    )
+    assert spec and spec.loader
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    assert mod._seed_core("Large Blend") == "1"
+    assert mod._seed_core("Large Growth") == "0"
+    assert mod._seed_core("Corporate Bond") == "1"
+    assert mod._seed_core("High Yield Bond") == "0"
+    assert mod._seed_core("Technology") == "1"
+    assert mod._seed_core("Japan Stock") == "0"
+    assert mod._seed_core("Foreign Small/Mid Blend") == "0"
+    # The flavor (shelf) seed rides the same category knowledge; unmapped -> blank
+    # (one unnamed shelf). Every flavor token the seed can emit must have >=1 committed
+    # row, or the refresh would invent shelves the reviewed file never had.
+    assert mod._seed_flavor("Intermediate Government") == "intermediate"
+    assert mod._seed_flavor("High Yield Bond") == "high-yield"
+    assert mod._seed_flavor("Miscellaneous Sector") == ""
+    # Mis-shelved funds stay dropped: a refresh must not silently restore them.
+    assert {"SPHB", "MTBA", "LMBS"} <= set(mod._DROP_TICKERS)

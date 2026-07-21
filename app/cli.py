@@ -44,7 +44,7 @@ from app.narrate import (
     build_prompt,
     render_narration,
 )
-from app.discover import Discovery, find_gaps, restrict_to
+from app.discover import Discovery, find_gaps, merge_menus, role_menu
 from app.universe import ROLES, Candidate, load_universe
 from app.returns import ReturnsSummary
 from app.risk import DollarDrawdown, RiskSummary
@@ -202,8 +202,12 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="suggest NEW tickers for the roles your book is light in, from the curated "
         "universe (bundled app/data/universe.csv), each judged by the same screen. Bare --discover "
-        "covers every gap; --discover reit,tips targets specific roles. Needs the price "
-        "pipeline; propose-only (no --rebalance/--backtest/--allocate in the same run).",
+        "covers every gap except the sector-equity satellite (a tactical bet, not a hole), showing "
+        "each role's standard shelf (3 comparable funds) and naming its other shelves. "
+        "--discover treasury shows a role's full per-shelf menu; --discover treasury:long drills "
+        "one shelf; --discover sector-equity maps the sector/theme shelves for you to drill — the "
+        "tool never picks a sector. Needs the price pipeline; propose-only (no "
+        "--rebalance/--backtest/--allocate in the same run).",
     )
     parser.add_argument(
         "--save",
@@ -599,7 +603,10 @@ def main(argv: list[str] | None = None) -> int:
         # which is itself book-free.
         if args.book is not None:
             summary_section = _compute_narration(state, prices, returns, risk, dollar_dd, run)
-        if discovery is not None and discovery_results is not None:
+        # Truthy, not `is not None`: a satellite shelf INDEX returns an empty results list —
+        # there are no candidates to rank, and narrating one would ask the model to
+        # recommend funds the tool deliberately withheld.
+        if discovery is not None and discovery_results:
             discovery_summary = _compute_discovery_narration(discovery, discovery_results, run)
         if benchmark is not None:
             benchmark_summary = _compute_benchmark_narration(benchmark, run)
@@ -1294,31 +1301,67 @@ def _compute_discover(
     if universe is None:
         return None, None
 
-    discovery = find_gaps(state, prices, universe)
-    if args.discover:  # a non-empty value → restrict to the named roles
-        wanted = [r.strip() for r in args.discover.split(",") if r.strip()]
+    # A named role may be a satellite, so the explicit path computes satellites-included;
+    # bare --discover keeps the default (satellites skipped, lead shelf per gap role).
+    discovery = find_gaps(state, prices, universe, include_satellites=bool(args.discover))
+    if args.discover:  # non-empty → the named menus: role, or role:flavor to drill a shelf
         gapset = set(discovery.gaps)
-        for r in wanted:
-            if r not in ROLES:
-                log.warning("--discover: %r is not a known role; ignoring", r)
-            elif r not in gapset:
-                log.info("--discover: %r is already covered in your book; skipping", r)
-        chosen = {r for r in wanted if r in gapset}
-        if not chosen:
+        menus = []
+        seen_roles: set[str] = set()
+        for token in (t.strip() for t in args.discover.split(",")):
+            if not token:
+                continue
+            role, _, flavor = token.partition(":")
+            if role not in ROLES:
+                log.warning("--discover: %r is not a known role; ignoring", role)
+            elif role in seen_roles:
+                # One menu per role: a repeat would double-screen its funds and garble the
+                # shelf map. The full menu (bare role token) already shows every shelf.
+                log.warning(
+                    "--discover: %s already requested; ignoring %r — use --discover %s "
+                    "for the full per-shelf menu", role, token, role,
+                )
+            elif role not in gapset:
+                log.info("--discover: %r is already covered in your book; skipping", role)
+            else:
+                try:
+                    menus.append(role_menu(state, prices, universe, role, flavor=flavor or None))
+                    seen_roles.add(role)
+                except ValueError as exc:  # unknown shelf — the message lists the valid ones
+                    log.warning("--discover: %s", exc)
+        if not menus:
             run["discover"] = "no matching gaps"
             return None, None
-        discovery = restrict_to(discovery, chosen)
+        discovery = merge_menus(menus)
 
-    if not discovery.candidates:
+    if not discovery.candidates and not discovery.more_shelves:
         log.info("--discover: your book already covers the universe's roles — no gaps to fill")
         run["discover"] = "no gaps"
         return None, None
 
+    if not discovery.candidates:  # a shelf index (satellite map): render it, nothing to screen
+        run["discover"] = "shelf index"
+        return discovery, []
     results = _screen_tickers(
         state, [c.ticker for c in discovery.candidates], args, run, today, daily,
         status_key="discover", with_role=args.target is not None, held_meta=held_meta,
     )
-    return (discovery, results) if results is not None else (None, None)
+    if results is None:
+        if not discovery.more_shelves:
+            return None, None
+        # Screening is unavailable (no portfolio return series), but the shelf-map parts
+        # need no screen — salvage the index instead of dropping the whole panel (a mixed
+        # `--discover sector-equity,treasury` must not lose the sector map because the
+        # treasury menu couldn't be screened).
+        run["discover"] = "shelf index; " + str(run.get("discover", "screen skipped"))
+        return (
+            Discovery(
+                gaps=discovery.gaps, exposure=discovery.exposure, candidates=(),
+                lead_flavor={}, more_shelves=discovery.more_shelves,
+            ),
+            [],
+        )
+    return discovery, results
 
 
 def _load_target_series(

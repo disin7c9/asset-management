@@ -253,11 +253,10 @@ def allocate(
 PresetName = Literal["conservative", "moderate", "aggressive"]
 PRESETS: frozenset[str] = frozenset(get_args(PresetName))
 
-# The 14 universe roles → 3 strategic buckets. Pinned to `universe.ROLES` by a test.
+# The 13 universe roles → 3 strategic buckets. Pinned to `universe.ROLES` by a test.
 _ROLE_BUCKET: dict[str, str] = {
     "us-large": "equity", "us-small-mid": "equity", "us-dividend": "equity",
     "intl-developed": "equity", "em-equity": "equity", "sector-equity": "equity",
-    "thematic-equity": "equity",
     "bond-aggregate": "bonds", "treasury": "bonds", "tips": "bonds",
     "corporate-bond": "bonds",
     "gold": "diversifiers", "commodity-broad": "diversifiers", "reit": "diversifiers",
@@ -277,7 +276,7 @@ _PRESET_BUCKETS: dict[str, dict[str, float]] = {
 # --discover or by hand). Each bucket's positive weights sum to 1.
 _ROLE_WEIGHT: dict[str, float] = {
     "us-large": 0.55, "intl-developed": 0.22, "us-dividend": 0.10,
-    "us-small-mid": 0.08, "em-equity": 0.05, "sector-equity": 0.0, "thematic-equity": 0.0,
+    "us-small-mid": 0.08, "em-equity": 0.05, "sector-equity": 0.0,
     "bond-aggregate": 0.50, "treasury": 0.20, "corporate-bond": 0.18, "tips": 0.12,
     "gold": 0.60, "reit": 0.40, "commodity-broad": 0.0,
 }

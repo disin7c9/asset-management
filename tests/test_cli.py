@@ -572,9 +572,87 @@ def test_discover_panel_renders(
     out = capsys.readouterr().out
     assert rc == 0
     assert "DISCOVERY (roles you're light in" in out
+    assert "A gap = no dedicated fund" in out  # the containment caveat leads the panel
     assert "reit  — you currently hold 0%" in out
     assert "VNQ" in out  # a reit candidate from the universe was screened
     assert "VNQ:" in _run_summary(caplog)["discover"]  # verdict recorded
+
+
+def test_discover_satellites_only_when_named(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str],
+) -> None:
+    # Bare --discover never flags the sector/thematic satellites (a tactical bet, not a
+    # hole); naming one explicitly still surfaces it with its candidates.
+    from app.metadata import MetadataResult, SecurityMeta
+
+    now = datetime.now(timezone.utc)
+    canned = {
+        tk: PriceRow(tk, date.today(), px, "test", now)
+        for tk, px in {"BND": 73.0, "IAU": 84.0, "VEA": 72.0, "VOO": 697.0}.items()
+    }
+    monkeypatch.setattr(
+        "app.cli.fetch_latest",
+        lambda tickers, *a, **k: PricesResult(
+            rows={tk: canned[tk] for tk in tickers if tk in canned},
+            missing=[tk for tk in tickers if tk not in canned],
+        ),
+    )
+    monkeypatch.setattr("app.cli.fetch_series", _flat_series)
+    monkeypatch.setattr("app.pipeline.price_basis_mismatches", lambda *a, **k: [])
+    monkeypatch.setattr(
+        "app.pipeline.fetch_metadata",
+        lambda tickers, **k: MetadataResult(
+            rows={
+                tk: SecurityMeta(
+                    ticker=tk, expense_ratio=0.0003, aum=5e9, avg_volume=2e6,
+                    category="Miscellaneous", family="Vanguard",
+                    legal_type="Exchange Traded Fund", quote_type="ETF",
+                    inception=date(2015, 1, 1),
+                )
+                for tk in tickers
+            }
+        ),
+    )
+    rc = main(["--csv", str(SAMPLE), "--discover"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "DISCOVERY (roles you're light in" in out  # other gaps still surface
+    assert "sector-equity" not in out and "thematic-equity" not in out
+
+    # Naming the satellite yields its SHELF INDEX — a map of sectors/themes with counts,
+    # no tickers, nothing screened: picking the sector is the user's bet, not the tool's.
+    rc = main(["--csv", str(SAMPLE), "--discover", "sector-equity"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "sector-equity  — you currently hold 0%" in out
+    assert "tech (" in out and "clean-energy (" in out  # sectors AND themes, one aisle
+    assert "VGT" not in out  # the index refuses to shortlist a sector
+
+    # Drilling one shelf screens that shelf's funds.
+    rc = main(["--csv", str(SAMPLE), "--discover", "sector-equity:tech"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "VGT" in out and "XLK" in out  # the tech shelf's comparable funds, screened
+    assert "SMH" not in out  # semis are their own shelf, not "technology"
+
+    # Review fix: a repeated role token is collapsed with a warning — one menu per role,
+    # never a double-screened fund or a garbled shelf map.
+    with caplog.at_level(logging.WARNING):
+        rc = main(["--csv", str(SAMPLE), "--discover", "reit,reit:global"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "already requested" in caplog.text
+    assert out.count("VNQ   ") == 1  # the candidate line renders exactly once
+
+    # Review fix: a satellite shelf INDEX has no candidates to rank — --narrate must not
+    # build a note that would ask the model to recommend deliberately withheld funds.
+    def _boom(*a: object, **k: object) -> None:
+        raise AssertionError("discovery narration must not run for a shelf index")
+
+    monkeypatch.setattr("app.cli._compute_discovery_narration", _boom)
+    rc = main(["--csv", str(SAMPLE), "--discover", "sector-equity", "--narrate"])
+    assert rc == 0  # the gate skipped narration; _boom never fired
 
 
 def test_discover_with_target_runs_the_role_check(

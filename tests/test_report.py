@@ -353,3 +353,24 @@ def test_securities_section_uses_one_consistent_asof(state) -> None:
     sec = next(s for s in data.sections if s.title.startswith("SECURITIES"))
     assert any("10.0y" in line for line in sec.lines)  # age computed from the SAME date
     assert any("ETF" in line for line in sec.lines)    # quote_type surfaced in the row
+
+
+def test_shelf_index_drill_hint_skips_blank_flavors() -> None:
+    # Review fix: the index's example command must be a runnable drill — a blank flavor
+    # would suggest `--discover role:` which just re-renders the index.
+    from app.discover import Discovery
+    from app.report import _section_discoveries
+
+    blank_first = Discovery(
+        gaps=("sector-equity",), exposure={}, candidates=(),
+        more_shelves={"sector-equity": (("", 2), ("tech", 3))},
+    )
+    text = "\n".join(_section_discoveries(blank_first, []).lines)
+    assert "--discover sector-equity:tech" in text  # first NAMED shelf, not the blank one
+
+    all_blank = Discovery(
+        gaps=("sector-equity",), exposure={}, candidates=(),
+        more_shelves={"sector-equity": (("", 2),)},
+    )
+    text = "\n".join(_section_discoveries(all_blank, []).lines)
+    assert "e.g. --discover" not in text  # no runnable example exists → no hint line

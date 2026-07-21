@@ -71,7 +71,7 @@ from app.backtest import (
     benchmark_weights,
 )
 from app.derive import DerivedState
-from app.discover import find_gaps
+from app.discover import Discovery, find_gaps, role_menu
 from app.events import CASH_TICKER, Event, load_events, load_target
 from app.log_config import setup_logging
 from app.metadata import fetch_metadata
@@ -80,7 +80,7 @@ from app.returns import ReturnsSummary
 from app.risk import DollarDrawdown, MetricCI, RiskSummary
 from app.screen import screen_candidates
 from app.strategy import VALID_MODES, Mode, suggest
-from app.universe import load_universe
+from app.universe import RoleName, load_universe
 
 if TYPE_CHECKING:
     import pandas as pd
@@ -522,12 +522,38 @@ class GapCandidate(BaseModel):
     ticker: str
     name: str
     role: str
+    flavor: str = Field(
+        default="",
+        description="the SHELF this fund sits on within its role (e.g. treasury duration, "
+        "a sector) — a display/address label, never a recommendation; blank = the role's "
+        "one unnamed shelf",
+    )
+
+
+class FlavorShelf(BaseModel):
+    flavor: str
+    n: int = Field(description="universe funds on this shelf (named, not screened)")
 
 
 class RoleGap(BaseModel):
     role: str
     current_exposure: float = Field(description="share of your book in this role (0..1)")
-    candidates: list[GapCandidate] = Field(description="largest low-cost ETFs in this role, by AUM")
+    candidates: list[GapCandidate] = Field(
+        description="comparable funds from the role's standard shelf (its lead flavor), "
+        "core funds first — a ≥3-way choice of near-substitutes, never a ranking"
+    )
+    lead_flavor: str = Field(
+        default="",
+        description="the shelf the candidates came from — the same shelf the presets buy "
+        "from, so the default carries no new stance; blank for single-shelf roles",
+    )
+    other_shelves: list[FlavorShelf] = Field(
+        default_factory=list,
+        description="this role's OTHER shelves, named with counts but not surfaced — "
+        "different exposures the user may deliberately choose (call again with role= and "
+        "flavor= to see one); choosing between shelves is the user's decision, tell them "
+        "these exist rather than picking for them",
+    )
 
 
 class DiscoveryGaps(BaseModel):
@@ -539,9 +565,11 @@ class DiscoveryGaps(BaseModel):
         "may be skewed; warm the cache for the full picture",
     )
     note: str = (
-        "Roles your book holds ≤3% of, with the biggest funds for each — propose-only, "
-        "never a prediction. For the full screen (cost / liquidity / overlap / "
-        "did-it-diversify-your-drawdowns) call `screen_candidate`. " + _OFFLINE_NOTE
+        "Roles your book holds ≤3% of, each showing its standard shelf's comparable funds "
+        "— propose-only, never a prediction. `other_shelves` names sub-exposures not shown "
+        "(treasury durations, sectors); picking a shelf is the user's decision. For the "
+        "full screen (cost / liquidity / overlap / did-it-diversify-your-drawdowns) call "
+        "`screen_candidate`. " + _OFFLINE_NOTE
     )
 
 
@@ -894,12 +922,18 @@ def securities_facts() -> SecuritiesFacts:
 
 @mcp.tool(
     annotations=_read_only("Discover gaps"),
-    description="Roles the user's portfolio is light in (≤3% of market value) and the largest "
-    "low-cost ETFs that fill each (offline, read-only, propose-only). Use to answer 'what am I "
-    "missing / what could I consider adding'. The candidate listing is deterministic; for the "
-    "full per-candidate screen call `screen_candidate`.",
+    description="Roles the user's portfolio is light in (≤3% of market value), each with "
+    "comparable funds from its standard SHELF — core funds first, so a style tilt or junk bond "
+    "never fills a gap while a plain option exists (offline, read-only, propose-only). "
+    "`other_shelves` names the role's other sub-exposures (treasury durations, REIT geography) "
+    "without picking one: choosing a shelf is the user's decision. The sector-equity satellite "
+    "is never flagged as a gap (a tactical bet, not a hole) — call with role='sector-equity' to "
+    "get its shelf map, then add flavor= to see one shelf's funds. A gap means no dedicated "
+    "fund; broad funds the user holds may already include the role at market weight. Use to "
+    "answer 'what am I missing / what could I consider adding'. Deterministic; for the full "
+    "per-candidate screen call `screen_candidate`.",
 )
-def discover_gaps() -> DiscoveryGaps:
+def discover_gaps(role: RoleName | None = None, flavor: str | None = None) -> DiscoveryGaps:
     today = date.today()
     b = _build(no_risk=True, today=today)
     if not b.prices:
@@ -908,21 +942,40 @@ def discover_gaps() -> DiscoveryGaps:
             "Warm the cache once with `uv run python -m app --book <your-book> --warm full` "
             "(`full` also fetches the discovery universe), then retry."
         ))
+    if flavor is not None and role is None:
+        raise ValueError("flavor= needs role= — a shelf is addressed within its role.")
     universe = load_universe(_universe_path())
     if not universe:
         raise ValueError(f"the curated universe is empty or missing at {_universe_path()}.")
-    discovery = find_gaps(b.state, b.prices, universe)
+    discovery: Discovery
+    if role is None:
+        discovery = find_gaps(b.state, b.prices, universe)
+    else:
+        gapset = set(find_gaps(
+            b.state, b.prices, universe, include_satellites=True
+        ).gaps)
+        if role not in gapset:
+            raise ValueError(
+                f"{role} is not a gap in this book (exposure above the threshold, or the "
+                "universe has no such role) — discovery only proposes for roles held ≤3%."
+            )
+        discovery = role_menu(b.state, b.prices, universe, role, flavor=flavor)
     gaps = [
         RoleGap(
-            role=role,
-            current_exposure=discovery.exposure.get(role, 0.0),
+            role=r,
+            current_exposure=discovery.exposure.get(r, 0.0),
             candidates=[
-                GapCandidate(ticker=c.ticker, name=c.name, role=c.role)
+                GapCandidate(ticker=c.ticker, name=c.name, role=c.role, flavor=c.flavor)
                 for c in discovery.candidates
-                if c.role == role
+                if c.role == r
+            ],
+            lead_flavor=discovery.lead_flavor.get(r, ""),
+            other_shelves=[
+                FlavorShelf(flavor=f, n=n)
+                for f, n in discovery.more_shelves.get(r, ())
             ],
         )
-        for role in discovery.gaps
+        for r in discovery.gaps
     ]
     return DiscoveryGaps(asof=today, gaps=gaps, unpriced_holdings=sorted(b.missing))
 

@@ -34,7 +34,7 @@ from app.returns import ReturnsSummary
 from app.risk import NOISY_THRESHOLD_DAYS, DollarDrawdown, DrawdownInfo, MetricCI, RiskSummary
 from app.screen import CandidateScreen
 from app.strategy import Suggestion
-from app.universe import Candidate
+from app.universe import FLAVOR_NOTES, SATELLITE_ROLES, Candidate
 
 _NA = "n/a"
 _DISCLAIMER = (
@@ -460,32 +460,82 @@ def _section_candidates(results: list[CandidateScreen]) -> Section:
     return Section("CANDIDATES (deterministic screen)", tuple(lines))
 
 
+def _flavor_label(flavor: str) -> str:
+    """A shelf's display label: the token plus its gloss when we have one."""
+    note = FLAVOR_NOTES.get(flavor)
+    return f"{flavor} — {note}" if note else flavor
+
+
 def _section_discoveries(discovery: Discovery, results: list[CandidateScreen]) -> Section:
-    """The discovery panel: roles the book is light in, with screened universe candidates.
-    Grouped by gap role; each candidate shows its summary, the screen verdict, and the
-    notable (warn/fail) reasons. Propose-only — a PASS is "sane, cheap, liquid, genuinely
-    different", never a prediction."""
+    """The discovery panel: roles the book is light in, with screened universe candidates
+    grouped by SHELF (flavor) where a role has them. A shelf label is a menu heading, never
+    a pick: candidates under one shelf are near-substitutes; other shelves are named with
+    counts ("also here"), and a satellite role renders as a shelf INDEX — picking a
+    sector/theme is the user's bet, so the panel maps it and refuses to shortlist.
+    Propose-only — a PASS is "sane, cheap, liquid, genuinely different", never a
+    prediction."""
     by_ticker = {r.ticker: r for r in results}
     by_role: dict[str, list[Candidate]] = {}
     for c in discovery.candidates:
         by_role.setdefault(c.role, []).append(c)
-    lines: list[str] = []
+    lines: list[str] = [
+        "A gap = no dedicated fund in this role; broad funds you hold may already include "
+        "it at market weight. Where shelves are named, each shelf is a different exposure — "
+        "choosing between them is yours; the funds under one shelf are the comparable options.",
+        "",
+    ]
     for role in discovery.gaps:
-        cands = by_role.get(role)
-        if not cands:
+        cands = by_role.get(role, [])
+        more = discovery.more_shelves.get(role, ())
+        if not cands and not more:
             continue
         lines.append(f"{role}  — you currently hold {discovery.exposure.get(role, 0.0) * 100:.0f}%")
+
+        if not cands:  # the shelf index (satellite map): counts only, nothing screened
+            if role in SATELLITE_ROLES:
+                lines.append(
+                    "  a tactical bet, not a hole — picking the sector/theme is the decision "
+                    "here, and it is yours. This maps the shelves; it won't rank them."
+                )
+            lines.append(
+                "    " + " · ".join(f"{f or '(unnamed)'} ({n})" for f, n in more)
+            )
+            # The example must be a runnable drill: a blank flavor would render
+            # `--discover role:` which just re-shows this index.
+            named = next((f for f, _ in more if f), None)
+            if named:
+                lines.append(
+                    f"  name one to see its screened funds, e.g. --discover {role}:{named}"
+                )
+            lines.append("")
+            continue
+
+        groups: dict[str, list[Candidate]] = {}
         for c in cands:
-            r = by_ticker.get(c.ticker)
-            verdict = r.verdict.upper() if r is not None else "N/A"
-            counts = f"  ({r.counts()})" if r is not None else ""
-            lines.append(f"  {c.ticker:6}{verdict:<5} {c.name}{counts}")
-            if c.summary:
-                lines.append(f"         {c.summary}")
-            if r is not None:
-                for chk in r.checks:
-                    if chk.status in ("warn", "fail"):
-                        lines.append(f"         [{chk.status}] {chk.name}: {chk.reason}")
+            groups.setdefault(c.flavor, []).append(c)
+        labeled = len(groups) > 1 or (bool(more) and any(f for f in groups))
+        for flavor, rows in groups.items():
+            if labeled and flavor:
+                lines.append(f"  · {_flavor_label(flavor)}")
+            for c in rows:
+                r = by_ticker.get(c.ticker)
+                verdict = r.verdict.upper() if r is not None else "N/A"
+                counts = f"  ({r.counts()})" if r is not None else ""
+                lines.append(f"  {c.ticker:6}{verdict:<5} {c.name}{counts}")
+                if c.summary:
+                    lines.append(f"         {c.summary}")
+                if r is not None:
+                    for chk in r.checks:
+                        if chk.status in ("warn", "fail"):
+                            lines.append(f"         [{chk.status}] {chk.name}: {chk.reason}")
+        if len(cands) < 3:
+            lines.append(f"  (thin shelf — only {len(cands)} fund(s) in the universe here)")
+        if more:
+            lines.append(
+                "  also here: "
+                + " · ".join(f"{_flavor_label(f) if f else '(unnamed)'} ({n})" for f, n in more)
+                + f" — drill with --discover {role}:<shelf>"
+            )
         lines.append("")
     lines.append(
         'Discovery is propose-only: roles you hold little of + screened options; a PASS is '

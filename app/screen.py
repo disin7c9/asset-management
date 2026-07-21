@@ -262,6 +262,56 @@ def _check_diversifier(
     return CheckResult("diversifier", status, "; ".join(parts), values)
 
 
+# The candidate's own worst fall: history shorter than this is n/a (a young fund's shallow
+# drawdown is false comfort); deeper than this warns even without book context.
+_OWN_DD_MIN_YEARS = 2.0
+_OWN_DD_WARN = -0.30
+
+
+def _check_own_drawdown(
+    cand_close: "pd.Series[float] | None",
+    portfolio_dd: DrawdownInfo | None,
+) -> CheckResult:
+    """The candidate's OWN worst price fall over its fetched history, vs the book's worst.
+
+    The drawdown-first disclosure the diversifier check can't make: long treasuries or
+    junk bonds PASS on correlation (they do move differently) while carrying equity-scale
+    drawdowns of their own — the computed number says so; the tool never editorializes."""
+    if cand_close is None or cand_close.empty:
+        return CheckResult("own-drawdown", "n/a", "no usable price history")
+    try:
+        # min/max, not positional ends: robust to a non-monotonic index; the except keeps
+        # the module's "degrades per-check, never raises" contract on a non-date index.
+        years = (cand_close.index.max() - cand_close.index.min()).days / 365.25
+    except (AttributeError, TypeError):
+        return CheckResult("own-drawdown", "n/a", "price history has no usable date index")
+    if years < _OWN_DD_MIN_YEARS:
+        return CheckResult(
+            "own-drawdown", "n/a",
+            f"only {years:.1f}y of history (< {_OWN_DD_MIN_YEARS:.0f}y) — too short to judge; "
+            "a young fund's shallow drawdown is false comfort",
+        )
+    dd = max_drawdown(cand_close)
+    if dd is None or dd.depth >= 0:
+        return CheckResult("own-drawdown", "pass", f"no drawdown in {years:.1f}y of history")
+    values: dict[str, float] = {"depth": dd.depth, "history_years": years}
+    desc = f"worst fall {dd.depth * 100:.1f}% ({dd.peak_date}→{dd.trough_date}) in {years:.1f}y"
+    if portfolio_dd is not None and portfolio_dd.depth < 0:
+        values["book_depth"] = portfolio_dd.depth
+        if dd.depth < portfolio_dd.depth:
+            return CheckResult(
+                "own-drawdown", "warn",
+                f"{desc} — deeper than your book's worst ({portfolio_dd.depth * 100:.1f}%)",
+                values,
+            )
+        desc += f"; your book's worst is {portfolio_dd.depth * 100:.1f}%"
+    if dd.depth <= _OWN_DD_WARN:
+        return CheckResult(
+            "own-drawdown", "warn", f"{desc} — equity-scale drawdowns of its own", values
+        )
+    return CheckResult("own-drawdown", "pass", desc, values)
+
+
 def _check_overlap(
     m: SecurityMeta | None, held_meta: dict[str, SecurityMeta]
 ) -> CheckResult:
@@ -361,6 +411,7 @@ def screen_candidates(
         checks.append(_check_age(m, asof))
         checks.append(_check_concentration(m))
         checks.append(_check_diversifier(candidate_close.get(tk), portfolio_returns, portfolio_dd))
+        checks.append(_check_own_drawdown(candidate_close.get(tk), portfolio_dd))
         checks.append(_check_overlap(m, held_meta))
         if role is not None:  # a target was supplied → the walk-forward evidence row
             checks.append(_check_role(role.get(tk)))

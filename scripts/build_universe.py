@@ -22,6 +22,58 @@ import sys
 
 import yfinance as yf
 
+# Morningstar categories whose funds are a TILT within their role rather than a plain
+# representative of it: Growth/Value styles, single regions, foreign small/mid, high-yield.
+# Everything else seeds core=1 — blends, diversified EM, investment-grade bonds, and the
+# sector/thematic categories (there the ROLE is the tilt; within it every fund represents it).
+# Seeds the universe's `core` column for human review; discovery surfaces core funds first.
+_NON_CORE_CATEGORIES: frozenset[str] = frozenset(
+    {
+        "Large Growth", "Mid-Cap Growth", "Mid-Cap Value", "Small Growth", "Small Value",
+        "Foreign Large Growth", "Foreign Large Value", "Foreign Small/Mid Blend",
+        "Europe Stock", "Japan Stock", "Pacific/Asia ex-Japan Stk",
+        "High Yield Bond",
+    }
+)
+
+
+def _seed_core(category: str) -> str:
+    return "0" if category in _NON_CORE_CATEGORIES else "1"
+
+
+# Category -> flavor (SHELF) seed. The shelf groups near-substitutes within a role for
+# discovery's menus; sector categories seed the block-level token and the human review
+# refines finer shelves (semis/software/ai/... — the committed file is the record).
+# Blank = the role's one unnamed shelf.
+_CATEGORY_FLAVOR: dict[str, str] = {
+    "Large Blend": "blend", "Large Growth": "growth",
+    "Mid-Cap Blend": "mid-blend", "Mid-Cap Growth": "mid-growth", "Mid-Cap Value": "mid-value",
+    "Small Blend": "small-blend", "Small Growth": "small-growth", "Small Value": "small-value",
+    "Foreign Large Blend": "blend", "Foreign Large Growth": "growth",
+    "Foreign Large Value": "value", "Foreign Small/Mid Blend": "small-mid",
+    "Europe Stock": "europe", "Japan Stock": "japan",
+    "Diversified Emerging Mkts": "diversified", "Pacific/Asia ex-Japan Stk": "asia-pacific",
+    "Long Government": "long", "Intermediate Government": "intermediate",
+    "Short Government": "short",
+    "Corporate Bond": "investment-grade", "High Yield Bond": "high-yield",
+    "Real Estate": "us", "Global Real Estate": "global",
+    "Technology": "tech", "Health": "health", "Financial": "financial",
+    "Utilities": "utilities", "Equity Energy": "energy",
+    "Natural Resources": "nat-resources", "Infrastructure": "infrastructure",
+}
+
+
+def _seed_flavor(category: str) -> str:
+    return _CATEGORY_FLAVOR.get(category, "")
+
+
+# Mis-shelved funds a category query keeps re-pulling: SPHB is a large-cap high-beta
+# factor fund tagged "Mid-Cap Blend"; MTBA/LMBS are mortgage funds tagged as treasuries
+# (the committed file re-roles them to bond-aggregate tilts by hand). Dropped from pulls
+# so a refresh can't silently restore the wrong shelf.
+_DROP_TICKERS = frozenset({"SPHB", "MTBA", "LMBS"})
+
+
 # Category substring -> role. First match wins; order matters (specific before general).
 # Unmapped -> "REVIEW". Gold is handled by name/category before this table.
 _CATEGORY_RULES: tuple[tuple[str, str], ...] = (
@@ -70,7 +122,10 @@ def _fetch(ticker: str) -> dict[str, str]:
     summary = _short_summary(info.get("longBusinessSummary") or "")
     if role == "REVIEW":  # leave the raw category visible so the human can place it
         summary = (summary + f"  [category: {category or 'n/a'}]").strip()
-    return {"ticker": ticker.upper(), "name": name, "role": role, "summary": summary}
+    return {
+        "ticker": ticker.upper(), "name": name, "role": role, "summary": summary,
+        "core": _seed_core(category), "flavor": _seed_flavor(category),
+    }
 
 
 # Names that mark a leveraged/inverse product (out of scope — long-only) → dropped from the pull.
@@ -79,11 +134,12 @@ _EXCLUDE_NAME = (
 )
 
 # Our role → Morningstar categorynames (ETFQuery filters on these, so the role is known from the
-# query — no per-ticker fetch). Covers 10 of 14 roles. The other 4 stay curated below: us-dividend
-# (a strategy inside "Large Value"), thematic ("Miscellaneous Sector" junk-drawer), gold bullion
-# ("Commodities Focused" — not an allowed value), and bond-aggregate (its funds are tagged
-# "Intermediate Core Bond", which the query enum rejects — the only allowed near-match,
-# "Intermediate-Term Bond", matches zero funds). All names below verified to return ETFs.
+# query — no per-ticker fetch). Covers 10 of 13 roles. The other 3 stay curated below: us-dividend
+# (a strategy inside "Large Value"), gold bullion ("Commodities Focused" — not an allowed value),
+# and bond-aggregate (its funds are tagged "Intermediate Core Bond", which the query enum rejects —
+# the only allowed near-match, "Intermediate-Term Bond", matches zero funds). Theme funds
+# ("Miscellaneous Sector" junk-drawer) are also curated, as shelves of sector-equity.
+# All names below verified to return ETFs.
 _ROLE_CATEGORIES: dict[str, tuple[str, ...]] = {
     "us-large": ("Large Blend", "Large Growth"),  # "Large Value" omitted (where dividend funds sit)
     "us-small-mid": ("Mid-Cap Blend", "Mid-Cap Growth", "Mid-Cap Value",
@@ -93,14 +149,16 @@ _ROLE_CATEGORIES: dict[str, tuple[str, ...]] = {
     "em-equity": ("Diversified Emerging Mkts", "Pacific/Asia ex-Japan Stk"),
     "sector-equity": ("Technology", "Health", "Financial", "Utilities", "Equity Energy",
                       "Natural Resources", "Infrastructure"),
-    "treasury": ("Long Government", "Intermediate Government", "Short Government"),
+    # Intermediate first: the role's lead shelf (and preset default) is the standard
+    # market-duration sleeve, so the refresh keeps intermediates at the top of the block.
+    "treasury": ("Intermediate Government", "Long Government", "Short Government"),
     "tips": ("Inflation-Protected Bond",),
     "corporate-bond": ("Corporate Bond", "High Yield Bond"),
     "reit": ("Real Estate", "Global Real Estate"),
     "commodity-broad": ("Commodities Broad Basket",),
 }
 
-# The 4 roles with no clean/queryable category — a small, stable curated set (wins on ticker conflict).
+# The 3 roles with no clean/queryable category + the theme shelves — a small, stable curated set (wins on ticker conflict).
 _CURATED: tuple[dict[str, str], ...] = (
     {"ticker": "SCHD", "name": "Schwab U.S. Dividend Equity ETF", "role": "us-dividend",
      "summary": "High-dividend, quality-screened US stocks (Dow Jones US Dividend 100)."},
@@ -117,10 +175,24 @@ _CURATED: tuple[dict[str, str], ...] = (
      "summary": "Physical gold bullion (low-cost MiniShares)."},
     {"ticker": "IAUM", "name": "iShares Gold Trust Micro", "role": "gold",
      "summary": "Physical gold bullion (low-cost Micro)."},
-    {"ticker": "ICLN", "name": "iShares Global Clean Energy ETF", "role": "thematic-equity",
+    {"ticker": "ICLN", "name": "iShares Global Clean Energy ETF", "role": "sector-equity",
+     "flavor": "clean-energy",
      "summary": "~100 global clean-energy companies (S&P Global Clean Energy)."},
-    {"ticker": "TAN", "name": "Invesco Solar ETF", "role": "thematic-equity",
+    {"ticker": "TAN", "name": "Invesco Solar ETF", "role": "sector-equity",
+     "flavor": "clean-energy",
      "summary": "Global solar-energy companies (MAC Global Solar Energy Index)."},
+    # The ARK family: cross-sector theme funds the category queries mis-file (ARKK as
+    # "Technology", ARKQ/ARKW as mid-caps) — curated so a refresh keeps them on the
+    # innovation shelf of the sector/thematic aisle.
+    {"ticker": "ARKK", "name": "ARK Innovation ETF", "role": "sector-equity",
+     "flavor": "innovation",
+     "summary": "Disruptive innovation across sectors, actively managed (ARK)."},
+    {"ticker": "ARKQ", "name": "ARK Autonomous Technology & Robotics ETF",
+     "role": "sector-equity", "flavor": "innovation",
+     "summary": "Autonomous tech & robotics, actively managed (ARK)."},
+    {"ticker": "ARKW", "name": "ARK Next Generation Internet ETF",
+     "role": "sector-equity", "flavor": "innovation",
+     "summary": "Next-generation internet, actively managed (ARK)."},
     {"ticker": "BND", "name": "Vanguard Total Bond Market ETF", "role": "bond-aggregate",
      "summary": "Broad US investment-grade taxable bond market."},
     {"ticker": "AGG", "name": "iShares Core U.S. Aggregate Bond ETF", "role": "bond-aggregate",
@@ -155,9 +227,11 @@ def _auto_pull(min_aum: float, per_category: int) -> dict[str, dict[str, str]]:
                 sym = (r.get("symbol") or "").upper()
                 nm = r.get("shortName") or r.get("longName") or sym
                 if (sym and "." not in sym and r.get("quoteType") == "ETF" and sym not in seen
+                        and sym not in _DROP_TICKERS
                         and not any(x in nm.lower() for x in _EXCLUDE_NAME)):
                     seen[sym] = {"ticker": sym, "name": nm, "role": role,
-                                 "summary": f"{cat} ETF.",
+                                 "summary": f"{cat} ETF.", "core": _seed_core(cat),
+                                 "flavor": _seed_flavor(cat),
                                  "_aum": float(r.get("fundnetassets") or r.get("marketCap") or 0.0)}
                     kept += 1
             print(f"  {role:16} {cat:28} +{kept}", file=sys.stderr)
@@ -205,8 +279,8 @@ def main(argv: list[str] | None = None) -> int:
                     help="max ETFs per --from-screen, or per category for --auto (default 100)")
     ap.add_argument(
         "--auto", action="store_true",
-        help="auto-build the WHOLE universe via ETFQuery-by-category-by-AUM (11 roles) + the "
-        "curated odd roles (dividend/gold/thematic). Writes complete rows; no per-ticker fetch.",
+        help="auto-build the WHOLE universe via ETFQuery-by-category-by-AUM (10 roles) + the "
+        "curated odd roles (dividend/gold/bond-aggregate + theme shelves). Writes complete rows; no per-ticker fetch.",
     )
     ap.add_argument("--min-aum", type=float, default=1e9, help="AUM floor for --auto (default $1B)")
     args = ap.parse_args(argv)
@@ -214,12 +288,18 @@ def main(argv: list[str] | None = None) -> int:
     if args.auto:
         rows_by_ticker = _auto_pull(args.min_aum, args.count)
         for c in _CURATED:  # curated wins on a conflict (SCHD is us-dividend, not auto's us-large)
-            rows_by_ticker[c["ticker"]] = {**c, "_aum": float("inf")}  # anchors lead their role
+            # pop first so a curated row takes the CURATED list's position, not the auto
+            # pull's (a dict update keeps the old slot — that artifact once let VIG jump
+            # ahead of SCHD). Anchors lead their role; curated rows are core by construction.
+            rows_by_ticker.pop(c["ticker"], None)
+            rows_by_ticker[c["ticker"]] = {
+                **c, "core": "1", "flavor": c.get("flavor", ""), "_aum": float("inf"),
+            }
         # Group by role, biggest-AUM first within each role → discovery's "top 3" = the giants.
         out_rows = sorted(rows_by_ticker.values(), key=lambda r: (r["role"], -float(r.get("_aum", 0.0))))
         out = open(args.out, "w", newline="", encoding="utf-8") if args.out else sys.stdout
         try:
-            writer = csv.DictWriter(out, fieldnames=("ticker", "name", "role", "summary"),
+            writer = csv.DictWriter(out, fieldnames=("ticker", "name", "role", "summary", "core", "flavor"),
                                     extrasaction="ignore")
             writer.writeheader()
             writer.writerows(out_rows)
@@ -252,7 +332,7 @@ def main(argv: list[str] | None = None) -> int:
 
     out = open(args.out, "w", newline="", encoding="utf-8") if args.out else sys.stdout
     try:
-        writer = csv.DictWriter(out, fieldnames=("ticker", "name", "role", "summary"))
+        writer = csv.DictWriter(out, fieldnames=("ticker", "name", "role", "summary", "core", "flavor"))
         writer.writeheader()
         writer.writerows(rows)
     finally:

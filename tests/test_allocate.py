@@ -266,3 +266,33 @@ def test_preset_role_tables_cover_every_role() -> None:
 
     assert set(A._ROLE_BUCKET) == ROLES
     assert set(A._ROLE_WEIGHT) == ROLES
+
+
+def test_bundled_universe_preset_targets_are_pinned() -> None:
+    # The v2.12 invariant: universe-file edits (new rows, the core column) must not move
+    # preset composition — `_resolve_role_tickers` takes each role's FIRST row, so this
+    # golden fails loudly if a refresh reorders a role. Update it only on a deliberate
+    # universe refresh, never as collateral of another change.
+    from pathlib import Path
+
+    from app.allocate import build_preset_target
+    from app.universe import load_universe
+
+    uni = load_universe(Path(__file__).resolve().parent.parent / "app" / "data" / "universe.csv")
+    golden = {
+        "conservative": {
+            "BND": 0.25, "IAU": 0.09, "IEF": 0.1, "SCHP": 0.06, "VCIT": 0.09, "VIG": 0.035,
+            "VNQ": 0.06, "VO": 0.028, "VTI": 0.1925, "VWO": 0.0175, "VXUS": 0.077,
+        },
+        "moderate": {
+            "BND": 0.15, "IAU": 0.09, "IEF": 0.06, "SCHP": 0.036, "VCIT": 0.054, "VIG": 0.055,
+            "VNQ": 0.06, "VO": 0.044, "VTI": 0.3025, "VWO": 0.0275, "VXUS": 0.121,
+        },
+        "aggressive": {
+            "BND": 0.06, "IAU": 0.078, "IEF": 0.024, "SCHP": 0.0144, "VCIT": 0.0216,
+            "VIG": 0.075, "VNQ": 0.052, "VO": 0.06, "VTI": 0.4125, "VWO": 0.0375, "VXUS": 0.165,
+        },
+    }
+    for preset, want in golden.items():
+        got = {tk: round(w, 6) for tk, w in build_preset_target(preset, uni, {}).items()}
+        assert got == want, preset

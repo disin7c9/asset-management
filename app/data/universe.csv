@@ -1,376 +1,375 @@
-ticker,name,role,summary
-BND,Vanguard Total Bond Market ETF,bond-aggregate,Broad US investment-grade taxable bond market.
-AGG,iShares Core U.S. Aggregate Bond ETF,bond-aggregate,Broad US investment-grade bond market (Bloomberg US Aggregate).
-SCHZ,Schwab U.S. Aggregate Bond ETF,bond-aggregate,Broad US investment-grade bond market (Bloomberg US Aggregate).
-FBND,Fidelity Total Bond ETF,bond-aggregate,"Broad US bonds, actively managed (core-plus)."
-PDBC,Invesco Optimum Yield Diversifi,commodity-broad,Commodities Broad Basket ETF.
-HGER,Harbor Commodity All-Weather St,commodity-broad,Commodities Broad Basket ETF.
-FTGC,First Trust Global Tactical Com,commodity-broad,Commodities Broad Basket ETF.
-BCI,abrdn Bloomberg All Commodity S,commodity-broad,Commodities Broad Basket ETF.
-DBC,Invesco DB Commodity Index Trac,commodity-broad,Commodities Broad Basket ETF.
-COMT,iShares GSCI Commodity Dynamic ,commodity-broad,Commodities Broad Basket ETF.
-CERY,State Street SPDR Bloomberg Enh,commodity-broad,Commodities Broad Basket ETF.
-GSG,iShares GSCI Commodity-Indexed ,commodity-broad,Commodities Broad Basket ETF.
-VCIT,Vanguard Intermediate-Term Corp,corporate-bond,Corporate Bond ETF.
-LQD,iShares iBoxx $ Investment Grad,corporate-bond,Corporate Bond ETF.
-IGIB,iShares 5-10 Year Investment Gr,corporate-bond,Corporate Bond ETF.
-USIG,iShares Broad USD Investment Gr,corporate-bond,Corporate Bond ETF.
-SPIB,State Street SPDR Portfolio Int,corporate-bond,Corporate Bond ETF.
-SCHI,Schwab 5-10 Year Corporate Bond,corporate-bond,Corporate Bond ETF.
-SPBO,State Street SPDR Portfolio Cor,corporate-bond,Corporate Bond ETF.
-VTC,Vanguard Total Corporate Bond E,corporate-bond,Corporate Bond ETF.
-CORP,Pimco Investment Grade Corporat,corporate-bond,Corporate Bond ETF.
-QLTA,iShares Aaa A Rated Corporate B,corporate-bond,Corporate Bond ETF.
-SUSC,iShares ESG Aware USD Corporate,corporate-bond,Corporate Bond ETF.
-IGEB,iShares Investment Grade System,corporate-bond,Corporate Bond ETF.
-VCEB,Vanguard ESG U.S. Corporate Bon,corporate-bond,Corporate Bond ETF.
-USHY,iShares Broad USD High Yield Co,corporate-bond,High Yield Bond ETF.
-HYG,iShares iBoxx $ High Yield Corp,corporate-bond,High Yield Bond ETF.
-SPHY,State Street SPDR Portfolio Hig,corporate-bond,High Yield Bond ETF.
-JNK,State Street SPDR Bloomberg Hig,corporate-bond,High Yield Bond ETF.
-SHYG,iShares 0-5 Year High Yield Cor,corporate-bond,High Yield Bond ETF.
-SJNK,State Street SPDR Bloomberg Sho,corporate-bond,High Yield Bond ETF.
-HYLB,Xtrackers USD High Yield Corpor,corporate-bond,High Yield Bond ETF.
-ANGL,VanEck Fallen Angel High Yield ,corporate-bond,High Yield Bond ETF.
-SCYB,Schwab High Yield Bond ETF,corporate-bond,High Yield Bond ETF.
-BHYB,Xtrackers USD High Yield BB-B e,corporate-bond,High Yield Bond ETF.
-JPHY,JPMorgan Active High Yield ETF,corporate-bond,High Yield Bond ETF.
-HYS,PIMCO 0-5 Year High Yield Corpo,corporate-bond,High Yield Bond ETF.
-FALN,iShares Fallen Angels USD Bond ,corporate-bond,High Yield Bond ETF.
-HYLS,First Trust Tactical High Yield,corporate-bond,High Yield Bond ETF.
-HYDB,iShares High Yield Systematic B,corporate-bond,High Yield Bond ETF.
-PHYL,PGIM Active High Yield Bond ETF,corporate-bond,High Yield Bond ETF.
-FLHY,Franklin High Yield Corporate E,corporate-bond,High Yield Bond ETF.
-HYGV,FlexShares High Yield Value-Sco,corporate-bond,High Yield Bond ETF.
-LEND,SEI High Yield Bond & Alternati,corporate-bond,High Yield Bond ETF.
-VWO,Vanguard FTSE Emerging Markets ,em-equity,Diversified Emerging Mkts ETF.
-IEMG,iShares Core MSCI Emerging Mark,em-equity,Diversified Emerging Mkts ETF.
-EEM,iShares MSCI Emerging Index Fun,em-equity,Diversified Emerging Mkts ETF.
-AVEM,Avantis Emerging Markets Equity,em-equity,Diversified Emerging Mkts ETF.
-EMXC,iShares MSCI Emerging Markets e,em-equity,Diversified Emerging Mkts ETF.
-SPEM,State Street SPDR Portfolio Eme,em-equity,Diversified Emerging Mkts ETF.
-SCHE,Schwab Emerging Markets Equity ,em-equity,Diversified Emerging Mkts ETF.
-DFAE,Dimensional Emerging Core Equit,em-equity,Diversified Emerging Mkts ETF.
-FNDE,Schwab Fundamental Emerging Mar,em-equity,Diversified Emerging Mkts ETF.
-DFEM,Dimensional Emerging Markets Co,em-equity,Diversified Emerging Mkts ETF.
-ESGE,iShares ESG Aware MSCI EM ETF,em-equity,Diversified Emerging Mkts ETF.
-DEM,WisdomTree Emerging Markets Hig,em-equity,Diversified Emerging Mkts ETF.
-EEMV,iShares MSCI Emerging Markets M,em-equity,Diversified Emerging Mkts ETF.
-FRDM,Freedom 100 Emerging Markets ET,em-equity,Diversified Emerging Mkts ETF.
-CGNG,Capital Group New Geography Equ,em-equity,Diversified Emerging Mkts ETF.
-XSOE,WisdomTree Emerging Markets Ex-,em-equity,Diversified Emerging Mkts ETF.
-EMOP,AB Emerging Markets Opportuniti,em-equity,Diversified Emerging Mkts ETF.
-XCEM,Columbia EM Core ex-China ETF,em-equity,Diversified Emerging Mkts ETF.
-DFEV,Dimensional Emerging Markets Va,em-equity,Diversified Emerging Mkts ETF.
-PXH,Invesco RAFI Emerging Markets E,em-equity,Diversified Emerging Mkts ETF.
-BBAX,JPMorgan BetaBuilders Developed,em-equity,Pacific/Asia ex-Japan Stk ETF.
-AIA,iShares Asia 50 ETF,em-equity,Pacific/Asia ex-Japan Stk ETF.
-AAXJ,iShares MSCI All Country Asia e,em-equity,Pacific/Asia ex-Japan Stk ETF.
-EPP,iShares MSCI Pacific Ex-Japan I,em-equity,Pacific/Asia ex-Japan Stk ETF.
-EEMA,iShares MSCI Emerging Markets A,em-equity,Pacific/Asia ex-Japan Stk ETF.
-IAU,iShares Gold Trust,gold,Physical gold bullion.
-GLD,SPDR Gold Shares,gold,Physical gold bullion — the largest gold ETF.
-GLDM,SPDR Gold MiniShares Trust,gold,Physical gold bullion (low-cost MiniShares).
-IAUM,iShares Gold Trust Micro,gold,Physical gold bullion (low-cost Micro).
-VXUS,Vanguard Total International St,intl-developed,Foreign Large Blend ETF.
-VEA,Vanguard FTSE Developed Markets,intl-developed,Foreign Large Blend ETF.
-IEFA,iShares Core MSCI EAFE ETF,intl-developed,Foreign Large Blend ETF.
-VEU,Vanguard FTSE All World Ex US E,intl-developed,Foreign Large Blend ETF.
-EFA,iShares MSCI EAFE ETF,intl-developed,Foreign Large Blend ETF.
-SCHF,Schwab International Equity ETF,intl-developed,Foreign Large Blend ETF.
-IXUS,iShares Core MSCI Total Interna,intl-developed,Foreign Large Blend ETF.
-SPDW,State Street SPDR Portfolio Dev,intl-developed,Foreign Large Blend ETF.
-IDEV,iShares Core MSCI International,intl-developed,Foreign Large Blend ETF.
-AVDE,Avantis International Equity ET,intl-developed,Foreign Large Blend ETF.
-DFAI,Dimensional International Core ,intl-developed,Foreign Large Blend ETF.
-DFIC,Dimensional International Core ,intl-developed,Foreign Large Blend ETF.
-IQLT,iShares MSCI Intl Quality Facto,intl-developed,Foreign Large Blend ETF.
-DFAX,Dimensional World ex U.S. Core ,intl-developed,Foreign Large Blend ETF.
-ESGD,iShares ESG Aware MSCI EAFE ETF,intl-developed,Foreign Large Blend ETF.
-ACWX,iShares MSCI ACWI ex U.S. ETF,intl-developed,Foreign Large Blend ETF.
-JIRE,JPMorgan International Research,intl-developed,Foreign Large Blend ETF.
-EFG,iShares MSCI EAFE Growth ETF,intl-developed,Foreign Large Growth ETF.
-VIGI,Vanguard International Dividend,intl-developed,Foreign Large Growth ETF.
-CGXU,Capital Group International Foc,intl-developed,Foreign Large Growth ETF.
-CGIE,Capital Group International Equ,intl-developed,Foreign Large Growth ETF.
-IHDG,WisdomTree International Hedged,intl-developed,Foreign Large Growth ETF.
-WCMI,First Trust WCM International E,intl-developed,Foreign Large Growth ETF.
-EFV,iShares MSCI EAFE Value ETF,intl-developed,Foreign Large Value ETF.
-FNDF,Schwab Fundamental Internationa,intl-developed,Foreign Large Value ETF.
-VYMI,Vanguard International High Div,intl-developed,Foreign Large Value ETF.
-DFIV,Dimensional International Value,intl-developed,Foreign Large Value ETF.
-IDV,iShares International Select Di,intl-developed,Foreign Large Value ETF.
-LVHI,Franklin International Low Vola,intl-developed,Foreign Large Value ETF.
-IVLU,iShares MSCI Intl Value Factor ,intl-developed,Foreign Large Value ETF.
-PXF,Invesco RAFI Developed Markets ,intl-developed,Foreign Large Value ETF.
-JIVE,JPMorgan International Value ET,intl-developed,Foreign Large Value ETF.
-DIVI,Franklin International Core Div,intl-developed,Foreign Large Value ETF.
-SCHY,Schwab International Dividend E,intl-developed,Foreign Large Value ETF.
-HDEF,Xtrackers MSCI EAFE High Divide,intl-developed,Foreign Large Value ETF.
-ICOW,Pacer Developed Markets Interna,intl-developed,Foreign Large Value ETF.
-AVIV,Avantis International Large Cap,intl-developed,Foreign Large Value ETF.
-RODM,Hartford Multifactor Developed ,intl-developed,Foreign Large Value ETF.
-FGD,First Trust DJ Global Select Di,intl-developed,Foreign Large Value ETF.
-DDWM,WisdomTree Dynamic Internationa,intl-developed,Foreign Large Value ETF.
-FDT,First Trust Developed Markets E,intl-developed,Foreign Large Value ETF.
-IQDF,FlexShares International Qualit,intl-developed,Foreign Large Value ETF.
-SCZ,iShares MSCI EAFE Small-Cap ETF,intl-developed,Foreign Small/Mid Blend ETF.
-VSS,Vanguard FTSE All-Wld ex-US SmC,intl-developed,Foreign Small/Mid Blend ETF.
-DFIS,Dimensional International Small,intl-developed,Foreign Small/Mid Blend ETF.
-SCHC,Schwab International Small-Cap ,intl-developed,Foreign Small/Mid Blend ETF.
-VGK,Vanguard FTSEEuropean ETF,intl-developed,Europe Stock ETF.
-EZU,iShares MSCI Eurozone ETF,intl-developed,Europe Stock ETF.
-BBEU,JPMorgan BetaBuilders Europe ET,intl-developed,Europe Stock ETF.
-IEUR,iShares Core MSCI Europe ETF,intl-developed,Europe Stock ETF.
-FEZ,State Street SPDR EURO STOXX 50,intl-developed,Europe Stock ETF.
-EUFN,iShares MSCI Europe Financials ,intl-developed,Europe Stock ETF.
-HEDJ,WisdomTree Europe Hedged Equity,intl-developed,Europe Stock ETF.
-IEV,iShares Europe ETF,intl-developed,Europe Stock ETF.
-EWJ,iShares MSCI Japan Index Fund,intl-developed,Japan Stock ETF.
-BBJP,JPMorgan BetaBuilders Japan ETF,intl-developed,Japan Stock ETF.
-DXJ,WisdomTree Japan Hedged Equity ,intl-developed,Japan Stock ETF.
-FLJP,Franklin FTSE Japan ETF,intl-developed,Japan Stock ETF.
-VNQ,Vanguard Real Estate ETF,reit,Real Estate ETF.
-SCHH,Schwab U.S. REIT ETF,reit,Real Estate ETF.
-XLRE,State Street Real Estate Select,reit,Real Estate ETF.
-IYR,iShares U.S. Real Estate ETF,reit,Real Estate ETF.
-USRT,iShares Core U.S. REIT ETF,reit,Real Estate ETF.
-DTCR,Global X Data Center & Digital ,reit,Real Estate ETF.
-ICF,iShares Select U.S. REIT ETF,reit,Real Estate ETF.
-RWR,State Street SPDR Dow Jones REI,reit,Real Estate ETF.
-DFAR,Dimensional US Real Estate ETF,reit,Real Estate ETF.
-FREL,Fidelity MSCI Real Estate Index,reit,Real Estate ETF.
-BBRE,JPMorgan BetaBuilders MSCI U.S.,reit,Real Estate ETF.
-REET,iShares Global REIT ETF,reit,Global Real Estate ETF.
-VNQI,Vanguard Global ex-U.S. Real Es,reit,Global Real Estate ETF.
-DFGR,Dimensional Global Real Estate ,reit,Global Real Estate ETF.
-RWO,State Street SPDR Dow Jones Glo,reit,Global Real Estate ETF.
-HAUZ,Xtrackers International Real Es,reit,Global Real Estate ETF.
-VGT,Vanguard Information Tech ETF,sector-equity,Technology ETF.
-XLK,State Street Technology Select ,sector-equity,Technology ETF.
-SMH,VanEck Semiconductor ETF,sector-equity,Technology ETF.
-SOXX,iShares PHLX SOX Semiconductor ,sector-equity,Technology ETF.
-IYW,iShares U.S. Technology ETF,sector-equity,Technology ETF.
-FTEC,Fidelity MSCI Information Techn,sector-equity,Technology ETF.
-IGV,iShares Expanded Tech-Software ,sector-equity,Technology ETF.
-BAI,iShares A.I. Innovation and Tec,sector-equity,Technology ETF.
-DRAM,Roundhill Memory ETF,sector-equity,Technology ETF.
-CIBR,First Trust NASDAQ Cybersecurit,sector-equity,Technology ETF.
-IGM,iShares Expanded Tech Sector ET,sector-equity,Technology ETF.
-AIQ,Global X Artificial Intelligenc,sector-equity,Technology ETF.
-IXN,iShares Global Tech ETF,sector-equity,Technology ETF.
-ARKK,ARK Innovation ETF,sector-equity,Technology ETF.
-QTUM,Defiance Quantum ETF,sector-equity,Technology ETF.
-XLV,State Street Health Care Select,sector-equity,Health ETF.
-VHT,Vanguard Health Care ETF,sector-equity,Health ETF.
-XBI,State Street SPDR S&P Biotech E,sector-equity,Health ETF.
-IBB,iShares Biotechnology ETF,sector-equity,Health ETF.
-IXJ,iShares Global Healthcare ETF,sector-equity,Health ETF.
-IYH,iShares U.S. Healthcare ETF,sector-equity,Health ETF.
-IHI,iShares U.S. Medical Devices ET,sector-equity,Health ETF.
-FHLC,Fidelity MSCI Health Care Index,sector-equity,Health ETF.
-FBT,First Trust Amex Biotech Index ,sector-equity,Health ETF.
-ARKG,ARK Genomic Revolution ETF,sector-equity,Health ETF.
-XLF,State Street Financial Select S,sector-equity,Financial ETF.
-VFH,Vanguard Financials ETF,sector-equity,Financial ETF.
-KBWB,Invesco KBW Bank ETF,sector-equity,Financial ETF.
-KRE,State Street SPDR S&P Regional ,sector-equity,Financial ETF.
-IYF,iShares U.S. Financial ETF,sector-equity,Financial ETF.
-FNCL,Fidelity MSCI Financials Index ,sector-equity,Financial ETF.
-IYG,iShares U.S. Financial Services,sector-equity,Financial ETF.
-BIZD,VanEck BDC Income ETF,sector-equity,Financial ETF.
-IAI,iShares U.S. Broker-Dealers & S,sector-equity,Financial ETF.
-KBE,State Street SPDR S&P Bank ETF,sector-equity,Financial ETF.
-FXO,First Trust Financials AlphaDEX,sector-equity,Financial ETF.
-XLU,State Street Utilities Select S,sector-equity,Utilities ETF.
-VPU,Vanguard Utilities ETF,sector-equity,Utilities ETF.
-FUTY,Fidelity MSCI Utilities Index E,sector-equity,Utilities ETF.
-IDU,iShares U.S. Utilities ETF,sector-equity,Utilities ETF.
-UTES,Virtus Reaves Utilities ETF,sector-equity,Utilities ETF.
-XLE,State Street Energy Select Sect,sector-equity,Equity Energy ETF.
-VDE,Vanguard Energy ETF,sector-equity,Equity Energy ETF.
-XOP,State Street SPDR S&P Oil & Gas,sector-equity,Equity Energy ETF.
-IXC,iShares Global Energy ETF,sector-equity,Equity Energy ETF.
-OIH,VanEck Oil Services ETF,sector-equity,Equity Energy ETF.
-FENY,Fidelity MSCI Energy Index ETF,sector-equity,Equity Energy ETF.
-IYE,iShares U.S. Energy ETF,sector-equity,Equity Energy ETF.
-FXN,First Trust Energy AlphaDEX Fun,sector-equity,Equity Energy ETF.
-COPX,Global X Copper Miners ETF,sector-equity,Natural Resources ETF.
-GUNR,FlexShares Global Upstream Natu,sector-equity,Natural Resources ETF.
-XLB,State Street Materials Select S,sector-equity,Natural Resources ETF.
-URA,Global X Uranium ETF,sector-equity,Natural Resources ETF.
-XME,State Street SPDR S&P Metals & ,sector-equity,Natural Resources ETF.
-GNR,State Street SPDR S&P Global Na,sector-equity,Natural Resources ETF.
-NLR,VanEck Uranium and Nuclear ETF,sector-equity,Natural Resources ETF.
-VAW,Vanguard Materials ETF,sector-equity,Natural Resources ETF.
-REMX,VanEck Rare Earth and Strategic,sector-equity,Natural Resources ETF.
-LIT,Global X Lithium & Battery Tech,sector-equity,Natural Resources ETF.
-URNM,Sprott Uranium Miners ETF,sector-equity,Natural Resources ETF.
-PICK,iShares MSCI Global Select Meta,sector-equity,Natural Resources ETF.
-PHO,Invesco Water Resources ETF,sector-equity,Natural Resources ETF.
-FIW,First Trust Water ETF,sector-equity,Natural Resources ETF.
-IYM,iShares U.S. Basic Materials ET,sector-equity,Natural Resources ETF.
-PAVE,Global X U.S. Infrastructure De,sector-equity,Infrastructure ETF.
-GRID,First Trust NASDAQ Clean Edge S,sector-equity,Infrastructure ETF.
-IGF,iShares Global Infrastructure E,sector-equity,Infrastructure ETF.
-IFRA,iShares U.S. Infrastructure ETF,sector-equity,Infrastructure ETF.
-NFRA,FlexShares STOXX Global Broad I,sector-equity,Infrastructure ETF.
-BKGI,BNY Mellon Global Infrastructur,sector-equity,Infrastructure ETF.
-ICLN,iShares Global Clean Energy ETF,thematic-equity,~100 global clean-energy companies (S&P Global Clean Energy).
-TAN,Invesco Solar ETF,thematic-equity,Global solar-energy companies (MAC Global Solar Energy Index).
-SCHP,Schwab U.S. TIPs ETF,tips,Inflation-Protected Bond ETF.
-TIP,iShares TIPS Bond ETF,tips,Inflation-Protected Bond ETF.
-DFIP,Dimensional Inflation-Protected,tips,Inflation-Protected Bond ETF.
-TDTF,FlexShares iBoxx 5 Year Target ,tips,Inflation-Protected Bond ETF.
-SPIP,State Street SPDR Portfolio TIP,tips,Inflation-Protected Bond ETF.
-IEF,iShares 7-10 Year Treasury Bond,treasury,Long Government ETF.
-TLT,iShares 20+ Year Treasury Bond ,treasury,Long Government ETF.
-VGLT,Vanguard Long-Term Treasury ETF,treasury,Long Government ETF.
-TLH,iShares 10-20 Year Treasury Bon,treasury,Long Government ETF.
-SPTL,State Street SPDR Portfolio Lon,treasury,Long Government ETF.
-EDV,Vanguard Extended Duration Trea,treasury,Long Government ETF.
-TLTW,iShares 20+ Year Treasury Bond ,treasury,Long Government ETF.
-ZROZ,PIMCO 25  Year Zero Coupon U.S.,treasury,Long Government ETF.
-GOVI,Invesco Equal Weight 0-30 Year ,treasury,Long Government ETF.
-XTEN,BondBloxx Bloomberg Ten Year Ta,treasury,Long Government ETF.
-VGIT,Vanguard Intermediate-Term Trea,treasury,Intermediate Government ETF.
-GOVT,iShares U.S. Treasury Bond ETF,treasury,Intermediate Government ETF.
-IEI,iShares 3-7 Year Treasury Bond ,treasury,Intermediate Government ETF.
-SCHR,Schwab Intermediate-Term U.S. T,treasury,Intermediate Government ETF.
-SPTI,State Street SPDR Portfolio Int,treasury,Intermediate Government ETF.
-MTBA,Simplify MBS ETF,treasury,Intermediate Government ETF.
-VGSH,Vanguard Short-Term Treasury ET,treasury,Short Government ETF.
-SHY,iShares 1-3 Year Treasury Bond ,treasury,Short Government ETF.
-SCHO,Schwab Short-Term U.S. Treasury,treasury,Short Government ETF.
-LMBS,First Trust Low Duration Opport,treasury,Short Government ETF.
-SPTS,State Street SPDR Portfolio Sho,treasury,Short Government ETF.
-VIG,Vanguard Dividend Appreciation ETF,us-dividend,US stocks with a long record of growing dividends.
-SCHD,Schwab U.S. Dividend Equity ETF,us-dividend,"High-dividend, quality-screened US stocks (Dow Jones US Dividend 100)."
-VYM,Vanguard High Dividend Yield ETF,us-dividend,Higher-yielding US large-caps (FTSE High Dividend Yield).
-FDVV,Fidelity High Dividend ETF,us-dividend,Higher-yielding US stocks with a quality tilt.
-VTI,Vanguard Total Stock Market ETF,us-large,Large Blend ETF.
-VOO,Vanguard S&P 500 ETF,us-large,Large Blend ETF.
-IVV,iShares Core S&P 500 ETF,us-large,Large Blend ETF.
-SPY,State Street SPDR S&P 500 ETF T,us-large,Large Blend ETF.
-SPYM,State Street SPDR Portfolio S&P,us-large,Large Blend ETF.
-ITOT,iShares Core S&P Total U.S. Sto,us-large,Large Blend ETF.
-RSP,Invesco S&P 500 Equal Weight ET,us-large,Large Blend ETF.
-VV,Vanguard Large-Cap ETF,us-large,Large Blend ETF.
-SCHX,Schwab U.S. Large-Cap ETF,us-large,Large Blend ETF.
-IWB,iShares Russell 1000 ETF,us-large,Large Blend ETF.
-QUAL,iShares MSCI USA Quality Factor,us-large,Large Blend ETF.
-DFAC,Dimensional U.S. Core Equity 2 ,us-large,Large Blend ETF.
-QQQ,"Invesco QQQ Trust, Series 1",us-large,Large Growth ETF.
-VUG,Vanguard Growth ETF,us-large,Large Growth ETF.
-IWF,iShares Russell 1000 Growth Fun,us-large,Large Growth ETF.
-QQQM,Invesco NASDAQ 100 ETF,us-large,Large Growth ETF.
-IVW,iShares S&P 500 Growth ETF,us-large,Large Growth ETF.
-SCHG,Schwab U.S. Large-Cap Growth ET,us-large,Large Growth ETF.
-VONG,Vanguard Russell 1000 Growth ET,us-large,Large Growth ETF.
-SPYG,State Street SPDR Portfolio S&P,us-large,Large Growth ETF.
-MGK,Vanguard Mega Cap Growth ETF,us-large,Large Growth ETF.
-IUSG,iShares Core S&P U.S. Growth ET,us-large,Large Growth ETF.
-VOOG,Vanguard S&P 500 Growth ETF,us-large,Large Growth ETF.
-CGGR,Capital Group Growth ETF,us-large,Large Growth ETF.
-IWY,iShares Russell Top 200 Growth ,us-large,Large Growth ETF.
-ONEQ,Fidelity Nasdaq Composite Index,us-large,Large Growth ETF.
-VO,Vanguard Mid-Cap ETF,us-small-mid,Mid-Cap Blend ETF.
-IJH,iShares Core S&P Mid-Cap ETF,us-small-mid,Mid-Cap Blend ETF.
-VXF,Vanguard Extended Market ETF,us-small-mid,Mid-Cap Blend ETF.
-IWR,iShares Russell Mid-Cap ETF,us-small-mid,Mid-Cap Blend ETF.
-MDY,State Street SPDR S&P MIDCAP 40,us-small-mid,Mid-Cap Blend ETF.
-SPMD,State Street SPDR Portfolio S&P,us-small-mid,Mid-Cap Blend ETF.
-SCHM,Schwab U.S. Mid Cap ETF,us-small-mid,Mid-Cap Blend ETF.
-XMMO,Invesco S&P MidCap Momentum ETF,us-small-mid,Mid-Cap Blend ETF.
-FMDE,Fidelity Enhanced Mid Cap Core ,us-small-mid,Mid-Cap Blend ETF.
-IVOO,Vanguard S&P Mid-Cap 400 ETF,us-small-mid,Mid-Cap Blend ETF.
-JHMM,John Hancock Multifactor Mid Ca,us-small-mid,Mid-Cap Blend ETF.
-XMHQ,Invesco S&P MidCap Quality ETF,us-small-mid,Mid-Cap Blend ETF.
-FV,First Trust Dorsey Wright Focus,us-small-mid,Mid-Cap Blend ETF.
-CGMM,Capital Group U.S. Small and Mi,us-small-mid,Mid-Cap Blend ETF.
-TMSL,T. Rowe Price Small-Mid Cap ETF,us-small-mid,Mid-Cap Blend ETF.
-BBMC,JPMorgan BetaBuilders U.S. Mid ,us-small-mid,Mid-Cap Blend ETF.
-EUSA,iShares MSCI USA Equal Weighted,us-small-mid,Mid-Cap Blend ETF.
-VFMO,Vanguard U.S. Momentum Factor E,us-small-mid,Mid-Cap Blend ETF.
-IMCB,iShares Morningstar Mid-Cap ETF,us-small-mid,Mid-Cap Blend ETF.
-FLQM,Franklin U.S. Mid Cap Multifact,us-small-mid,Mid-Cap Blend ETF.
-FNX,First Trust Mid Cap Core AlphaD,us-small-mid,Mid-Cap Blend ETF.
-SPHB,Invesco S&P 500 High Beta ETF,us-small-mid,Mid-Cap Blend ETF.
-VOT,Vanguard Mid-Cap Growth ETF,us-small-mid,Mid-Cap Growth ETF.
-IWP,iShares Russell Midcap Growth E,us-small-mid,Mid-Cap Growth ETF.
-IJK,iShares S&P Mid-Cap 400 Growth ,us-small-mid,Mid-Cap Growth ETF.
-IMCG,iShares Morningstar Mid-Cap Gro,us-small-mid,Mid-Cap Growth ETF.
-MDYG,State Street SPDR S&P 400 Mid C,us-small-mid,Mid-Cap Growth ETF.
-ARKQ,ARK Autonomous Technology & Rob,us-small-mid,Mid-Cap Growth ETF.
-COWG,Pacer US Large Cap Cash Cows Gr,us-small-mid,Mid-Cap Growth ETF.
-ARKW,ARK Next Generation Internet ET,us-small-mid,Mid-Cap Growth ETF.
-IVOG,Vanguard S&P Mid-Cap 400 Growth,us-small-mid,Mid-Cap Growth ETF.
-FPX,First Trust US Equity Opportuni,us-small-mid,Mid-Cap Growth ETF.
-QQQJ,Invesco NASDAQ Next Gen 100 ETF,us-small-mid,Mid-Cap Growth ETF.
-VOE,Vanguard Mid-Cap Value ETF,us-small-mid,Mid-Cap Value ETF.
-DVY,iShares Select Dividend ETF,us-small-mid,Mid-Cap Value ETF.
-SDY,State Street SPDR S&P Dividend ,us-small-mid,Mid-Cap Value ETF.
-COWZ,Pacer US Cash Cows 100 ETF,us-small-mid,Mid-Cap Value ETF.
-IWS,iShares Russell Mid-cap Value E,us-small-mid,Mid-Cap Value ETF.
-IJJ,iShares S&P Mid-Cap 400 Value E,us-small-mid,Mid-Cap Value ETF.
-FVD,First Trust VL Dividend,us-small-mid,Mid-Cap Value ETF.
-VFLO,VictoryShares Free Cash Flow ET,us-small-mid,Mid-Cap Value ETF.
-SPYD,State Street SPDR Portfolio S&P,us-small-mid,Mid-Cap Value ETF.
-DON,WisdomTree U.S. MidCap Dividend,us-small-mid,Mid-Cap Value ETF.
-WTV,WisdomTree U.S. Value Fund,us-small-mid,Mid-Cap Value ETF.
-MDYV,State Street SPDR S&P 400 Mid C,us-small-mid,Mid-Cap Value ETF.
-RPV,Invesco S&P 500 Pure Value ETF,us-small-mid,Mid-Cap Value ETF.
-PKW,Invesco BuyBack Achievers ETF,us-small-mid,Mid-Cap Value ETF.
-IVOV,Vanguard S&P Mid-Cap 400 Value ,us-small-mid,Mid-Cap Value ETF.
-SMIG,Bahl & Gaynor Small/Mid Cap Inc,us-small-mid,Mid-Cap Value ETF.
-FTA,First Trust Large Cap Value Alp,us-small-mid,Mid-Cap Value ETF.
-RWK,Invesco S&P MidCap 400 Revenue ,us-small-mid,Mid-Cap Value ETF.
-RDIV,Invesco S&P Ultra Dividend Reve,us-small-mid,Mid-Cap Value ETF.
-PEY,Invesco High Yield Equity Divid,us-small-mid,Mid-Cap Value ETF.
-IMCV,iShares Morningstar Mid-Cap Val,us-small-mid,Mid-Cap Value ETF.
-VB,Vanguard Small-Cap ETF,us-small-mid,Small Blend ETF.
-IJR,iShares Core S&P Small-Cap ETF,us-small-mid,Small Blend ETF.
-IWM,iShares Russell 2000 Index Fund,us-small-mid,Small Blend ETF.
-SCHA,Schwab U.S. Small-Cap ETF,us-small-mid,Small Blend ETF.
-VTWO,Vanguard Russell 2000 ETF,us-small-mid,Small Blend ETF.
-SPSM,State Street SPDR Portfolio S&P,us-small-mid,Small Blend ETF.
-DFAS,Dimensional U.S. Small Cap ETF,us-small-mid,Small Blend ETF.
-FNDA,Schwab Fundamental U.S. Small C,us-small-mid,Small Blend ETF.
-VIOO,Vanguard S&P Small-Cap 600 ETF,us-small-mid,Small Blend ETF.
-FESM,Fidelity Enhanced Small Cap Cor,us-small-mid,Small Blend ETF.
-SMLF,iShares U.S. Small-Cap Equity F,us-small-mid,Small Blend ETF.
-SMMD,iShares Russell 2500 ETF,us-small-mid,Small Blend ETF.
-XSMO,Invesco S&P SmallCap Momentum E,us-small-mid,Small Blend ETF.
-PRFZ,Invesco RAFI US 1500 Small-Mid ,us-small-mid,Small Blend ETF.
-JMEE,JPMorgan Small & Mid Cap Enhanc,us-small-mid,Small Blend ETF.
-FSMD,Fidelity Small-Mid Multifactor ,us-small-mid,Small Blend ETF.
-ESML,iShares ESG Aware MSCI USA Smal,us-small-mid,Small Blend ETF.
-PSC,Principal U.S. Small-Cap ETF,us-small-mid,Small Blend ETF.
-NUSC,Nuveen ESG Small-Cap ETF,us-small-mid,Small Blend ETF.
-RSSL,Global X Russell 2000 ETF,us-small-mid,Small Blend ETF.
-IWC,iShares Microcap ETF,us-small-mid,Small Blend ETF.
-VBK,Vanguard Small-Cap Growth ETF,us-small-mid,Small Growth ETF.
-IWO,iShares Russell 2000 Growth Fun,us-small-mid,Small Growth ETF.
-IJT,iShares S&P SmallCap 600 Growth,us-small-mid,Small Growth ETF.
-SLYG,State Street SPDR S&P 600 Small,us-small-mid,Small Growth ETF.
-DUSG,U.S. Small Cap Growth Portfolio,us-small-mid,Small Growth ETF.
-VTWG,Vanguard Russell 2000 Growth ET,us-small-mid,Small Growth ETF.
-FYC,First Trust Small Cap Growth Al,us-small-mid,Small Growth ETF.
-JSMD,Janus Henderson Small/Mid Cap G,us-small-mid,Small Growth ETF.
-VBR,Vanguard Small-Cap Value ETF,us-small-mid,Small Value ETF.
-AVUV,Avantis U.S. Small Cap Value ET,us-small-mid,Small Value ETF.
-IWN,iShares Russell 2000 Value ETF,us-small-mid,Small Value ETF.
-DFAT,Dimensional U.S. Targeted Value,us-small-mid,Small Value ETF.
-SDVY,First Trust SMID Cap Rising Div,us-small-mid,Small Value ETF.
-IJS,iShares S&P SmallCap 600 Value ,us-small-mid,Small Value ETF.
-DFSV,Dimensional US Small Cap Value ,us-small-mid,Small Value ETF.
-SLYV,State Street SPDR S&P 600 Small,us-small-mid,Small Value ETF.
-CALF,Pacer US Small Cap Cash Cows ET,us-small-mid,Small Value ETF.
-AVSC,Avantis U.S Small Cap Equity ET,us-small-mid,Small Value ETF.
-BSVO,EA Bridgeway Omni Small-Cap Val,us-small-mid,Small Value ETF.
-DES,WisdomTree U.S. SmallCap Divide,us-small-mid,Small Value ETF.
-VIOV,Vanguard S&P Small-Cap 600 Valu,us-small-mid,Small Value ETF.
-RWJ,Invesco S&P SmallCap 600 Revenu,us-small-mid,Small Value ETF.
-REGL,ProShares S&P MidCap 400 Divide,us-small-mid,Small Value ETF.
-USVM,VictoryShares US Small Mid Cap ,us-small-mid,Small Value ETF.
-VTWV,Vanguard Russell 2000 Value ETF,us-small-mid,Small Value ETF.
+ticker,name,role,summary,core,flavor
+BND,Vanguard Total Bond Market ETF,bond-aggregate,Broad US investment-grade taxable bond market.,1,
+AGG,iShares Core U.S. Aggregate Bond ETF,bond-aggregate,Broad US investment-grade bond market (Bloomberg US Aggregate).,1,
+SCHZ,Schwab U.S. Aggregate Bond ETF,bond-aggregate,Broad US investment-grade bond market (Bloomberg US Aggregate).,1,
+FBND,Fidelity Total Bond ETF,bond-aggregate,"Broad US bonds, actively managed (core-plus).",1,
+PDBC,Invesco Optimum Yield Diversifi,commodity-broad,Commodities Broad Basket ETF.,1,
+HGER,Harbor Commodity All-Weather St,commodity-broad,Commodities Broad Basket ETF.,1,
+FTGC,First Trust Global Tactical Com,commodity-broad,Commodities Broad Basket ETF.,1,
+BCI,abrdn Bloomberg All Commodity S,commodity-broad,Commodities Broad Basket ETF.,1,
+DBC,Invesco DB Commodity Index Trac,commodity-broad,Commodities Broad Basket ETF.,1,
+COMT,iShares GSCI Commodity Dynamic ,commodity-broad,Commodities Broad Basket ETF.,1,
+CERY,State Street SPDR Bloomberg Enh,commodity-broad,Commodities Broad Basket ETF.,1,
+GSG,iShares GSCI Commodity-Indexed ,commodity-broad,Commodities Broad Basket ETF.,1,
+VCIT,Vanguard Intermediate-Term Corp,corporate-bond,Corporate Bond ETF.,1,investment-grade
+LQD,iShares iBoxx $ Investment Grad,corporate-bond,Corporate Bond ETF.,1,investment-grade
+IGIB,iShares 5-10 Year Investment Gr,corporate-bond,Corporate Bond ETF.,1,investment-grade
+USIG,iShares Broad USD Investment Gr,corporate-bond,Corporate Bond ETF.,1,investment-grade
+SPIB,State Street SPDR Portfolio Int,corporate-bond,Corporate Bond ETF.,1,investment-grade
+SCHI,Schwab 5-10 Year Corporate Bond,corporate-bond,Corporate Bond ETF.,1,investment-grade
+SPBO,State Street SPDR Portfolio Cor,corporate-bond,Corporate Bond ETF.,1,investment-grade
+VTC,Vanguard Total Corporate Bond E,corporate-bond,Corporate Bond ETF.,1,investment-grade
+CORP,Pimco Investment Grade Corporat,corporate-bond,Corporate Bond ETF.,1,investment-grade
+QLTA,iShares Aaa A Rated Corporate B,corporate-bond,Corporate Bond ETF.,1,investment-grade
+SUSC,iShares ESG Aware USD Corporate,corporate-bond,Corporate Bond ETF.,1,investment-grade
+IGEB,iShares Investment Grade System,corporate-bond,Corporate Bond ETF.,1,investment-grade
+VCEB,Vanguard ESG U.S. Corporate Bon,corporate-bond,Corporate Bond ETF.,1,investment-grade
+USHY,iShares Broad USD High Yield Co,corporate-bond,High Yield Bond ETF.,0,high-yield
+HYG,iShares iBoxx $ High Yield Corp,corporate-bond,High Yield Bond ETF.,0,high-yield
+SPHY,State Street SPDR Portfolio Hig,corporate-bond,High Yield Bond ETF.,0,high-yield
+JNK,State Street SPDR Bloomberg Hig,corporate-bond,High Yield Bond ETF.,0,high-yield
+SHYG,iShares 0-5 Year High Yield Cor,corporate-bond,High Yield Bond ETF.,0,high-yield
+SJNK,State Street SPDR Bloomberg Sho,corporate-bond,High Yield Bond ETF.,0,high-yield
+HYLB,Xtrackers USD High Yield Corpor,corporate-bond,High Yield Bond ETF.,0,high-yield
+ANGL,VanEck Fallen Angel High Yield ,corporate-bond,High Yield Bond ETF.,0,high-yield
+SCYB,Schwab High Yield Bond ETF,corporate-bond,High Yield Bond ETF.,0,high-yield
+BHYB,Xtrackers USD High Yield BB-B e,corporate-bond,High Yield Bond ETF.,0,high-yield
+JPHY,JPMorgan Active High Yield ETF,corporate-bond,High Yield Bond ETF.,0,high-yield
+HYS,PIMCO 0-5 Year High Yield Corpo,corporate-bond,High Yield Bond ETF.,0,high-yield
+FALN,iShares Fallen Angels USD Bond ,corporate-bond,High Yield Bond ETF.,0,high-yield
+HYLS,First Trust Tactical High Yield,corporate-bond,High Yield Bond ETF.,0,high-yield
+HYDB,iShares High Yield Systematic B,corporate-bond,High Yield Bond ETF.,0,high-yield
+PHYL,PGIM Active High Yield Bond ETF,corporate-bond,High Yield Bond ETF.,0,high-yield
+FLHY,Franklin High Yield Corporate E,corporate-bond,High Yield Bond ETF.,0,high-yield
+HYGV,FlexShares High Yield Value-Sco,corporate-bond,High Yield Bond ETF.,0,high-yield
+LEND,SEI High Yield Bond & Alternati,corporate-bond,High Yield Bond ETF.,0,high-yield
+VWO,Vanguard FTSE Emerging Markets ,em-equity,Diversified Emerging Mkts ETF.,1,diversified
+IEMG,iShares Core MSCI Emerging Mark,em-equity,Diversified Emerging Mkts ETF.,1,diversified
+EEM,iShares MSCI Emerging Index Fun,em-equity,Diversified Emerging Mkts ETF.,1,diversified
+AVEM,Avantis Emerging Markets Equity,em-equity,Diversified Emerging Mkts ETF.,1,diversified
+EMXC,iShares MSCI Emerging Markets e,em-equity,Diversified Emerging Mkts ETF.,1,diversified
+SPEM,State Street SPDR Portfolio Eme,em-equity,Diversified Emerging Mkts ETF.,1,diversified
+SCHE,Schwab Emerging Markets Equity ,em-equity,Diversified Emerging Mkts ETF.,1,diversified
+DFAE,Dimensional Emerging Core Equit,em-equity,Diversified Emerging Mkts ETF.,1,diversified
+FNDE,Schwab Fundamental Emerging Mar,em-equity,Diversified Emerging Mkts ETF.,1,diversified
+DFEM,Dimensional Emerging Markets Co,em-equity,Diversified Emerging Mkts ETF.,1,diversified
+ESGE,iShares ESG Aware MSCI EM ETF,em-equity,Diversified Emerging Mkts ETF.,1,diversified
+DEM,WisdomTree Emerging Markets Hig,em-equity,Diversified Emerging Mkts ETF.,1,diversified
+EEMV,iShares MSCI Emerging Markets M,em-equity,Diversified Emerging Mkts ETF.,1,diversified
+FRDM,Freedom 100 Emerging Markets ET,em-equity,Diversified Emerging Mkts ETF.,1,diversified
+CGNG,Capital Group New Geography Equ,em-equity,Diversified Emerging Mkts ETF.,1,diversified
+XSOE,WisdomTree Emerging Markets Ex-,em-equity,Diversified Emerging Mkts ETF.,1,diversified
+EMOP,AB Emerging Markets Opportuniti,em-equity,Diversified Emerging Mkts ETF.,1,diversified
+XCEM,Columbia EM Core ex-China ETF,em-equity,Diversified Emerging Mkts ETF.,1,diversified
+DFEV,Dimensional Emerging Markets Va,em-equity,Diversified Emerging Mkts ETF.,1,diversified
+PXH,Invesco RAFI Emerging Markets E,em-equity,Diversified Emerging Mkts ETF.,1,diversified
+BBAX,JPMorgan BetaBuilders Developed,em-equity,Pacific/Asia ex-Japan Stk ETF.,0,asia-pacific
+AIA,iShares Asia 50 ETF,em-equity,Pacific/Asia ex-Japan Stk ETF.,0,asia-pacific
+AAXJ,iShares MSCI All Country Asia e,em-equity,Pacific/Asia ex-Japan Stk ETF.,0,asia-pacific
+EPP,iShares MSCI Pacific Ex-Japan I,em-equity,Pacific/Asia ex-Japan Stk ETF.,0,asia-pacific
+EEMA,iShares MSCI Emerging Markets A,em-equity,Pacific/Asia ex-Japan Stk ETF.,0,asia-pacific
+IAU,iShares Gold Trust,gold,Physical gold bullion.,1,
+GLD,SPDR Gold Shares,gold,Physical gold bullion — the largest gold ETF.,1,
+GLDM,SPDR Gold MiniShares Trust,gold,Physical gold bullion (low-cost MiniShares).,1,
+IAUM,iShares Gold Trust Micro,gold,Physical gold bullion (low-cost Micro).,1,
+VXUS,Vanguard Total International St,intl-developed,Foreign Large Blend ETF.,1,blend
+VEA,Vanguard FTSE Developed Markets,intl-developed,Foreign Large Blend ETF.,1,blend
+IEFA,iShares Core MSCI EAFE ETF,intl-developed,Foreign Large Blend ETF.,1,blend
+VEU,Vanguard FTSE All World Ex US E,intl-developed,Foreign Large Blend ETF.,1,blend
+EFA,iShares MSCI EAFE ETF,intl-developed,Foreign Large Blend ETF.,1,blend
+SCHF,Schwab International Equity ETF,intl-developed,Foreign Large Blend ETF.,1,blend
+IXUS,iShares Core MSCI Total Interna,intl-developed,Foreign Large Blend ETF.,1,blend
+SPDW,State Street SPDR Portfolio Dev,intl-developed,Foreign Large Blend ETF.,1,blend
+IDEV,iShares Core MSCI International,intl-developed,Foreign Large Blend ETF.,1,blend
+AVDE,Avantis International Equity ET,intl-developed,Foreign Large Blend ETF.,1,blend
+DFAI,Dimensional International Core ,intl-developed,Foreign Large Blend ETF.,1,blend
+DFIC,Dimensional International Core ,intl-developed,Foreign Large Blend ETF.,1,blend
+IQLT,iShares MSCI Intl Quality Facto,intl-developed,Foreign Large Blend ETF.,1,blend
+DFAX,Dimensional World ex U.S. Core ,intl-developed,Foreign Large Blend ETF.,1,blend
+ESGD,iShares ESG Aware MSCI EAFE ETF,intl-developed,Foreign Large Blend ETF.,1,blend
+ACWX,iShares MSCI ACWI ex U.S. ETF,intl-developed,Foreign Large Blend ETF.,1,blend
+JIRE,JPMorgan International Research,intl-developed,Foreign Large Blend ETF.,1,blend
+EFG,iShares MSCI EAFE Growth ETF,intl-developed,Foreign Large Growth ETF.,0,growth
+VIGI,Vanguard International Dividend,intl-developed,Foreign Large Growth ETF.,0,growth
+CGXU,Capital Group International Foc,intl-developed,Foreign Large Growth ETF.,0,growth
+CGIE,Capital Group International Equ,intl-developed,Foreign Large Growth ETF.,0,growth
+IHDG,WisdomTree International Hedged,intl-developed,Foreign Large Growth ETF.,0,growth
+WCMI,First Trust WCM International E,intl-developed,Foreign Large Growth ETF.,0,growth
+EFV,iShares MSCI EAFE Value ETF,intl-developed,Foreign Large Value ETF.,0,value
+FNDF,Schwab Fundamental Internationa,intl-developed,Foreign Large Value ETF.,0,value
+VYMI,Vanguard International High Div,intl-developed,Foreign Large Value ETF.,0,value
+DFIV,Dimensional International Value,intl-developed,Foreign Large Value ETF.,0,value
+IDV,iShares International Select Di,intl-developed,Foreign Large Value ETF.,0,value
+LVHI,Franklin International Low Vola,intl-developed,Foreign Large Value ETF.,0,value
+IVLU,iShares MSCI Intl Value Factor ,intl-developed,Foreign Large Value ETF.,0,value
+PXF,Invesco RAFI Developed Markets ,intl-developed,Foreign Large Value ETF.,0,value
+JIVE,JPMorgan International Value ET,intl-developed,Foreign Large Value ETF.,0,value
+DIVI,Franklin International Core Div,intl-developed,Foreign Large Value ETF.,0,value
+SCHY,Schwab International Dividend E,intl-developed,Foreign Large Value ETF.,0,value
+HDEF,Xtrackers MSCI EAFE High Divide,intl-developed,Foreign Large Value ETF.,0,value
+ICOW,Pacer Developed Markets Interna,intl-developed,Foreign Large Value ETF.,0,value
+AVIV,Avantis International Large Cap,intl-developed,Foreign Large Value ETF.,0,value
+RODM,Hartford Multifactor Developed ,intl-developed,Foreign Large Value ETF.,0,value
+FGD,First Trust DJ Global Select Di,intl-developed,Foreign Large Value ETF.,0,value
+DDWM,WisdomTree Dynamic Internationa,intl-developed,Foreign Large Value ETF.,0,value
+FDT,First Trust Developed Markets E,intl-developed,Foreign Large Value ETF.,0,value
+IQDF,FlexShares International Qualit,intl-developed,Foreign Large Value ETF.,0,value
+SCZ,iShares MSCI EAFE Small-Cap ETF,intl-developed,Foreign Small/Mid Blend ETF.,0,small-mid
+VSS,Vanguard FTSE All-Wld ex-US SmC,intl-developed,Foreign Small/Mid Blend ETF.,0,small-mid
+DFIS,Dimensional International Small,intl-developed,Foreign Small/Mid Blend ETF.,0,small-mid
+SCHC,Schwab International Small-Cap ,intl-developed,Foreign Small/Mid Blend ETF.,0,small-mid
+VGK,Vanguard FTSEEuropean ETF,intl-developed,Europe Stock ETF.,0,europe
+EZU,iShares MSCI Eurozone ETF,intl-developed,Europe Stock ETF.,0,europe
+BBEU,JPMorgan BetaBuilders Europe ET,intl-developed,Europe Stock ETF.,0,europe
+IEUR,iShares Core MSCI Europe ETF,intl-developed,Europe Stock ETF.,0,europe
+FEZ,State Street SPDR EURO STOXX 50,intl-developed,Europe Stock ETF.,0,europe
+EUFN,iShares MSCI Europe Financials ,intl-developed,Europe Stock ETF.,0,europe
+HEDJ,WisdomTree Europe Hedged Equity,intl-developed,Europe Stock ETF.,0,europe
+IEV,iShares Europe ETF,intl-developed,Europe Stock ETF.,0,europe
+EWJ,iShares MSCI Japan Index Fund,intl-developed,Japan Stock ETF.,0,japan
+BBJP,JPMorgan BetaBuilders Japan ETF,intl-developed,Japan Stock ETF.,0,japan
+DXJ,WisdomTree Japan Hedged Equity ,intl-developed,Japan Stock ETF.,0,japan
+FLJP,Franklin FTSE Japan ETF,intl-developed,Japan Stock ETF.,0,japan
+VNQ,Vanguard Real Estate ETF,reit,Real Estate ETF.,1,us
+SCHH,Schwab U.S. REIT ETF,reit,Real Estate ETF.,1,us
+XLRE,State Street Real Estate Select,reit,Real Estate ETF.,1,us
+IYR,iShares U.S. Real Estate ETF,reit,Real Estate ETF.,1,us
+USRT,iShares Core U.S. REIT ETF,reit,Real Estate ETF.,1,us
+DTCR,Global X Data Center & Digital ,reit,Real Estate ETF.,0,us
+ICF,iShares Select U.S. REIT ETF,reit,Real Estate ETF.,1,us
+RWR,State Street SPDR Dow Jones REI,reit,Real Estate ETF.,1,us
+DFAR,Dimensional US Real Estate ETF,reit,Real Estate ETF.,1,us
+FREL,Fidelity MSCI Real Estate Index,reit,Real Estate ETF.,1,us
+BBRE,JPMorgan BetaBuilders MSCI U.S.,reit,Real Estate ETF.,1,us
+REET,iShares Global REIT ETF,reit,Global Real Estate ETF.,1,global
+VNQI,Vanguard Global ex-U.S. Real Es,reit,Global Real Estate ETF.,1,global
+DFGR,Dimensional Global Real Estate ,reit,Global Real Estate ETF.,1,global
+RWO,State Street SPDR Dow Jones Glo,reit,Global Real Estate ETF.,1,global
+HAUZ,Xtrackers International Real Es,reit,Global Real Estate ETF.,1,global
+VGT,Vanguard Information Tech ETF,sector-equity,Technology ETF.,1,tech
+XLK,State Street Technology Select ,sector-equity,Technology ETF.,1,tech
+SMH,VanEck Semiconductor ETF,sector-equity,Technology ETF.,1,semis
+SOXX,iShares PHLX SOX Semiconductor ,sector-equity,Technology ETF.,1,semis
+IYW,iShares U.S. Technology ETF,sector-equity,Technology ETF.,1,tech
+FTEC,Fidelity MSCI Information Techn,sector-equity,Technology ETF.,1,tech
+IGV,iShares Expanded Tech-Software ,sector-equity,Technology ETF.,1,software
+BAI,iShares A.I. Innovation and Tec,sector-equity,Technology ETF.,1,ai
+DRAM,Roundhill Memory ETF,sector-equity,Technology ETF.,1,semis
+CIBR,First Trust NASDAQ Cybersecurit,sector-equity,Technology ETF.,1,cyber
+IGM,iShares Expanded Tech Sector ET,sector-equity,Technology ETF.,1,tech
+AIQ,Global X Artificial Intelligenc,sector-equity,Technology ETF.,1,ai
+IXN,iShares Global Tech ETF,sector-equity,Technology ETF.,1,tech
+ARKK,ARK Innovation ETF,sector-equity,"Disruptive innovation across sectors, actively managed (ARK).",1,innovation
+QTUM,Defiance Quantum ETF,sector-equity,Technology ETF.,1,quantum
+XLV,State Street Health Care Select,sector-equity,Health ETF.,1,health
+VHT,Vanguard Health Care ETF,sector-equity,Health ETF.,1,health
+XBI,State Street SPDR S&P Biotech E,sector-equity,Health ETF.,1,biotech
+IBB,iShares Biotechnology ETF,sector-equity,Health ETF.,1,biotech
+IXJ,iShares Global Healthcare ETF,sector-equity,Health ETF.,1,health
+IYH,iShares U.S. Healthcare ETF,sector-equity,Health ETF.,1,health
+IHI,iShares U.S. Medical Devices ET,sector-equity,Health ETF.,1,devices
+FHLC,Fidelity MSCI Health Care Index,sector-equity,Health ETF.,1,health
+FBT,First Trust Amex Biotech Index ,sector-equity,Health ETF.,1,biotech
+ARKG,ARK Genomic Revolution ETF,sector-equity,Health ETF.,1,biotech
+XLF,State Street Financial Select S,sector-equity,Financial ETF.,1,financial
+VFH,Vanguard Financials ETF,sector-equity,Financial ETF.,1,financial
+KBWB,Invesco KBW Bank ETF,sector-equity,Financial ETF.,1,banks
+KRE,State Street SPDR S&P Regional ,sector-equity,Financial ETF.,1,banks
+IYF,iShares U.S. Financial ETF,sector-equity,Financial ETF.,1,financial
+FNCL,Fidelity MSCI Financials Index ,sector-equity,Financial ETF.,1,financial
+IYG,iShares U.S. Financial Services,sector-equity,Financial ETF.,1,financial
+BIZD,VanEck BDC Income ETF,sector-equity,Financial ETF.,1,bdc
+IAI,iShares U.S. Broker-Dealers & S,sector-equity,Financial ETF.,1,brokers
+KBE,State Street SPDR S&P Bank ETF,sector-equity,Financial ETF.,1,banks
+FXO,First Trust Financials AlphaDEX,sector-equity,Financial ETF.,1,financial
+XLU,State Street Utilities Select S,sector-equity,Utilities ETF.,1,utilities
+VPU,Vanguard Utilities ETF,sector-equity,Utilities ETF.,1,utilities
+FUTY,Fidelity MSCI Utilities Index E,sector-equity,Utilities ETF.,1,utilities
+IDU,iShares U.S. Utilities ETF,sector-equity,Utilities ETF.,1,utilities
+UTES,Virtus Reaves Utilities ETF,sector-equity,Utilities ETF.,1,utilities
+XLE,State Street Energy Select Sect,sector-equity,Equity Energy ETF.,1,energy
+VDE,Vanguard Energy ETF,sector-equity,Equity Energy ETF.,1,energy
+XOP,State Street SPDR S&P Oil & Gas,sector-equity,Equity Energy ETF.,1,explorers
+IXC,iShares Global Energy ETF,sector-equity,Equity Energy ETF.,1,energy
+OIH,VanEck Oil Services ETF,sector-equity,Equity Energy ETF.,1,oil-services
+FENY,Fidelity MSCI Energy Index ETF,sector-equity,Equity Energy ETF.,1,energy
+IYE,iShares U.S. Energy ETF,sector-equity,Equity Energy ETF.,1,energy
+FXN,First Trust Energy AlphaDEX Fun,sector-equity,Equity Energy ETF.,1,energy
+COPX,Global X Copper Miners ETF,sector-equity,Natural Resources ETF.,1,miners
+GUNR,FlexShares Global Upstream Natu,sector-equity,Natural Resources ETF.,1,nat-resources
+XLB,State Street Materials Select S,sector-equity,Natural Resources ETF.,1,materials
+URA,Global X Uranium ETF,sector-equity,Natural Resources ETF.,1,uranium
+XME,State Street SPDR S&P Metals & ,sector-equity,Natural Resources ETF.,1,miners
+GNR,State Street SPDR S&P Global Na,sector-equity,Natural Resources ETF.,1,nat-resources
+NLR,VanEck Uranium and Nuclear ETF,sector-equity,Natural Resources ETF.,1,uranium
+VAW,Vanguard Materials ETF,sector-equity,Natural Resources ETF.,1,materials
+REMX,VanEck Rare Earth and Strategic,sector-equity,Natural Resources ETF.,1,miners
+LIT,Global X Lithium & Battery Tech,sector-equity,Natural Resources ETF.,1,battery-metals
+URNM,Sprott Uranium Miners ETF,sector-equity,Natural Resources ETF.,1,uranium
+PICK,iShares MSCI Global Select Meta,sector-equity,Natural Resources ETF.,1,miners
+PHO,Invesco Water Resources ETF,sector-equity,Natural Resources ETF.,1,water
+FIW,First Trust Water ETF,sector-equity,Natural Resources ETF.,1,water
+IYM,iShares U.S. Basic Materials ET,sector-equity,Natural Resources ETF.,1,materials
+PAVE,Global X U.S. Infrastructure De,sector-equity,Infrastructure ETF.,1,infrastructure
+GRID,First Trust NASDAQ Clean Edge S,sector-equity,Infrastructure ETF.,1,grid
+IGF,iShares Global Infrastructure E,sector-equity,Infrastructure ETF.,1,infrastructure
+IFRA,iShares U.S. Infrastructure ETF,sector-equity,Infrastructure ETF.,1,infrastructure
+NFRA,FlexShares STOXX Global Broad I,sector-equity,Infrastructure ETF.,1,infrastructure
+BKGI,BNY Mellon Global Infrastructur,sector-equity,Infrastructure ETF.,1,infrastructure
+ICLN,iShares Global Clean Energy ETF,sector-equity,~100 global clean-energy companies (S&P Global Clean Energy).,1,clean-energy
+TAN,Invesco Solar ETF,sector-equity,Global solar-energy companies (MAC Global Solar Energy Index).,1,clean-energy
+SCHP,Schwab U.S. TIPs ETF,tips,Inflation-Protected Bond ETF.,1,
+TIP,iShares TIPS Bond ETF,tips,Inflation-Protected Bond ETF.,1,
+DFIP,Dimensional Inflation-Protected,tips,Inflation-Protected Bond ETF.,1,
+TDTF,FlexShares iBoxx 5 Year Target ,tips,Inflation-Protected Bond ETF.,1,
+SPIP,State Street SPDR Portfolio TIP,tips,Inflation-Protected Bond ETF.,1,
+IEF,iShares 7-10 Year Treasury Bond,treasury,7-10 year US Treasury bonds (intermediate).,1,intermediate
+TLT,iShares 20+ Year Treasury Bond ,treasury,Long Government ETF.,1,long
+VGLT,Vanguard Long-Term Treasury ETF,treasury,Long Government ETF.,1,long
+TLH,iShares 10-20 Year Treasury Bon,treasury,Long Government ETF.,1,long
+SPTL,State Street SPDR Portfolio Lon,treasury,Long Government ETF.,1,long
+EDV,Vanguard Extended Duration Trea,treasury,Long Government ETF.,0,long
+TLTW,iShares 20+ Year Treasury Bond ,treasury,Long Government ETF.,0,long
+ZROZ,PIMCO 25  Year Zero Coupon U.S.,treasury,Long Government ETF.,0,long
+GOVI,Invesco Equal Weight 0-30 Year ,treasury,Long Government ETF.,1,long
+XTEN,BondBloxx Bloomberg Ten Year Ta,treasury,Long Government ETF.,1,long
+VGIT,Vanguard Intermediate-Term Trea,treasury,Intermediate Government ETF.,1,intermediate
+GOVT,iShares U.S. Treasury Bond ETF,treasury,Intermediate Government ETF.,1,intermediate
+IEI,iShares 3-7 Year Treasury Bond ,treasury,Intermediate Government ETF.,1,intermediate
+SCHR,Schwab Intermediate-Term U.S. T,treasury,Intermediate Government ETF.,1,intermediate
+SPTI,State Street SPDR Portfolio Int,treasury,Intermediate Government ETF.,1,intermediate
+MTBA,Simplify MBS ETF,bond-aggregate,Agency mortgage-backed securities (MBS).,0,
+VGSH,Vanguard Short-Term Treasury ET,treasury,Short Government ETF.,1,short
+SHY,iShares 1-3 Year Treasury Bond ,treasury,Short Government ETF.,1,short
+SCHO,Schwab Short-Term U.S. Treasury,treasury,Short Government ETF.,1,short
+LMBS,First Trust Low Duration Opport,bond-aggregate,"Short-duration mortgage/securitized bonds, actively managed.",0,
+SPTS,State Street SPDR Portfolio Sho,treasury,Short Government ETF.,1,short
+VIG,Vanguard Dividend Appreciation ETF,us-dividend,US stocks with a long record of growing dividends.,1,
+SCHD,Schwab U.S. Dividend Equity ETF,us-dividend,"High-dividend, quality-screened US stocks (Dow Jones US Dividend 100).",1,
+VYM,Vanguard High Dividend Yield ETF,us-dividend,Higher-yielding US large-caps (FTSE High Dividend Yield).,1,
+FDVV,Fidelity High Dividend ETF,us-dividend,Higher-yielding US stocks with a quality tilt.,1,
+VTI,Vanguard Total Stock Market ETF,us-large,Large Blend ETF.,1,blend
+VOO,Vanguard S&P 500 ETF,us-large,Large Blend ETF.,1,blend
+IVV,iShares Core S&P 500 ETF,us-large,Large Blend ETF.,1,blend
+SPY,State Street SPDR S&P 500 ETF T,us-large,Large Blend ETF.,1,blend
+SPYM,State Street SPDR Portfolio S&P,us-large,Large Blend ETF.,1,blend
+ITOT,iShares Core S&P Total U.S. Sto,us-large,Large Blend ETF.,1,blend
+RSP,Invesco S&P 500 Equal Weight ET,us-large,Large Blend ETF.,1,blend
+VV,Vanguard Large-Cap ETF,us-large,Large Blend ETF.,1,blend
+SCHX,Schwab U.S. Large-Cap ETF,us-large,Large Blend ETF.,1,blend
+IWB,iShares Russell 1000 ETF,us-large,Large Blend ETF.,1,blend
+QUAL,iShares MSCI USA Quality Factor,us-large,Large Blend ETF.,1,blend
+DFAC,Dimensional U.S. Core Equity 2 ,us-large,Large Blend ETF.,1,blend
+QQQ,"Invesco QQQ Trust, Series 1",us-large,Large Growth ETF.,0,growth
+VUG,Vanguard Growth ETF,us-large,Large Growth ETF.,0,growth
+IWF,iShares Russell 1000 Growth Fun,us-large,Large Growth ETF.,0,growth
+QQQM,Invesco NASDAQ 100 ETF,us-large,Large Growth ETF.,0,growth
+IVW,iShares S&P 500 Growth ETF,us-large,Large Growth ETF.,0,growth
+SCHG,Schwab U.S. Large-Cap Growth ET,us-large,Large Growth ETF.,0,growth
+VONG,Vanguard Russell 1000 Growth ET,us-large,Large Growth ETF.,0,growth
+SPYG,State Street SPDR Portfolio S&P,us-large,Large Growth ETF.,0,growth
+MGK,Vanguard Mega Cap Growth ETF,us-large,Large Growth ETF.,0,growth
+IUSG,iShares Core S&P U.S. Growth ET,us-large,Large Growth ETF.,0,growth
+VOOG,Vanguard S&P 500 Growth ETF,us-large,Large Growth ETF.,0,growth
+CGGR,Capital Group Growth ETF,us-large,Large Growth ETF.,0,growth
+IWY,iShares Russell Top 200 Growth ,us-large,Large Growth ETF.,0,growth
+ONEQ,Fidelity Nasdaq Composite Index,us-large,Large Growth ETF.,0,growth
+VO,Vanguard Mid-Cap ETF,us-small-mid,Mid-Cap Blend ETF.,1,mid-blend
+IJH,iShares Core S&P Mid-Cap ETF,us-small-mid,Mid-Cap Blend ETF.,1,mid-blend
+VXF,Vanguard Extended Market ETF,us-small-mid,Mid-Cap Blend ETF.,1,mid-blend
+IWR,iShares Russell Mid-Cap ETF,us-small-mid,Mid-Cap Blend ETF.,1,mid-blend
+MDY,State Street SPDR S&P MIDCAP 40,us-small-mid,Mid-Cap Blend ETF.,1,mid-blend
+SPMD,State Street SPDR Portfolio S&P,us-small-mid,Mid-Cap Blend ETF.,1,mid-blend
+SCHM,Schwab U.S. Mid Cap ETF,us-small-mid,Mid-Cap Blend ETF.,1,mid-blend
+XMMO,Invesco S&P MidCap Momentum ETF,us-small-mid,Mid-Cap Blend ETF.,1,mid-blend
+FMDE,Fidelity Enhanced Mid Cap Core ,us-small-mid,Mid-Cap Blend ETF.,1,mid-blend
+IVOO,Vanguard S&P Mid-Cap 400 ETF,us-small-mid,Mid-Cap Blend ETF.,1,mid-blend
+JHMM,John Hancock Multifactor Mid Ca,us-small-mid,Mid-Cap Blend ETF.,1,mid-blend
+XMHQ,Invesco S&P MidCap Quality ETF,us-small-mid,Mid-Cap Blend ETF.,1,mid-blend
+FV,First Trust Dorsey Wright Focus,us-small-mid,Mid-Cap Blend ETF.,1,mid-blend
+CGMM,Capital Group U.S. Small and Mi,us-small-mid,Mid-Cap Blend ETF.,1,mid-blend
+TMSL,T. Rowe Price Small-Mid Cap ETF,us-small-mid,Mid-Cap Blend ETF.,1,mid-blend
+BBMC,JPMorgan BetaBuilders U.S. Mid ,us-small-mid,Mid-Cap Blend ETF.,1,mid-blend
+EUSA,iShares MSCI USA Equal Weighted,us-small-mid,Mid-Cap Blend ETF.,1,mid-blend
+VFMO,Vanguard U.S. Momentum Factor E,us-small-mid,Mid-Cap Blend ETF.,1,mid-blend
+IMCB,iShares Morningstar Mid-Cap ETF,us-small-mid,Mid-Cap Blend ETF.,1,mid-blend
+FLQM,Franklin U.S. Mid Cap Multifact,us-small-mid,Mid-Cap Blend ETF.,1,mid-blend
+FNX,First Trust Mid Cap Core AlphaD,us-small-mid,Mid-Cap Blend ETF.,1,mid-blend
+VOT,Vanguard Mid-Cap Growth ETF,us-small-mid,Mid-Cap Growth ETF.,0,mid-growth
+IWP,iShares Russell Midcap Growth E,us-small-mid,Mid-Cap Growth ETF.,0,mid-growth
+IJK,iShares S&P Mid-Cap 400 Growth ,us-small-mid,Mid-Cap Growth ETF.,0,mid-growth
+IMCG,iShares Morningstar Mid-Cap Gro,us-small-mid,Mid-Cap Growth ETF.,0,mid-growth
+MDYG,State Street SPDR S&P 400 Mid C,us-small-mid,Mid-Cap Growth ETF.,0,mid-growth
+ARKQ,ARK Autonomous Technology & Rob,sector-equity,"Autonomous tech & robotics, actively managed (ARK).",1,innovation
+COWG,Pacer US Large Cap Cash Cows Gr,us-small-mid,Mid-Cap Growth ETF.,0,mid-growth
+ARKW,ARK Next Generation Internet ET,sector-equity,"Next-generation internet, actively managed (ARK).",1,innovation
+IVOG,Vanguard S&P Mid-Cap 400 Growth,us-small-mid,Mid-Cap Growth ETF.,0,mid-growth
+FPX,First Trust US Equity Opportuni,us-small-mid,Mid-Cap Growth ETF.,0,mid-growth
+QQQJ,Invesco NASDAQ Next Gen 100 ETF,us-small-mid,Mid-Cap Growth ETF.,0,mid-growth
+VOE,Vanguard Mid-Cap Value ETF,us-small-mid,Mid-Cap Value ETF.,0,mid-value
+DVY,iShares Select Dividend ETF,us-small-mid,Mid-Cap Value ETF.,0,mid-value
+SDY,State Street SPDR S&P Dividend ,us-small-mid,Mid-Cap Value ETF.,0,mid-value
+COWZ,Pacer US Cash Cows 100 ETF,us-small-mid,Mid-Cap Value ETF.,0,mid-value
+IWS,iShares Russell Mid-cap Value E,us-small-mid,Mid-Cap Value ETF.,0,mid-value
+IJJ,iShares S&P Mid-Cap 400 Value E,us-small-mid,Mid-Cap Value ETF.,0,mid-value
+FVD,First Trust VL Dividend,us-small-mid,Mid-Cap Value ETF.,0,mid-value
+VFLO,VictoryShares Free Cash Flow ET,us-small-mid,Mid-Cap Value ETF.,0,mid-value
+SPYD,State Street SPDR Portfolio S&P,us-small-mid,Mid-Cap Value ETF.,0,mid-value
+DON,WisdomTree U.S. MidCap Dividend,us-small-mid,Mid-Cap Value ETF.,0,mid-value
+WTV,WisdomTree U.S. Value Fund,us-small-mid,Mid-Cap Value ETF.,0,mid-value
+MDYV,State Street SPDR S&P 400 Mid C,us-small-mid,Mid-Cap Value ETF.,0,mid-value
+RPV,Invesco S&P 500 Pure Value ETF,us-small-mid,Mid-Cap Value ETF.,0,mid-value
+PKW,Invesco BuyBack Achievers ETF,us-small-mid,Mid-Cap Value ETF.,0,mid-value
+IVOV,Vanguard S&P Mid-Cap 400 Value ,us-small-mid,Mid-Cap Value ETF.,0,mid-value
+SMIG,Bahl & Gaynor Small/Mid Cap Inc,us-small-mid,Mid-Cap Value ETF.,0,mid-value
+FTA,First Trust Large Cap Value Alp,us-small-mid,Mid-Cap Value ETF.,0,mid-value
+RWK,Invesco S&P MidCap 400 Revenue ,us-small-mid,Mid-Cap Value ETF.,0,mid-value
+RDIV,Invesco S&P Ultra Dividend Reve,us-small-mid,Mid-Cap Value ETF.,0,mid-value
+PEY,Invesco High Yield Equity Divid,us-small-mid,Mid-Cap Value ETF.,0,mid-value
+IMCV,iShares Morningstar Mid-Cap Val,us-small-mid,Mid-Cap Value ETF.,0,mid-value
+VB,Vanguard Small-Cap ETF,us-small-mid,Small Blend ETF.,1,small-blend
+IJR,iShares Core S&P Small-Cap ETF,us-small-mid,Small Blend ETF.,1,small-blend
+IWM,iShares Russell 2000 Index Fund,us-small-mid,Small Blend ETF.,1,small-blend
+SCHA,Schwab U.S. Small-Cap ETF,us-small-mid,Small Blend ETF.,1,small-blend
+VTWO,Vanguard Russell 2000 ETF,us-small-mid,Small Blend ETF.,1,small-blend
+SPSM,State Street SPDR Portfolio S&P,us-small-mid,Small Blend ETF.,1,small-blend
+DFAS,Dimensional U.S. Small Cap ETF,us-small-mid,Small Blend ETF.,1,small-blend
+FNDA,Schwab Fundamental U.S. Small C,us-small-mid,Small Blend ETF.,1,small-blend
+VIOO,Vanguard S&P Small-Cap 600 ETF,us-small-mid,Small Blend ETF.,1,small-blend
+FESM,Fidelity Enhanced Small Cap Cor,us-small-mid,Small Blend ETF.,1,small-blend
+SMLF,iShares U.S. Small-Cap Equity F,us-small-mid,Small Blend ETF.,1,small-blend
+SMMD,iShares Russell 2500 ETF,us-small-mid,Small Blend ETF.,1,small-blend
+XSMO,Invesco S&P SmallCap Momentum E,us-small-mid,Small Blend ETF.,1,small-blend
+PRFZ,Invesco RAFI US 1500 Small-Mid ,us-small-mid,Small Blend ETF.,1,small-blend
+JMEE,JPMorgan Small & Mid Cap Enhanc,us-small-mid,Small Blend ETF.,1,small-blend
+FSMD,Fidelity Small-Mid Multifactor ,us-small-mid,Small Blend ETF.,1,small-blend
+ESML,iShares ESG Aware MSCI USA Smal,us-small-mid,Small Blend ETF.,1,small-blend
+PSC,Principal U.S. Small-Cap ETF,us-small-mid,Small Blend ETF.,1,small-blend
+NUSC,Nuveen ESG Small-Cap ETF,us-small-mid,Small Blend ETF.,1,small-blend
+RSSL,Global X Russell 2000 ETF,us-small-mid,Small Blend ETF.,1,small-blend
+IWC,iShares Microcap ETF,us-small-mid,Small Blend ETF.,1,small-blend
+VBK,Vanguard Small-Cap Growth ETF,us-small-mid,Small Growth ETF.,0,small-growth
+IWO,iShares Russell 2000 Growth Fun,us-small-mid,Small Growth ETF.,0,small-growth
+IJT,iShares S&P SmallCap 600 Growth,us-small-mid,Small Growth ETF.,0,small-growth
+SLYG,State Street SPDR S&P 600 Small,us-small-mid,Small Growth ETF.,0,small-growth
+DUSG,U.S. Small Cap Growth Portfolio,us-small-mid,Small Growth ETF.,0,small-growth
+VTWG,Vanguard Russell 2000 Growth ET,us-small-mid,Small Growth ETF.,0,small-growth
+FYC,First Trust Small Cap Growth Al,us-small-mid,Small Growth ETF.,0,small-growth
+JSMD,Janus Henderson Small/Mid Cap G,us-small-mid,Small Growth ETF.,0,small-growth
+VBR,Vanguard Small-Cap Value ETF,us-small-mid,Small Value ETF.,0,small-value
+AVUV,Avantis U.S. Small Cap Value ET,us-small-mid,Small Value ETF.,0,small-value
+IWN,iShares Russell 2000 Value ETF,us-small-mid,Small Value ETF.,0,small-value
+DFAT,Dimensional U.S. Targeted Value,us-small-mid,Small Value ETF.,0,small-value
+SDVY,First Trust SMID Cap Rising Div,us-small-mid,Small Value ETF.,0,small-value
+IJS,iShares S&P SmallCap 600 Value ,us-small-mid,Small Value ETF.,0,small-value
+DFSV,Dimensional US Small Cap Value ,us-small-mid,Small Value ETF.,0,small-value
+SLYV,State Street SPDR S&P 600 Small,us-small-mid,Small Value ETF.,0,small-value
+CALF,Pacer US Small Cap Cash Cows ET,us-small-mid,Small Value ETF.,0,small-value
+AVSC,Avantis U.S Small Cap Equity ET,us-small-mid,Small Value ETF.,0,small-value
+BSVO,EA Bridgeway Omni Small-Cap Val,us-small-mid,Small Value ETF.,0,small-value
+DES,WisdomTree U.S. SmallCap Divide,us-small-mid,Small Value ETF.,0,small-value
+VIOV,Vanguard S&P Small-Cap 600 Valu,us-small-mid,Small Value ETF.,0,small-value
+RWJ,Invesco S&P SmallCap 600 Revenu,us-small-mid,Small Value ETF.,0,small-value
+REGL,ProShares S&P MidCap 400 Divide,us-small-mid,Small Value ETF.,0,small-value
+USVM,VictoryShares US Small Mid Cap ,us-small-mid,Small Value ETF.,0,small-value
+VTWV,Vanguard Russell 2000 Value ETF,us-small-mid,Small Value ETF.,0,small-value
