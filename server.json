@@ -1,0 +1,20 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.disin7c9/asset-management",
+  "description": "Drawdown-first risk for your stock/ETF book — every number from a validated core, not the model.",
+  "repository": {
+    "url": "https://github.com/disin7c9/asset-management",
+    "source": "github"
+  },
+  "version": "2.12.0",
+  "packages": [
+    {
+      "registryType": "mcpb",
+      "identifier": "https://github.com/disin7c9/asset-management/releases/download/v2.12.0/asset-management-2.12.0.mcpb",
+      "fileSha256": "d4a80659ea0ce16bb974c7d6121582be337e347672e7a1aec55bbbee0e478bc6",
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}
