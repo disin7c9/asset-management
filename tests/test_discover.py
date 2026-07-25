@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from datetime import date, datetime, timezone
 
+import pytest
+
 from app.derive import DerivedState, Position
 from app.discover import find_gaps, gap_roles, merge_menus, role_exposure, role_menu
 from app.prices import PriceRow
@@ -209,11 +211,9 @@ def test_role_menu_satellite_index_and_single_shelf_autodrill() -> None:
 
 def test_role_menu_unknown_flavor_names_the_valid_shelves() -> None:
     s, prices = _gapbook()
-    try:
+    with pytest.raises(ValueError, match="intermediate") as ei:
         role_menu(s, prices, _TREASURY, "treasury", flavor="mortgage")
-        raise AssertionError("expected ValueError")
-    except ValueError as exc:
-        assert "intermediate" in str(exc) and "long" in str(exc)
+    assert "long" in str(ei.value)
 
 
 def test_merge_menus_combines_named_roles() -> None:

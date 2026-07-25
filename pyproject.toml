@@ -39,6 +39,22 @@ packages = ["app"]
 line-length = 100
 target-version = "py312"
 
+[tool.ruff.lint]
+# Without a `select` ruff ran its defaults only (E4/E7/E9/F), so every `# noqa: BLE001`,
+# `S310`, `PT011` in the tree suppressed a rule that never executed. Select the families the
+# code's own suppressions already assume, plus the bug-catching ones; RUF100 then fails the
+# gate on a noqa that has gone dead.
+select = ["E", "F", "W", "B", "SIM", "BLE", "S", "PT", "RUF100"]
+ignore = [
+    "E501",   # line length is the formatter's target, not a gate (114 pre-existing overruns)
+    "S101",   # `assert` is the test suite's whole vocabulary
+    "PT018",  # composite asserts read fine here
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S108", "S603", "S607", "SIM300"]   # literal /tmp fixtures, subprocess probes, Yoda asserts
+"scripts/*" = ["S603", "S605", "S607"]           # build tooling drives git/uv/python by name on purpose
+
 [tool.mypy]
 python_version = "3.12"
 strict = true

@@ -23,6 +23,8 @@ jobs:
         with:
           python-version: "3.12"
       - run: uv sync --frozen
-      - run: uv run ruff check app/ tests/ scripts/
-      - run: uv run mypy app/
+      # reconcile/ is in scope on purpose: it was unlinted and untyped for 50 commits, which is
+      # how a dead import in the correctness harness stayed invisible while the README cited it.
+      - run: uv run ruff check app/ tests/ scripts/ reconcile/
+      - run: uv run mypy app/ scripts/ reconcile/
       - run: uv run pytest -q

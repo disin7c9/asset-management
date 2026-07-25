@@ -281,7 +281,7 @@ def bootstrap_ci(
         resampled = pd.Series(arr[bidx], index=idx[: len(bidx)])
         try:
             val = float(metric_fn(resampled))
-        except Exception:  # noqa: BLE001 — a degenerate resample shouldn't kill the CI
+        except Exception:  # noqa: BLE001,S112 — a degenerate resample shouldn't kill the CI (or log 1000×)
             continue
         if np.isfinite(val):
             samples.append(val)

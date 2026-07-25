@@ -53,7 +53,10 @@ def _warm_series_cache(cache: Path, ticker: str, base: float) -> None:
             "fetched_at": pd.Timestamp.now(tz="UTC") - pd.Timedelta(minutes=1),
         }
     )
+    # Both bases: the portfolio path reads the raw file, the screen/simulate paths read the
+    # total-return one. The fixture is synthetic, so one curve legitimately serves as both.
     df.to_parquet(cache / f"{ticker}_series.parquet", index=False)
+    df.to_parquet(cache / f"{ticker}_series_tr.parquet", index=False)
 
 
 @pytest.fixture(autouse=True)
@@ -187,7 +190,7 @@ def test_every_prompt_carries_the_figures_rule() -> None:
         "text", "",
     )
     assert "'aggressive'" in posture_text
-    with pytest.raises(BaseException) as ei:
+    with pytest.raises(BaseException) as ei:  # noqa: PT011 — anyio wraps McpError in a BaseExceptionGroup
         _get_prompt("propose_a_posture", {"posture": "balanced"})
     err: BaseException = ei.value
     while isinstance(err, BaseExceptionGroup):  # anyio wraps the McpError in a TaskGroup
@@ -210,7 +213,7 @@ def test_should_i_rebalance_threads_mode_and_new_cash() -> None:
         _get_prompt("should_i_rebalance", {"mode": "to_total"}).messages[0].content, "text", "",
     )
     assert "mode='to_total'" in tot and "new_cash" not in tot
-    with pytest.raises(BaseException) as ei:  # an off-menu mode errors at prompt time
+    with pytest.raises(BaseException) as ei:  # noqa: PT011 — anyio wraps McpError; off-menu mode errors at prompt time
         _get_prompt("should_i_rebalance", {"mode": "momentum"})
     err: BaseException = ei.value
     while isinstance(err, BaseExceptionGroup):  # anyio wraps the McpError in a TaskGroup
@@ -241,7 +244,7 @@ def test_propose_a_posture_threads_posture_and_benchmark() -> None:
         "text", "",
     )
     assert "preset 'aggressive'" in txt and "benchmark 'all-weather'" in txt
-    with pytest.raises(BaseException) as ei:  # an off-menu benchmark errors at prompt time
+    with pytest.raises(BaseException) as ei:  # noqa: PT011 — anyio wraps McpError; off-menu benchmark errors at prompt time
         _get_prompt("propose_a_posture", {"posture": "moderate", "benchmark": "sp500"})
     err: BaseException = ei.value
     while isinstance(err, BaseExceptionGroup):  # anyio wraps the McpError in a TaskGroup
@@ -508,6 +511,20 @@ def test_missing_book_prices_demo_through_a_tool(
     assert not res.isError, _error_text(res)
     sc = res.structuredContent
     assert sc is not None and sc["holdings"]  # the demo book derives real positions
+    # ...and the response must SAY it's demo data. `_env_book` warns on stderr, which the
+    # model never reads — without this the assistant reports fake holdings as the user's.
+    assert sc["provenance"]["is_demo"] is True
+    assert "DEMO DATA" in sc["note"]
+
+
+def test_a_configured_book_is_never_labelled_demo(warm_book: Path) -> None:
+    # The mirror: the disclosure must not cry wolf on a real book, or it stops meaning anything.
+    res = _call("portfolio_summary")
+    assert not res.isError, _error_text(res)
+    sc = res.structuredContent
+    assert sc is not None
+    assert sc["provenance"]["is_demo"] is False
+    assert "DEMO DATA" not in sc["note"]
 
 
 def test_asset_csv_env_is_back_compat(warm_book: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1184,3 +1201,23 @@ def test_propose_allocation_held_book_cold_cache_still_refuses(
     _cold_book(tmp_path, monkeypatch)
     res = _call("propose_allocation", {"preset": "moderate", "benchmark": "none"})
     assert res.isError and "warm" in _error_text(res).lower()
+
+
+def test_every_tool_that_can_answer_on_demo_data_says_so(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Regression: `note` was switched to a demo-aware default_factory, but three response
+    paths passed `note=` explicitly (which skips the default) or were never migrated off the
+    plain constant — `rebalance_check`, `discover_gaps`, and `screen_candidate`'s
+    couldn't-fetch branch. rebalance_check is the worst of the three: it proposes TRADES and
+    carries no DataProvenance, so `note` is its only channel for saying the holdings are fake."""
+    monkeypatch.setenv("ASSET_CACHE_DIR", str(tmp_path / "cache"))
+    # ASSET_BOOK/ASSET_CSV pinned "" by the autouse fixture → the demo-book fallback
+    for tool, args in (
+        ("rebalance_check", {"mode": "to_total"}),
+        ("discover_gaps", {}),
+        ("screen_candidate", {"ticker": "ZZZ"}),   # uncached → the couldn't-fetch branch
+    ):
+        res = _call(tool, args)
+        sc = res.structuredContent
+        if sc is None or "note" not in sc:
+            continue  # the tool errored for an unrelated reason (no target file, etc.)
+        assert "DEMO DATA" in sc["note"], f"{tool} did not disclose demo data: {sc['note'][:120]}"

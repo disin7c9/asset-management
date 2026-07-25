@@ -202,3 +202,58 @@ def test_complete_openai_truncation_is_none(monkeypatch: pytest.MonkeyPatch) -> 
                                         "message": {"content": "fell {{max_dr"}}]},
     )
     assert complete(_OPENAI, "sys", "usr") is None
+
+
+def test_a_redirect_cannot_walk_the_api_key_to_another_host() -> None:
+    """Regression: `_post` used a bare `urlopen`, which follows 3xx and re-sends every
+    header — including the user's `Authorization` and, on the next call, their portfolio
+    figures. `_is_safe_url` vets the CONFIGURED base_url and has no say over where a
+    redirect points, so a user-supplied proxy or a MITM was enough. `prices.py` already
+    had the fix for its own credential; the LLM path did not, because the handler lived in
+    the price module rather than in a shared one.
+
+    **The status code is load-bearing — use 302, not 307.** urllib's stock handler already
+    refuses to auto-follow a 307/308 for a POST, so a 307 test passes against the *unfixed*
+    code and pins nothing. 302 is where the leak actually lives: verified against a bare
+    urlopen, the redirect target received `Bearer sk-SECRET`."""
+    import json
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    received: list[str | None] = []
+
+    class _Target(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            received.append(self.headers.get("Authorization"))
+            body = json.dumps({"ok": True}).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a: object) -> None: ...
+
+    class _Redirector(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            self.send_response(302)
+            self.send_header("Location", f"http://127.0.0.1:{target.server_port}/v1/x")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, *a: object) -> None: ...
+
+    target = HTTPServer(("127.0.0.1", 0), _Target)
+    redirector = HTTPServer(("127.0.0.1", 0), _Redirector)
+    for srv in (target, redirector):
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        with pytest.raises(Exception, match="302"):
+            llm._post(
+                f"http://127.0.0.1:{redirector.server_port}/v1/x",
+                {"Authorization": "Bearer sk-SECRET"}, {"q": 1}, 5.0,
+            )
+        assert received == []          # the redirect target got nothing at all
+    finally:
+        for srv in (target, redirector):
+            srv.shutdown()
+            srv.server_close()

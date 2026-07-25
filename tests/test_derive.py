@@ -27,7 +27,10 @@ GOLDEN_HELD = {
     "IAU": (25.0, 930.625, 220.625),
     "VEA": (15.0, 604.0, 0.0),
 }
-GOLDEN_TOTAL_FEES = 8.0  # 8 non-dividend rows × $1 (3 VOO + 2 BND + 2 IAU + 1 VEA)
+# 8 trade rows × $1 (3 VOO + 2 BND + 2 IAU + 1 VEA), plus the $25 annual account fee row.
+GOLDEN_TOTAL_FEES = 33.0
+# Interest $12.85 − the $25 account fee. Realized on the CASH side, with no position behind it.
+GOLDEN_CASH_REALIZED = -12.15
 
 
 def _abs_close(a: float, b: float, tol: float = 1e-6) -> bool:
@@ -65,10 +68,14 @@ def test_derived_state_helpers_match() -> None:
         state.total_cost_basis(),
         sum(cb for _, cb, _ in GOLDEN_HELD.values()),
     )
+    # total_realized spans BOTH sides: per-ticker sale/dividend gains and the cash-side
+    # interest/fee rows. The example book exercises all seven action types, so this sum
+    # would silently drop the cash leg if the two were ever wired apart.
     assert _abs_close(
         state.total_realized(),
-        sum(r for _, _, r in GOLDEN_HELD.values()),
+        sum(r for _, _, r in GOLDEN_HELD.values()) + GOLDEN_CASH_REALIZED,
     )
+    assert _abs_close(state.cash_realized, GOLDEN_CASH_REALIZED)
 
 
 # --- Property-based invariants ---
@@ -159,9 +166,8 @@ def test_unmatched_tax_on_cash_ticker_is_a_cash_account_cost() -> None:
 
 
 def test_interest_on_cash_is_cash_account_income() -> None:
-    # Broker interest on idle cash (the Shinhan 외화예탁금이용료 row) is real income:
-    # it counts in total_realized via cash_realized, without fabricating a CASH
-    # position or a realized["CASH"] entry.
+    # Broker interest on idle cash is real income: it counts in total_realized via
+    # cash_realized, without fabricating a CASH position or a realized["CASH"] entry.
     state = derive(
         [Event(date(2024, 3, 1), CASH_TICKER, "interest", quantity=0.0, price=0.0,
                fee=0.0, cash=12.0)]

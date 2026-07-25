@@ -104,13 +104,25 @@ deposits/withdrawals are excluded. Funding and transfers cancel (they move balan
 equally), so a drawdown of this curve is real "dollars of profit given back."
 
 ### 2.3 Daily time-weighted return — `build_daily_returns`
-Neutralize external flows so the series reflects investment performance, not contribution timing:
+Neutralize external flows so the series reflects investment performance, not contribution timing.
+Writing the day's net external flow as $F(d)=B(d)-S(d)$:
 $$
-g(d)=V(d)-V(d-1)-B(d)+S(d)+I(d),
+g(d)=V(d)-V(d-1)-F(d)+I(d),
 \qquad
-r(d)=\frac{g(d)}{V(d-1)}\quad\text{for } V(d-1)>0,
+r(d)=\frac{g(d)}{V(d-1)+F(d)}\quad\text{for } V(d-1)>0,\ V(d-1)+F(d)>0,
 $$
 with $B$ buy cost, $S$ sell proceeds, $I$ income (dividends/interest net of withholding, minus fees).
+
+**The flow sits in the denominator too** — a day-level Modified Dietz (§1.3), with a full-day
+weight because the day's new shares are valued at that day's close. This is forced, not stylistic:
+shares bought on day $d$ enter $V(d)$ at the CLOSE while their cash leaves at the EXECUTION price,
+so the fill→close move is already inside $g(d)$. Dividing by $V(d-1)$ alone credits new money's
+gain to old money, with error scaling as $F(d)/V(d-1)$ — unbounded, and bounded only on a mature
+book. In a flat market where no price moved, a \$99{,}500 purchase filled 0.5% under the close
+against a \$100 position yields $r=+0.502\%$ here and reported $+500\%$ before this correction.
+Note the sign: a fill *above* the close manufactures a negative day, i.e. a drawdown that never
+happened. Income is deliberately NOT in the denominator — it is return the holdings earned, not
+capital the investor added.
 
 ### 2.4 Growth-of-1 index — `twr_index`
 $$
@@ -401,6 +413,19 @@ s_k(t_0)=\frac{w_k\,K}{P_k(t_0)},
 $$
 Weights are renormalized over priced tickers, $w_k\leftarrow w_k/\sum_j w_j$.
 
+**Return basis.** $P_k$ here is the **total-return** close (split- *and* dividend-adjusted), not
+the split-adjusted-only close $P_k$ denotes everywhere else in this document. The distinction is
+forced: the portfolio path (§2) takes dividends from the transaction log, so an adjusted close
+would double-count them, while `simulate` holds funds with no log — on a raw close every coupon
+and dividend becomes a permanent capital loss. Measured over 2023-01→2026-07 on the same cache,
+the raw basis reports BND at $-0.12\%$/yr against $+3.51\%$ (Ulcer $3.35\%$ vs $2.15\%$) and BIL —
+whose entire return is coupon — at $+0.02\%$/yr against $+4.58\%$. The benchmark references are
+40–55% bonds (`60-40` is 40% BND; `permanent` is 25% BIL + 25% TLT), so this is not a rounding
+concern: it moved the `all-weather` leg from $+5.61\%$/yr to $+8.50\%$ over the demo window, and
+cut the preset's apparent Ulcer advantage over it from $0.70$pp to $0.43$pp. The bases are cached
+in separate
+files (`<T>_series.parquet` vs `<T>_series_tr.parquet`) so neither can be served for the other.
+
 ### 12.3 In-sample / out-of-sample split
 Over the common priced window of $n$ days (the candidate's history is usually binding):
 $$
@@ -408,6 +433,22 @@ n_{\text{oos}}=\lfloor n\cdot 0.30\rfloor,\qquad n_{\text{is}}=n-n_{\text{oos}},
 $$
 require $n_{\text{is}}\ge 60$ **and** $n_{\text{oos}}\ge 60$ else the verdict is **insufficient**. Fresh
 capital each window; legs date-aligned by inner join (never positional truncation).
+
+**Known limitation — selection sits OUTSIDE the split.** The *evaluation* above is clean: nothing
+is tuned, and the statistics are computed on the held-out window alone. But on the `--discover`
+path the candidate is chosen upstream by `screen.py`, whose correlation and drawdown-window checks
+read the **full** history — including the very window this split then holds out. So a fund that
+happened to behave well in that window is somewhat likelier to be the one you are shown, and the
+verdict about it is not fully independent of it. This is why the output says *held-out
+recent-window*, not *walk-forward*: a walk-forward guarantee requires selection to happen inside
+the training window, repeatedly.
+
+Two things bound the damage. Most screen checks carry no return information at all (expense ratio,
+liquidity, fund age, leveraged/inverse rejection, holdings overlap), and the screen is a pass/fail
+**gate rather than a ranker** — threshold pressure is far weaker than an optimizer's. When you name
+the ticker yourself (`--screen SCHD`) there is no selection step, so no leak. The fix — computing
+the return-based checks on the in-sample window only when a role check will follow — is recorded as
+the first item of the next patch.
 
 ### 12.4 Window statistics — `_window_stats`
 Per leg (with-candidate, without), over the held-out window: **Ulcer index** (§5.4 — the verdict

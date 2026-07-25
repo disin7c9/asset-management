@@ -107,6 +107,21 @@ _OFFLINE_NOTE = (
 # fallback when a tool errors). Reinforces the same rule stated in the server instructions.
 _NO_ESTIMATE = " Until then, report that it's unavailable — do not estimate it yourself."
 
+_DEMO_NOTE = (
+    "⚠ DEMO DATA — no transaction file is configured, so these are the bundled example "
+    "holdings, NOT the user's portfolio. Say this before quoting any figure below, and tell "
+    "them to set their book in the extension's Configure panel (or ASSET_BOOK). "
+)
+
+
+def _note() -> str:
+    """The standard tool note, prefixed with the demo warning when it applies.
+
+    A `default_factory` rather than a constant default: whether the server is on demo data is
+    an environment fact at CALL time, and it has to reach the model through the response —
+    the stderr warning `_env_book` logs is invisible to it."""
+    return (_DEMO_NOTE + _OFFLINE_NOTE) if _book_is_demo() else _OFFLINE_NOTE
+
 
 def _cold_error(msg: str) -> str:
     """A cold-cache / figure-unavailable message + the anti-fabrication directive. The one funnel
@@ -121,13 +136,21 @@ def _cold_error(msg: str) -> str:
 BenchmarkArg = Literal["60-40", "all-weather", "permanent", "none"]
 
 
-# Read-only, closed-world (no external side effects), idempotent — the honest hints
-# for a Claude client (Claude reads readOnlyHint to know the tool only observes).
+# `readOnlyHint` is about the USER'S DATA — no tool here ever writes to the ledger or
+# places a trade, so it stays True throughout. `openWorldHint` is about the network, and
+# it is NOT uniform: a client reads these hints to decide what to auto-approve, so a tool
+# that may reach Yahoo/Tiingo on demand must say so rather than inherit a blanket False.
 # The human-readable `title` is what a client shows in a tool menu; the connectors
 # directory rejects a submission whose tools don't carry one.
-def _read_only(title: str) -> ToolAnnotations:
+def _read_only(title: str, *, fetches: bool = False) -> ToolAnnotations:
+    """Annotations for a tool. ``fetches=True`` when it can make a live price/metadata
+    request for a symbol that isn't cached (which also makes it non-idempotent: the first
+    call populates the cache the next one reads)."""
     return ToolAnnotations(
-        title=title, readOnlyHint=True, idempotentHint=True, openWorldHint=False
+        title=title,
+        readOnlyHint=True,
+        idempotentHint=not fetches,
+        openWorldHint=fetches,
     )
 
 mcp: FastMCP = FastMCP(
@@ -205,6 +228,15 @@ def _env_path(var: str, what: str, *, fallback: str | None = None) -> Path:
     if not path.exists():
         raise ValueError(f"{var} points at a missing file: {path}")
     return path
+
+
+def _book_is_demo() -> bool:
+    """True when no book is configured, so every figure comes from the bundled DEMO data.
+
+    `_env_book` warns about this on stderr — which the MODEL never sees. It reads tool output.
+    So the same fact has to travel in the response (`DataProvenance.is_demo` + the note), or an
+    assistant will present fake holdings as the user's portfolio in perfect good faith."""
+    return _env_raw("ASSET_BOOK", fallback="ASSET_CSV") is None
 
 
 def _env_book() -> Path:
@@ -401,6 +433,13 @@ class DataProvenance(BaseModel):
     stalest_fetch_hours: float | None = Field(
         None, description="age of the STALEST price used — how long since it was last fetched"
     )
+    is_demo: bool = Field(
+        default=False,
+        description="TRUE when no book is configured and these figures come from the bundled "
+        "DEMO portfolio — fake holdings, NOT the user's. Say so before reporting any number "
+        "from this response, and tell the user to set their book in the extension's Configure "
+        "panel (or ASSET_BOOK) to see their own.",
+    )
 
 
 class PortfolioSummary(BaseModel):
@@ -411,7 +450,7 @@ class PortfolioSummary(BaseModel):
     returns: Returns
     provenance: DataProvenance
     unpriced_tickers: list[str] = Field(description="held tickers with no usable cached price")
-    note: str = _OFFLINE_NOTE
+    note: str = Field(default_factory=_note)
 
 
 class CI(BaseModel):
@@ -463,7 +502,7 @@ class RiskReport(BaseModel):
     calmar: CI | None = Field(None, description="null when there's no drawdown (undefined)")
     dollar_drawdown: DollarDD | None
     provenance: DataProvenance
-    note: str = _OFFLINE_NOTE
+    note: str = Field(default_factory=_note)
 
 
 class Trade(BaseModel):
@@ -481,9 +520,9 @@ class RebalancePlan(BaseModel):
     mode: str
     new_cash: float = Field(
         default=0.0,
-        description="new cash deployed this run: fixed_dca / cash_flow_only REQUIRE it, "
-        "to_total also deploys it if passed, only bands ignores it. For fixed_dca / "
-        "cash_flow_only, 0 → all-HOLD.",
+        description="new cash deployed this run: fixed_dca / cash_flow_only REQUIRE it; "
+        "to_total and bands also deploy it when passed (bands only if some holding has "
+        "drifted outside its band). For fixed_dca / cash_flow_only, 0 → all-HOLD.",
     )
     target_source: str = Field(
         default="", description="the ASSET_TARGET file the plan is measured against"
@@ -493,7 +532,7 @@ class RebalancePlan(BaseModel):
         description="held/target tickers with no cached price; offline, a NEW target "
         "ticker can't be sized — run the CLI online for a full plan"
     )
-    note: str = _OFFLINE_NOTE
+    note: str = Field(default_factory=_note)
 
 
 class SecurityFact(BaseModel):
@@ -515,7 +554,7 @@ class SecuritiesFacts(BaseModel):
     missing: list[str] = Field(
         description="held tickers with no cached facts (warm via `--metadata` online)"
     )
-    note: str = _OFFLINE_NOTE
+    note: str = Field(default_factory=_note)
 
 
 class GapCandidate(BaseModel):
@@ -564,12 +603,14 @@ class DiscoveryGaps(BaseModel):
         description="held tickers with no cached price — role exposure (and thus the gaps) "
         "may be skewed; warm the cache for the full picture",
     )
-    note: str = (
-        "Roles your book holds ≤3% of, each showing its standard shelf's comparable funds "
-        "— propose-only, never a prediction. `other_shelves` names sub-exposures not shown "
-        "(treasury durations, sectors); picking a shelf is the user's decision. For the "
-        "full screen (cost / liquidity / overlap / did-it-diversify-your-drawdowns) call "
-        "`screen_candidate`. " + _OFFLINE_NOTE
+    note: str = Field(
+        default_factory=lambda: (
+            "Roles your book holds ≤3% of, each showing its standard shelf's comparable funds "
+            "— propose-only, never a prediction. `other_shelves` names sub-exposures not shown "
+            "(treasury durations, sectors); picking a shelf is the user's decision. For the "
+            "full screen (cost / liquidity / overlap / did-it-diversify-your-drawdowns) call "
+            "`screen_candidate`. " + _note()
+        )
     )
 
 
@@ -589,7 +630,7 @@ class CandidateVerdict(BaseModel):
         description="PASS | WARN | FAIL | N/A — necessary, not sufficient; never a prediction"
     )
     checks: list[ScreenCheck]
-    note: str = _OFFLINE_NOTE
+    note: str = Field(default_factory=_note)
 
 
 class AllocationWeight(BaseModel):
@@ -644,7 +685,7 @@ class ProposedAllocation(BaseModel):
         "priced subset, so a role's fund may differ from your actual dominant holding; "
         "warm the cache for the full picture",
     )
-    note: str = _OFFLINE_NOTE
+    note: str = Field(default_factory=_note)
 
 
 # ── serialization helpers ────────────────────────────────────────────────────
@@ -709,6 +750,7 @@ def _data_provenance(b: _Build) -> DataProvenance:
     when nothing is currently held but risk was still computed from past holdings — a
     fully-exited book — so risk_report never shows numbers next to an all-null receipt.
     Empty only when there is genuinely no price data to stamp."""
+    demo = _book_is_demo()
     rows = list(b.prices.values())
     if rows:
         return DataProvenance(
@@ -716,6 +758,7 @@ def _data_provenance(b: _Build) -> DataProvenance:
             oldest_close=min(pr.asof_date for pr in rows),
             sources=sorted({pr.source for pr in rows}),
             stalest_fetch_hours=max(_age_hours(pr.cache_age) for pr in rows),
+            is_demo=demo,
         )
     series = b.series
     if series is not None and series.rows:
@@ -733,8 +776,11 @@ def _data_provenance(b: _Build) -> DataProvenance:
             stalest_fetch_hours=(
                 max(_age_hours(now - fetched) for _, fetched in prov.values()) if prov else None
             ),
+            is_demo=demo,
         )
-    return DataProvenance(price_asof=None, oldest_close=None, sources=[], stalest_fetch_hours=None)
+    return DataProvenance(
+        price_asof=None, oldest_close=None, sources=[], stalest_fetch_hours=None, is_demo=demo
+    )
 
 
 # ── tools ────────────────────────────────────────────────────────────────────
@@ -829,8 +875,9 @@ def risk_report() -> RiskReport:
     description="Buy/sell/hold suggestions to move current holdings toward the target "
     "allocation (ASSET_TARGET). There are exactly 4 modes: 'to_total' (rebalance the whole "
     "book back to target weights — ALSO deploys new_cash into the rebalance if you pass it) and "
-    "'bands' (trade only sleeves that drifted past the 5%/25% threshold — the one mode that "
-    "IGNORES new_cash); 'fixed_dca' (spread new_cash across the target mix) and 'cash_flow_only' "
+    "'bands' (the same plan, but only when some sleeve has drifted past the 5%/25% threshold; "
+    "if none has, every line is HOLD); 'fixed_dca' (spread new_cash across the target mix) "
+    "and 'cash_flow_only' "
     "(put new_cash into the most-underweight sleeves) — these two REQUIRE new_cash > 0 and "
     "suggest all-HOLD when it is 0. Offline + read-only — it suggests, never trades. A NEW "
     "target ticker can't be sized offline (no cached price); those appear under 'unpriced'.",
@@ -877,11 +924,15 @@ def rebalance_check(mode: Mode = "to_total", new_cash: float = 0.0) -> Rebalance
     ]
     # Self-describing: fixed_dca / cash_flow_only exist to deploy NEW cash, so with none they
     # emit all-HOLD — say so rather than leave the caller puzzled by a plan of only HOLDs.
-    note = _OFFLINE_NOTE
+    # `_note()`, not `_OFFLINE_NOTE`: an explicit note= defeats the field's default_factory,
+    # and this model carries no DataProvenance, so this string is the ONLY channel that can
+    # tell the model these are demo holdings. Overriding it with the plain note silently
+    # dropped the ⚠ DEMO warning from the one tool that proposes trades.
+    note = _note()
     if mode in ("fixed_dca", "cash_flow_only") and new_cash == 0:
         note = (
             f"{mode} deploys NEW cash, but new_cash=0 → every line is HOLD. Pass "
-            f"new_cash=<amount> to see where the money would go. {_OFFLINE_NOTE}"
+            f"new_cash=<amount> to see where the money would go. {note}"
         )
     return RebalancePlan(
         asof=today, mode=mode, new_cash=new_cash, target_source=str(target_path),
@@ -981,7 +1032,7 @@ def discover_gaps(role: RoleName | None = None, flavor: str | None = None) -> Di
 
 
 @mcp.tool(
-    annotations=_read_only("Screen a candidate"),
+    annotations=_read_only("Screen a candidate", fetches=True),
     description="Judge a NEW ticker against the user's book (offline, read-only, propose-only): "
     "cost, liquidity, age, concentration, overlap with what they hold, and whether it diversified "
     "their past drawdowns — each with a reason and the figures behind it. Use to answer 'is "
@@ -1011,7 +1062,10 @@ def screen_candidate(ticker: str) -> CandidateVerdict:
     # server is locked strictly offline — then stay cache-only. The held set already comes
     # from the warmed book; only the candidate's own series/metadata may need the network.
     online = not _offline_locked()
-    cand_series = fetch_series([tk], start, today, cache_dir=cache, online=online)
+    # total_return: judged against the book's own return series, which carries its dividends.
+    cand_series = fetch_series(
+        [tk], start, today, cache_dir=cache, online=online, basis="total_return"
+    )
     if tk not in cand_series.rows:
         note = (
             f"Couldn't fetch price history for {tk} — check the symbol "
@@ -1021,7 +1075,10 @@ def screen_candidate(ticker: str) -> CandidateVerdict:
             f"Warm it once — `uv run python -m app --book <your-book> --screen {tk}` "
             "(or `--warm full`) — then ask again."
         )
-        return CandidateVerdict(ticker=tk, verdict="N/A", checks=[], note=note)
+        # `+ _note()` for the same reason as rebalance_check: an explicit note= skips the
+        # field default, and this branch would otherwise be the one screen_candidate reply
+        # that never discloses demo data.
+        return CandidateVerdict(ticker=tk, verdict="N/A", checks=[], note=f"{note} {_note()}")
     held = set(b.state.held())
     # Held facts stay cache-only (already warmed); only the candidate may need the network, so an
     # on-demand fetch doesn't fan out across every holding (the held/candidate online split).
@@ -1059,7 +1116,10 @@ def _benchmark_verdict(
     tickers = sorted(set(target) | set(ref_weights))
     start = today - timedelta(days=HISTORY_DAYS)
     online = not _offline_locked()
-    series = fetch_series(tickers, start, today, cache_dir=cache, online=online)
+    # total_return: both legs are simulated without a log, and the references are 40-55% bonds.
+    series = fetch_series(
+        tickers, start, today, cache_dir=cache, online=online, basis="total_return"
+    )
     result = benchmark_compare(
         series.rows, target, ref_weights, reference=benchmark, provenance=series.provenance,
     )
@@ -1101,7 +1161,7 @@ def _benchmark_verdict(
 
 
 @mcp.tool(
-    annotations=_read_only("Propose an allocation"),
+    annotations=_read_only("Propose an allocation", fetches=True),
     description="Propose a strategic target allocation for a risk posture (conservative / "
     "moderate / aggressive) over the user's book + the curated universe, and validate it "
     "against a canonical reference (60-40 / all-weather / permanent) with a walk-forward "
@@ -1328,15 +1388,22 @@ def guarantees() -> str:
 Version {_VERSION}. These are properties **enforced in code and pinned by the test
 suite**, not promises.
 
-**1. Read-only.** No tool can place a trade, move money, or edit your transaction log.
-There are no write tools; every tool is annotated read-only. The ledger is append-only,
+**1. Read-only where it matters.** No tool can place a trade, move money, or edit your
+transaction log. There are no write tools; every tool is annotated read-only. (The server
+does write its own price cache under `ASSET_CACHE_DIR` — that is the only thing it writes.) The ledger is append-only,
 and only you write to it.
 
-**2. Every number is computed, never generated.** Figures come from a deterministic
-Python core — reconciled to the cent against a real brokerage export, and to 4 decimal
-places against quantstats. The AI assistant narrating this chat cannot compute, alter,
-or estimate a figure: when a value is unavailable, the tools say so (and how to fix it)
-rather than guessing, and the assistant is instructed to do the same.
+**2. Every number this server reports is computed, never generated.** Figures come from
+a deterministic Python core — reconciled to the cent against a real brokerage export, and
+to 4 decimal places against quantstats. When a value is unavailable the tools say so, and
+how to fix it, rather than guessing.
+
+Be precise about the boundary: that guarantee covers the *tool output*. Nothing here can
+stop an assistant from typing a number of its own into the chat — that is instruction, not
+enforcement, and you should treat any figure not visibly traceable to a tool result as
+unverified. (The CLI's `--narrate` path is different: it substitutes figures mechanically
+and refuses any narration containing a model-typed digit. That fence guards the brief, not
+this conversation.)
 
 **3. Your data stays on your machine.** The server runs locally over stdio; there is no
 telemetry. The only network use is downloading public market data — price history (a
@@ -1349,12 +1416,11 @@ those downloads.
 the named rule that produced it (e.g. "5/25 band breached"), every risk metric carries a
 confidence interval, and benchmark verdicts only ever say `shallower` / `deeper` /
 `inconclusive` / `insufficient` (too little data) — never "beats" or "buy this". A
-strategy claiming an *edge* must pass a walk-forward (out-of-sample) gate before it may
-even surface. You learn the rule; you decide.
+strategy claiming an *edge* must pass an out-of-sample gate before it may even surface. You learn the rule; you decide.
 
 *How to verify: the source is open — the tests pin each property (read-only annotations,
-the number fence that rejects any model-authored digit, the walk-forward gate). Nothing
-in this chat is financial advice.*
+the CLI number fence that rejects any model-authored decimal digit, the out-of-sample
+gate). Nothing in this chat is financial advice.*
 """
 
 

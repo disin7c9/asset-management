@@ -1315,7 +1315,7 @@ def test_unhandled_split_ticker_excluded_from_twr_and_noted(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str],
 ) -> None:
-    # Real-data guard (Shinhan/NVDA): a ticker bought at ~10× its split-adjusted
+    # Real-data guard (NVDA): a ticker bought at ~10× its split-adjusted
     # close (an unhandled split) must be EXCLUDED from the time-weighted series so
     # it can't fabricate a return — with a warning and a report note. Mirrors the
     # NVDA case: the split ticker is sold out, so current holdings stay clean.
@@ -2096,7 +2096,9 @@ def _record_warm_fetchers(monkeypatch: pytest.MonkeyPatch) -> dict[str, set[str]
     seen: dict[str, set[str]] = {}
 
     def series(tickers: object, start: object, end: object, **k: object) -> SeriesResult:
-        seen["series"] = set(tickers)  # type: ignore[arg-type]
+        # two passes: raw over everything, then total-return over the simulation set
+        key = "series_tr" if k.get("basis") == "total_return" else "series"
+        seen[key] = set(tickers)  # type: ignore[arg-type]
         return SeriesResult()
 
     def latest(tickers: object, **k: object) -> PricesResult:
@@ -2142,6 +2144,8 @@ def test_warm_full_adds_the_universe(
     assert {"VOO", "BND", "VEA", "IAU"} | _REFS <= seen["series"]
     assert "QQQM" in seen["series"] and "SCHD" in seen["series"]  # real universe tickers landed
     assert len(seen["series"]) > 100
+    # the total-return pass covers the simulation set only — the universe stays out of it
+    assert seen["series_tr"] == {"VOO", "BND", "VEA", "IAU"} | _REFS
 
 
 def test_warm_without_a_book_warms_refs_only(
@@ -2151,8 +2155,9 @@ def test_warm_without_a_book_warms_refs_only(
     rc = main(["--warm", "--cache-dir", str(tmp_path)])  # ASSET_BOOK pinned "" by the fixture
     capsys.readouterr()
     assert rc == 0
-    assert seen["series"] == _REFS         # just the references
-    assert set(seen) == {"series"}         # no book → no latest/splits/metadata fetch at all
+    assert seen["series"] == _REFS               # just the references
+    assert seen["series_tr"] == _REFS            # ...on both bases
+    assert set(seen) == {"series", "series_tr"}  # no book → no latest/splits/metadata fetch at all
 
 
 def test_warm_rejects_offline(monkeypatch: pytest.MonkeyPatch) -> None:

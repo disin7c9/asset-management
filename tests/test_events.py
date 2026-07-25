@@ -275,7 +275,7 @@ def test_load_events_report_raises_on_a_bad_row(tmp_path: Path) -> None:
     # A well-formed header but a row-level violation (unknown action) must raise through the
     # report seam too — not just parse-level column errors (the --dry-run rc-2 path relies on it).
     p = _csv(tmp_path, _HEADER + "2024-01-02,VOO,YAHOO,USD,400,1,teleport,0,\n")
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="teleport"):
         load_events_report(p)
 
 

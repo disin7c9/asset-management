@@ -34,13 +34,14 @@ import urllib.request
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
-from http.client import HTTPMessage
 from pathlib import Path
-from typing import IO
+from typing import Literal
 from urllib.parse import quote
 
 import pandas as pd
 import yfinance as yf
+
+from app.http_safe import no_redirect_opener
 
 log = logging.getLogger(__name__)
 
@@ -59,6 +60,19 @@ STALE_PRICE_FLOOR = timedelta(days=10)
 # below (a cached series "covers" `end` if its last row is within the grace) and the report's
 # stale-close display (`report._stale_close_lag` starts naming close dates beyond it).
 STALE_CLOSE_GRACE = timedelta(days=4)
+
+# WHICH close a series carries. The two are not interchangeable and the choice is forced by
+# whether the caller has a transaction log:
+#   "raw"          — split-adjusted only (yfinance auto_adjust=False / Tiingo `close` rebuilt
+#                    from splitFactor). The PORTFOLIO path: dividends already arrive as rows in
+#                    the user's log, so a dividend-adjusted close would count every one twice.
+#   "total_return" — split- AND dividend-adjusted (yfinance auto_adjust=True / Tiingo
+#                    `adjClose`). The NOTIONAL-SIMULATION path (`backtest.simulate` and every
+#                    verdict built on it): it holds funds without a log, so there is nowhere
+#                    else for income to come from. On a raw basis a bond sleeve shows the
+#                    coupon-stripped price drift as pure loss — BND ≈ -1.5%/yr over the cached
+#                    decade against ~+4% real, and BIL (whose return is ENTIRELY coupon) ≈ 0.
+PriceBasis = Literal["raw", "total_return"]
 
 
 @dataclass(frozen=True)
@@ -216,15 +230,24 @@ class _RetryCircuit:
             )
 
 
-def _fetch_yf(ticker: str, start: date, end: date) -> pd.DataFrame | None:
-    """One raw yfinance.download attempt — the mockable network seam. None on failure/empty."""
+def _fetch_yf(
+    ticker: str, start: date, end: date, *, adjusted: bool = False
+) -> pd.DataFrame | None:
+    """One raw yfinance.download attempt — the mockable network seam. None on failure/empty.
+
+    ``adjusted`` picks the BASIS. Default False = split-adjusted only, which is what the
+    portfolio path needs (dividends already arrive as rows in the transaction log, so an
+    adjusted close would count them twice). True = split- AND dividend-adjusted, i.e. total
+    return — what a *notional* simulation needs, since it has no transaction log to draw
+    income from. See `PriceBasis`.
+    """
     try:
         df = yf.download(
             ticker,
             start=start.isoformat(),
             end=end.isoformat(),
             progress=False,
-            auto_adjust=False,
+            auto_adjust=adjusted,
         )
     except Exception as exc:  # noqa: BLE001 — yfinance raises many specific things
         log.warning("yfinance fetch failed for %s: %s", ticker, exc)
@@ -233,7 +256,8 @@ def _fetch_yf(ticker: str, start: date, end: date) -> pd.DataFrame | None:
 
 
 def _fetch_yf_retrying(
-    ticker: str, start: date, end: date, *, circuit: _RetryCircuit | None = None
+    ticker: str, start: date, end: date, *,
+    circuit: _RetryCircuit | None = None, adjusted: bool = False,
 ) -> pd.DataFrame | None:
     """`_fetch_yf` with one spaced retry, gated by a batch `circuit`.
 
@@ -247,7 +271,7 @@ def _fetch_yf_retrying(
     armed = circuit is None or circuit.armed
     attempts = 2 if armed else 1
     for attempt in range(1, attempts + 1):
-        df = _fetch_yf(ticker, start, end)
+        df = _fetch_yf(ticker, start, end, adjusted=adjusted)
         if df is not None and not df.empty:
             if circuit is not None:
                 circuit.record(ok=True)
@@ -287,28 +311,9 @@ def _env_secret(var: str) -> str:
     return "" if raw.startswith("${") else raw
 
 
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    """Refuse 3xx rather than follow it.
-
-    `urllib` re-sends every header on a redirect and — unlike `requests` — does NOT
-    strip `Authorization` when the host changes, so a redirect (a compromised host, a
-    MITM'd proxy) would hand the user's API key to the target. Tiingo's API does not
-    redirect, so refusing is free: the 3xx surfaces as an HTTPError → a logged miss.
-    """
-
-    def redirect_request(
-        self,
-        req: urllib.request.Request,
-        fp: IO[bytes],
-        code: int,
-        msg: str,
-        headers: HTTPMessage,
-        newurl: str,
-    ) -> urllib.request.Request | None:
-        return None
-
-
-_TIINGO_OPENER = urllib.request.build_opener(_NoRedirect)
+# Tiingo's API does not redirect, so refusing one is free — and `urllib` would otherwise
+# re-send the Authorization header to wherever the 3xx pointed. See `http_safe.NoRedirect`.
+_TIINGO_OPENER = no_redirect_opener()
 
 
 def _fetch_tiingo_json(
@@ -331,9 +336,9 @@ def _fetch_tiingo_json(
         f"https://api.tiingo.com/tiingo/daily/{quote(ticker.lower(), safe='')}/prices"
         f"?startDate={start.isoformat()}&endDate={end.isoformat()}"
     )
-    req = urllib.request.Request(url, headers={"Authorization": f"Token {key}"})
+    req = urllib.request.Request(url, headers={"Authorization": f"Token {key}"})  # noqa: S310 — fixed https scheme
     try:
-        with _TIINGO_OPENER.open(req, timeout=10) as resp:  # noqa: S310 — fixed scheme
+        with _TIINGO_OPENER.open(req, timeout=10) as resp:
             rows = json.loads(resp.read().decode("utf-8"))
     except Exception as exc:  # noqa: BLE001
         log.warning("tiingo fetch failed for %s: %s", ticker, exc)
@@ -418,6 +423,15 @@ def _usable_closes(series: "pd.Series[float]") -> "pd.Series[float]":
 def _from_cache(
     ticker: str, asof: date, cache_dir: Path, *, allow_stale: bool = False
 ) -> PriceRow | None:
+    """The newest cached close at or before `asof`, or None.
+
+    Reads match on `asof_date <= asof`, NOT on equality. The writer stores the provider's
+    ACTUAL last close date, which is only equal to the requested date when `asof` is itself a
+    completed trading day. The README's flagship workflow is an 08:00 Monday cron — before the
+    US open — so yfinance returns Friday's bar and an equality match missed on every single
+    run, forever: two identical requests made two network calls and appended two duplicate
+    rows, while the 20h TTL never got a chance to apply. Weekends and holidays were the same.
+    """
     path = cache_dir / f"{ticker}.parquet"
     if not path.exists():
         return None
@@ -426,10 +440,14 @@ def _from_cache(
     except Exception as exc:  # noqa: BLE001
         log.warning("cache read failed for %s: %s", ticker, exc)
         return None
-    match = df[df["asof_date"] == pd.Timestamp(asof)]
+    match = df[df["asof_date"] <= pd.Timestamp(asof)]
     if match.empty:
         return None
-    row = match.sort_values("fetched_at").iloc[-1]
+    # Newest close date first, then newest fetch of that date.
+    row = match.sort_values(["asof_date", "fetched_at"]).iloc[-1]
+    close_date = pd.Timestamp(row["asof_date"]).date()
+    if asof - close_date > STALE_PRICE_FLOOR:
+        return None  # too old to pass off as a current price (a delisted/halted tail)
     fetched_at = _coerce_fetched_at(row["fetched_at"])
     if fetched_at is None:
         return None  # NaT / corrupt — unusable, refetch
@@ -440,7 +458,9 @@ def _from_cache(
         return None  # 0 / negative / non-finite cell (corrupt or legacy cache) — refetch
     return PriceRow(
         ticker=ticker,
-        asof_date=asof,
+        # The close's OWN date, not the requested one — the report's stale-close display
+        # reads this, so claiming `asof` would hide a Friday price behind a Monday label.
+        asof_date=close_date,
         close=close,
         source="cache",
         fetched_at=fetched_at,
@@ -498,8 +518,16 @@ def _tiingo_date(value: object) -> date | None:
         return None
 
 
-def _parse_tiingo_rows(rows: list[dict[str, object]]) -> list[tuple[date, float]]:
+def _parse_tiingo_rows(
+    rows: list[dict[str, object]], *, total_return: bool = False
+) -> list[tuple[date, float]]:
     """Tiingo JSON rows → ascending [(date, split-adjusted close)]; bad rows skipped.
+
+    With ``total_return=True`` the split reconstruction below is skipped entirely and
+    `adjClose` is served as-is: Tiingo already ships it split- AND dividend-adjusted, which
+    IS the total-return basis (see `PriceBasis`). That makes the third basis mentioned below
+    the *right* one for the notional-simulation path, and a mismatch only for the portfolio
+    path, which never asks for it.
 
     **The basis.** Tiingo's `close` is the RAW as-traded price, while yfinance's `Close`
     (`auto_adjust=False`) is **split-adjusted** — the basis this codebase assumes
@@ -518,15 +546,20 @@ def _parse_tiingo_rows(rows: list[dict[str, object]]) -> list[tuple[date, float]
     malformed, boolean, or non-finite, is skipped rather than raising — `fetch_latest`
     and `fetch_series` promise never to raise on a per-ticker miss.
     """
-    parsed: list[tuple[date, float, float]] = []  # (date, raw close, split factor)
+    key = "adjClose" if total_return else "close"
+    parsed: list[tuple[date, float, float]] = []  # (date, close, split factor)
     for row in rows:
         if not isinstance(row, dict):
             continue  # a JSON array of non-dicts (an error page, a format shift)
-        day, close = _tiingo_date(row.get("date")), _tiingo_float(row.get("close"))
+        day, close = _tiingo_date(row.get("date")), _tiingo_float(row.get(key))
         if day is None or close is None or not usable_price(close):
             continue  # a 0 / negative close is a halted / bad-feed row — skip it
         factor = _tiingo_float(row.get("splitFactor"))
         parsed.append((day, close, factor if factor and factor > 0.0 else 1.0))
+
+    if total_return:
+        parsed.sort()
+        return [(d, c) for d, c, _ in parsed]  # adjClose already carries every adjustment
 
     parsed.sort()
     out: list[tuple[date, float]] = []
@@ -539,7 +572,7 @@ def _parse_tiingo_rows(rows: list[dict[str, object]]) -> list[tuple[date, float]
 
 
 def _tiingo_closes(
-    ticker: str, start: date, end: date
+    ticker: str, start: date, end: date, *, total_return: bool = False
 ) -> list[tuple[date, float]] | None:
     """Split-adjusted (date, close) pairs within [start, end], ascending. None if empty.
 
@@ -557,7 +590,8 @@ def _tiingo_closes(
     raw = _fetch_tiingo_json(ticker, start, max(end, date.today()))
     if not raw:
         return None
-    pairs = [(d, c) for d, c in _parse_tiingo_rows(raw) if start <= d <= end]
+    parsed = _parse_tiingo_rows(raw, total_return=total_return)
+    pairs = [(d, c) for d, c in parsed if start <= d <= end]
     return pairs or None
 
 
@@ -584,6 +618,7 @@ def fetch_series(
     *,
     cache_dir: Path | None = None,
     online: bool = True,
+    basis: PriceBasis = "raw",
 ) -> SeriesResult:
     """Fetch the daily close *history* in [start, end] for each ticker.
 
@@ -591,8 +626,13 @@ def fetch_series(
     cached as `data/prices/<TICKER>_series.parquet` (columns: date, close,
     fetched_at) and reused if fresh within TTL and covering `end`. Never
     raises on a per-ticker miss — those appear in `missing`.
+
+    ``basis`` picks WHICH close (see `PriceBasis`), and each basis gets its own cache
+    file, so warming one never serves the other. `"total_return"` lands in
+    `<TICKER>_series_tr.parquet`.
     """
     cache = ensure_cache_dir(cache_dir)
+    total_return = basis == "total_return"
 
     rows: dict[str, pd.Series[float]] = {}
     missing: list[str] = []
@@ -601,7 +641,9 @@ def fetch_series(
 
     for ticker in dict.fromkeys(tickers):
         cached = (
-            _series_from_cache(ticker, start, end, cache, allow_stale=not online)
+            _series_from_cache(
+                ticker, start, end, cache, allow_stale=not online, total_return=total_return
+            )
             if cache
             else None
         )
@@ -612,16 +654,16 @@ def fetch_series(
         if not online:
             missing.append(ticker)
             continue
-        live = _series_from_yfinance(ticker, start, end, circuit=circuit)
+        live = _series_from_yfinance(ticker, start, end, circuit=circuit, total_return=total_return)
         source = "yfinance"
         if live is None or live.empty:
-            live = _series_from_tiingo(ticker, start, end)
+            live = _series_from_tiingo(ticker, start, end, total_return=total_return)
             source = "tiingo"
         if live is None or live.empty:
             missing.append(ticker)
             continue
         if cache:
-            _write_series_cache(ticker, live, cache)
+            _write_series_cache(ticker, live, cache, total_return=total_return)
         rows[ticker] = live
         provenance[ticker] = (source, _now_utc())
 
@@ -647,16 +689,21 @@ def _normalize_close(df: pd.DataFrame) -> "pd.Series[float] | None":
 
 
 def _series_from_yfinance(
-    ticker: str, start: date, end: date, *, circuit: _RetryCircuit | None = None
+    ticker: str, start: date, end: date, *,
+    circuit: _RetryCircuit | None = None, total_return: bool = False,
 ) -> "pd.Series[float] | None":
-    df = _fetch_yf_retrying(ticker, start, end + timedelta(days=1), circuit=circuit)
+    df = _fetch_yf_retrying(
+        ticker, start, end + timedelta(days=1), circuit=circuit, adjusted=total_return
+    )
     if df is None or df.empty:
         return None
     return _normalize_close(df)
 
 
-def _series_from_tiingo(ticker: str, start: date, end: date) -> "pd.Series[float] | None":
-    pairs = _tiingo_closes(ticker, start, end)
+def _series_from_tiingo(
+    ticker: str, start: date, end: date, *, total_return: bool = False
+) -> "pd.Series[float] | None":
+    pairs = _tiingo_closes(ticker, start, end, total_return=total_return)
     if not pairs:
         return None
     return pd.Series(
@@ -700,12 +747,24 @@ def _read_fresh_series_cache(
     return series, fetched
 
 
+def series_cache_path(ticker: str, cache_dir: Path, *, total_return: bool = False) -> Path:
+    """On-disk series cache for one ticker on one basis.
+
+    The two bases MUST NOT share a file: a raw close and a dividend-adjusted close for the
+    same day are different numbers, and mixing them into one parquet would silently corrupt
+    both the portfolio path and the simulation path."""
+    suffix = "_series_tr.parquet" if total_return else "_series.parquet"
+    return cache_dir / f"{ticker}{suffix}"
+
+
 def _series_from_cache(
-    ticker: str, start: date, end: date, cache_dir: Path, *, allow_stale: bool = False
+    ticker: str, start: date, end: date, cache_dir: Path, *,
+    allow_stale: bool = False, total_return: bool = False,
 ) -> "tuple[pd.Series[float], datetime] | None":
     """Return (series, fetched_at) from the cache, or None if absent/stale."""
     read = _read_fresh_series_cache(
-        cache_dir / f"{ticker}_series.parquet", ticker, allow_stale=allow_stale
+        series_cache_path(ticker, cache_dir, total_return=total_return),
+        ticker, allow_stale=allow_stale,
     )
     if read is None:
         return None
@@ -718,9 +777,8 @@ def _series_from_cache(
     # staleness floor decide whether the tail may count as a current price. A STALE short
     # cache (reachable only via allow_stale) still returns None — offline, "no usable
     # series" stays the honest answer there.
-    if series.index.max() < pd.Timestamp(end - STALE_CLOSE_GRACE):
-        if _now_utc() - fetched > _CACHE_TTL:
-            return None
+    if series.index.max() < pd.Timestamp(end - STALE_CLOSE_GRACE) and _now_utc() - fetched > _CACHE_TTL:
+        return None
     mask = (series.index >= pd.Timestamp(start)) & (series.index <= pd.Timestamp(end))
     sliced = series[mask]
     if sliced.empty:
@@ -738,7 +796,7 @@ def _latest_from_series_cache(
     --offline`. Returns the last close at/before `asof` from the cached series,
     age-tolerant (offline fallback); future-stamped rows are still rejected, else None."""
     read = _read_fresh_series_cache(
-        cache_dir / f"{ticker}_series.parquet", ticker, allow_stale=True
+        series_cache_path(ticker, cache_dir), ticker, allow_stale=True
     )
     if read is None:
         return None
@@ -758,8 +816,10 @@ def _latest_from_series_cache(
     )
 
 
-def _write_series_cache(ticker: str, series: "pd.Series[float]", cache_dir: Path) -> None:
-    path = cache_dir / f"{ticker}_series.parquet"
+def _write_series_cache(
+    ticker: str, series: "pd.Series[float]", cache_dir: Path, *, total_return: bool = False
+) -> None:
+    path = series_cache_path(ticker, cache_dir, total_return=total_return)
     fetched = pd.Timestamp(_now_utc())
     out = pd.DataFrame(
         {

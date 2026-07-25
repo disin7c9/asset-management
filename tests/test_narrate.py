@@ -303,7 +303,7 @@ _GOLDEN: tuple[tuple[str, str | None], ...] = (
 )
 
 
-@pytest.mark.parametrize("prose, expected", _GOLDEN)
+@pytest.mark.parametrize(("prose", "expected"), _GOLDEN)
 def test_fence_golden_set(
     core: tuple[DerivedState, dict[str, PriceRow], ReturnsSummary, RiskSummary],
     prose: str,

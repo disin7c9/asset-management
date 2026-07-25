@@ -309,6 +309,17 @@ def _section_returns(
         f"Period: {returns.period_start} → {returns.asof_date} "
         f"({returns.period_days} days, ~{returns.period_days / 365.25:.2f}y)",
         f"Time-weighted (true TWR):                {_pct_or_na(twr)}",
+    ]
+    if twr is None and returns.twr_cumulative is not None:
+        # Too short to annualize (see returns._MIN_ANNUALIZE_OBS), but the window's actual
+        # growth is real and known — print THAT rather than leaving only an `n/a`. Labelled,
+        # so it can't be misread as a per-year figure.
+        lines.append(
+            f"  ↳ cumulative so far (NOT annualized):  "
+            f"{returns.twr_cumulative * 100:+.2f}%  — the window is too short to state a "
+            "per-year rate honestly"
+        )
+    lines += [
         f"Money-weighted (IRR):                    "
         f"{_pct_or_na(returns.money_weighted_annualized)}",
         f"Modified Dietz (approx TWR):             "

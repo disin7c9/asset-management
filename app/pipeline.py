@@ -45,6 +45,7 @@ from app.returns import (
     price_basis_mismatches,
     summarize,
     true_twr_annualized,
+    twr_cumulative,
     twr_index,
     value_curve,
 )
@@ -73,17 +74,22 @@ def default_cache_dir(repo_root: Path) -> Path:
 # to data/sample_data/transactions.csv (the browsable copy) — pinned by a test.
 DEMO_BOOK_CSV = """\
 Date,Code,DataSource,Currency,Price,Quantity,Action,Fee,Note
+2023-01-03,CASH,,USD,5000.00,0,deposit,0.00,funded the account
 2023-01-05,VOO,YAHOO,USD,365.00,10,buy,1.00,initial position
 2023-03-15,BND,YAHOO,USD,72.50,30,buy,1.00,
 2023-06-01,VOO,YAHOO,USD,395.00,5,buy,1.00,adding on dip
 2023-09-20,VOO,YAHOO,USD,22.40,0,dividend,0.00,quarterly dividend
+2023-12-29,CASH,,USD,12.85,0,interest,0.00,interest on idle cash
 2024-02-10,IAU,YAHOO,USD,37.20,40,buy,1.00,gold hedge
 2024-04-01,VOO,YAHOO,USD,460.00,3,sell,1.00,trim winner
+2024-06-28,CASH,,USD,0.00,0,fee,25.00,annual account fee
 2024-07-15,VOO,YAHOO,USD,19.80,0,dividend,0.00,
 2024-11-05,BND,YAHOO,USD,71.80,20,buy,1.00,
 2025-01-20,BND,YAHOO,USD,45.10,0,dividend,0.00,
 2025-05-10,IAU,YAHOO,USD,52.00,15,sell,1.00,take some profit
-2025-06-21,VEA,YAHOO,USD,40.2,15,buy,1.00,"""
+2025-06-21,VEA,YAHOO,USD,40.2,15,buy,1.00,
+2025-09-30,CASH,,USD,300.00,0,withdraw,0.00,moved cash out
+"""
 
 
 def write_demo_book(cache_dir: Path) -> Path:
@@ -218,6 +224,7 @@ def compute_prices_returns_risk(
     prices: dict[str, PriceRow] = {}
     risk: RiskSummary | None = None
     true_twr: float | None = None
+    twr_cum: float | None = None
     twr_excluded: list[str] = []
     stale_tails: list[str] = []  # held tickers whose series tail is beyond the floor
     dollar_dd: DollarDrawdown | None = None
@@ -283,6 +290,7 @@ def compute_prices_returns_risk(
             value = value_curve(events, twr_series, today)
             daily = build_daily_returns(events, twr_series, asof_date=today, value=value)
             true_twr = true_twr_annualized(daily)
+            twr_cum = twr_cumulative(daily)
             risk = summarize_risk(daily, twr_index(daily))
             # 'Gains given back' — the flow-neutral dollar P&L drawdown over the
             # same priced universe (deposits/withdrawals/trades cancel).
@@ -346,7 +354,8 @@ def compute_prices_returns_risk(
         dollar_dd = None
     mkt_value = sum(priced_held.values())
     returns = summarize(
-        events, mkt_value, asof_date=today, true_twr=true_twr, fully_priced=not missing
+        events, mkt_value, asof_date=today, true_twr=true_twr, twr_cum=twr_cum,
+        fully_priced=not missing,
     )
     return prices, returns, risk, missing, twr_excluded, dollar_dd, series, daily
 
@@ -402,6 +411,13 @@ def warm_cache(
     today = date.today()
     start = today - timedelta(days=HISTORY_DAYS)
     series = fetch_series(series_tickers, start, today, cache_dir=cache_dir, online=online)
+    # A second, total-return pass over the SIMULATION set only (book ∪ benchmark refs) — what
+    # `--backtest`, `--benchmark` and the role check read. The universe extras are skipped: they
+    # feed discovery, which never simulates, so `--warm full` costs no extra ~375-ticker round.
+    sim_tickers = sorted(set(book) | set(benchmark_ref_tickers()))
+    series_tr = fetch_series(
+        sim_tickers, start, today, cache_dir=cache_dir, online=online, basis="total_return"
+    )
     if book:  # held positions need a spot price + split history; refs/universe need only series
         fetch_latest(book, cache_dir=cache_dir, online=online)
         fetch_splits(book, cache_dir=cache_dir, online=online)
@@ -422,9 +438,13 @@ def warm_cache(
         "book_total": len(book),
         "book_missing": len(set(book) & set(series.missing)),
         "meta_missing": len(meta.missing) if meta is not None else 0,
+        "tr_tickers": len(sim_tickers),
+        "tr_missing": len(series_tr.missing),
     }
     log.info(
-        "warm_cache: %d tickers (%d series missing, %d metadata missing)",
+        "warm_cache: %d tickers (%d series missing, %d metadata missing); "
+        "%d total-return series (%d missing)",
         counts["tickers"], counts["series_missing"], counts["meta_missing"],
+        counts["tr_tickers"], counts["tr_missing"],
     )
     return counts

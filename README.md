@@ -8,7 +8,7 @@
 
 ## 🔢 The number fence
 
-Many AI finance tools let the model produce the numbers. Here the model may only place `{{token}}` placeholders: a deterministic renderer substitutes figures from the validated core and **refuses the entire narration if the model typed even one digit itself**:
+Many AI finance tools let the model produce the numbers. Here the model may only place `{{token}}` placeholders: a deterministic renderer substitutes figures from the validated core and **refuses the entire narration if the model typed any decimal digit itself**:
 
 ```text
  the model wrote                             │  the reader gets
@@ -33,7 +33,7 @@ Run both sides yourself — it drives the real production fence, no API key need
 - **Deterministic buy/sell suggestions** toward a target you choose, each line paired to the **named rule** that produced it — you learn the rule rather than trust a bot.
 - Optional, fenced **AI narration**, and a read-only **Claude Desktop addon** ("chat with your portfolio") over the same validated core.
 
-Holdings are *derived* from an append-only transaction log (date, ticker, action, quantity, price, fee per row) — never stored — so the same input always produces the same output. Prices are fetched with a provider fallback (Yahoo Finance primary; Tiingo secondary, via a free API key) and an on-disk cache; every displayed number is traceable to its source, and figures that can't be computed honestly (too short a window, no real solution) print `n/a` rather than a fabricated number. **Stock splits are adjusted automatically** (share counts are reconciled with the split-adjusted price history), so a split during your holding period doesn't distort the returns.
+Holdings are *derived* from an append-only transaction log (date, ticker, action, quantity, price, fee per row) — never stored — so the same input always produces the same output. Prices are fetched with a provider fallback (Yahoo Finance primary; Tiingo secondary, via a free API key) and an on-disk cache; every displayed number is traceable to its source, and figures that can't be computed honestly (too short a window, no real solution) print `n/a` rather than a fabricated number. **Stock splits are adjusted automatically** (share counts are reconciled with the split-adjusted price history), so a split during your holding period doesn't distort the returns. When the split feed is unavailable, the mismatch detector catches ratios of 2:1 or larger.
 
 ## 📑 Contents
 
@@ -70,7 +70,7 @@ uvx --from git+https://github.com/disin7c9/asset-management asset-management --d
 
 or from a clone: `uv sync && uv run python -m app --demo` (needs Python 3.12 and [uv](https://docs.astral.sh/uv/)).
 
-**The full tour** (still the bundled book, ~a minute online) — the two commands below show the tool's characteristic features end to end: a preset target is *proposed*, then *validated* against a known 60-40 reference with a walk-forward held-out verdict, and threshold-band rebalance suggestions are laid out with the named rule behind every line, plus per-fund facts:
+**The full tour** (still the bundled book, ~a minute online) — the two commands below show the tool's characteristic features end to end: a preset target is *proposed*, then *validated* against a known 60-40 reference with a held-out recent-window verdict, and threshold-band rebalance suggestions are laid out with the named rule behind every line, plus per-fund facts:
 
 ```bash
 uvx --from git+https://github.com/disin7c9/asset-management asset-management --demo --allocate moderate --allocate-out demo_target.csv
@@ -112,7 +112,7 @@ After that, `--offline` runs and the Claude Desktop addon serve entirely from th
 
 #### Step 3 — choose a target
 
-Most of the decision features (`--rebalance`, `--backtest`, the walk-forward checks) work toward a **target allocation** — a small CSV (`Ticker,Weight`) that *you* own and edit. Three ways to get one, by where you're starting from:
+Most of the decision features (`--rebalance`, `--backtest`, the held-out checks) work toward a **target allocation** — a small CSV (`Ticker,Weight`) that *you* own and edit. Three ways to get one, by where you're starting from:
 
 - **You already hold a portfolio** → `--dump-target target.csv` writes your **current** allocation; edit it toward the mix you want. (A target is a *complete spec* — see [Rebalance modes](#-rebalance-modes) for the exit semantics.)
 - **Start from a risk posture** → `--onboard` asks three plain questions in the terminal (horizon / loss response / cash buffer) and builds the matched preset; or pick it yourself with `--allocate conservative|moderate|aggressive`. Save with `--allocate-out target.csv`. Both run **with no book at all** — before your first trade, every role fills from the curated universe. These are strategic **role-bucket templates** (stocks / bonds / diversifiers split by posture, core-satellite within each bucket): a role you already hold resolves to *your* largest fund in it, a role you're missing is filled with a sensible default ETF from the curated universe.
@@ -126,7 +126,7 @@ Two simpler re-weighting rules also exist — `--allocate equal_weight` (1/N; th
 uv run python -m app --backtest --target target.csv --benchmark 60-40   # or all-weather | permanent
 ```
 
-simulates your target and the reference over their common history (notional $10k, drawdown-first legs with CIs) and adds a **walk-forward held-out verdict**: `shallower` / `deeper` / `inconclusive` / `insufficient` — never "beats". The verdict is judged on the **Ulcer index** (whole-window drawdown pain — how deep *and* how long), with **CDaR** (the worst-tail average) required not to contradict it and a paired-bootstrap confidence interval to confirm; **max drawdown is reported as context, not the decider** — one worst event is too noisy to decide anything on a short history. When it can't call it, it says `inconclusive` and names exactly which gate blocked it.
+simulates your target and the reference over their common history (notional $10k, drawdown-first legs with CIs) and adds a **held-out recent-window verdict**: `shallower` / `deeper` / `inconclusive` / `insufficient` — never "beats". The verdict is judged on the **Ulcer index** (whole-window drawdown pain — how deep *and* how long), with **CDaR** (the worst-tail average) required not to contradict it and a paired-bootstrap confidence interval to confirm; **max drawdown is reported as context, not the decider** — one worst event is too noisy to decide anything on a short history. When it can't call it, it says `inconclusive` and names exactly which gate blocked it.
 
 **Propose, simulate, and act are separate steps**, enforced: `--allocate`/`--onboard` only *propose* (and optionally write the file) and **may not be combined** with `--backtest`/`--rebalance` in one command. You review the file, then simulate it, then ask for orders — each in its own command. A strategy never silently becomes trades.
 
@@ -139,7 +139,7 @@ uv run python -m app --book your.csv --backtest --target target.csv --benchmark 
 ```
 
 - Pick the `--benchmark` reference nearest **your** posture (`60-40` / `all-weather` / `permanent`).
-- `bands` acts only when a holding drifts past its band (the "5/25 rule") and **ignores `--new-cash`** — on a week you're depositing, swap in `--rebalance cash_flow_only --new-cash 500` (invest into underweights, never sell; tax-friendly).
+- `bands` fires only when some holding has drifted past its band (the "5/25 rule"), then rebalances the whole book — on a week you're depositing and don't want to sell, swap in `--rebalance cash_flow_only --new-cash 500` (invest into underweights only; tax-friendly).
 - Panels are **composable** — every flag adds a panel and they stack (see the [Reference](#-reference)).
 
 The same report leaves three ways from one build: plain text on stdout (always), markdown to `reports/<asof>.md` (`--save`), and an HTML email (`--send`; `RESEND_API_KEY` + `REPORT_TO` in `.env`). A failed sink never crashes the run — the brief still prints and the failure is logged — but if a sink you *requested* fails, the process exits non-zero so a scheduler notices. A weekly Monday brief is just this on cron:
@@ -175,7 +175,7 @@ The *shape* of the output is what makes this a description rather than advice:
 - every suggestion is paired to the **named rule** that fired ("5/25 band breached — trim X"), never a bare "buy X";
 - every sampled risk metric carries a **confidence interval**, and too-little-data says so (`inconclusive`, `insufficient`, `n/a`) instead of pretending;
 - benchmark verdicts only say **`shallower` / `deeper` / `inconclusive` / `insufficient`** — the vocabulary has no "beats";
-- anything claiming an *edge* must pass a **walk-forward (out-of-sample) gate** before it may surface a suggestion — in-sample-only numbers are refused by design;
+- anything claiming an *edge* must pass an **out-of-sample gate** before it may surface a suggestion — in-sample-only numbers are refused by design;
 - the tool is **read-only**: it never trades, and the AI can never write to your ledger.
 
 ### ✅ Correctness is a claim you can check
@@ -213,7 +213,7 @@ Expose your portfolio to an AI assistant (Claude Desktop, Claude Code, …) as *
 - **`securities_facts`** — published fund facts per holding (expense ratio, AUM, volume, age, category).
 - **`discover_gaps`** — suggest NEW ETFs for the roles you hold ≤3% of; optional `role`/`flavor` args drill one shelf (propose-only; judge a pick with `screen_candidate`).
 - **`screen_candidate`** — judge a NEW candidate ticker against your book (diversifier/cost/liquidity/age/overlap, each with a reason).
-- **`propose_allocation`** — a strategic target for a posture (`conservative`/`moderate`/`aggressive`) over your book + the universe, validated against a reference with the same walk-forward, Ulcer-first held-out verdict — propose-only, numbers from the core, never a recommendation.
+- **`propose_allocation`** — a strategic target for a posture (`conservative`/`moderate`/`aggressive`) over your book + the universe, validated against a reference with the same held-out recent-window, Ulcer-first verdict — propose-only, numbers from the core, never a recommendation.
 - **`starter_allocation`** — new to this? answer three plain risk questions → a starting posture and its validated proposal (the onboarding path into `propose_allocation`).
 
 **Install (Claude Desktop):** Settings → Developer → **Edit Config**, and add:
@@ -315,14 +315,14 @@ The report is **composable panels**, not exclusive modes — combine flags and t
 |---|---|---|
 | status brief (default) | `--book` | your holdings + returns + drawdown/risk |
 | `--rebalance MODE` | `--book` + `--target` | buy/sell suggestions toward the target (`--new-cash` sizes a deposit) |
-| `--allocate RULE` | `--book` | propose a target — re-weight your holdings (`equal_weight`/`inverse_vol`) or build a strategic role template (`conservative`/`moderate`/`aggressive`); write it with `--allocate-out` |
-| `--onboard` | `--book` (or `--demo`) | step 0 for a new user: answer 3 plain risk questions in the terminal → the matched posture builds its `--allocate` preset automatically (propose-only; save with `--allocate-out`) |
+| `--allocate RULE` | none for the presets; `--book` for the re-weight rules | propose a target — re-weight your holdings (`equal_weight`/`inverse_vol`, which need a book) or build a strategic role template (`conservative`/`moderate`/`aggressive`, which works with no book at all); write it with `--allocate-out` |
+| `--onboard` | none (a book anchors the roles on what you already hold) | step 0 for a new user: answer 3 plain risk questions in the terminal → the matched posture builds its `--allocate` preset automatically (propose-only; save with `--allocate-out`) |
 | `--dry-run` | `--book` (or `--demo`) | preview an import before trusting it: detected format, events parsed, rows skipped/flagged with reasons, and the holdings they derive to — fetches nothing, computes no brief |
 | `--metadata` | `--book` | published fund facts per holding (expense ratio, AUM, volume, age, category), cached 7 days |
-| `--screen TICKERS` | `--book` + prices | judge NEW candidates vs your book: diversifier (incl. your red days + worst drawdown), cost, liquidity, age, concentration, leveraged/inverse auto-reject, holdings-overlap dedup — each verdict with its reason. Add `--target` for the **walk-forward role check**: did a 5% sleeve reduce drawdown pain (Ulcer, with a CDaR check) on a held-out window? "Inconclusive" names the gate that blocked it. Propose-only; a PASS is "sane, cheap, liquid, genuinely different", never a prediction |
+| `--screen TICKERS` | `--book` + prices | judge NEW candidates vs your book: diversifier (incl. your red days + worst drawdown), cost, liquidity, age, concentration, leveraged/inverse auto-reject, holdings-overlap dedup — each verdict with its reason. Add `--target` for the **held-out role check**: did a 5% sleeve reduce drawdown pain (Ulcer, with a CDaR check) on a held-out window? "Inconclusive" names the gate that blocked it. Propose-only; a PASS is "sane, cheap, liquid, genuinely different", never a prediction |
 | `--discover [roles]` | `--book` + prices | suggest **new** ETFs for the roles you hold ≤3% of, run through the same screen — propose-only (see [Discovery](#-discovery--the-curated-universe)) |
 | `--backtest` | `--target` | notional rebalance-vs-buy-and-hold — **no `--book`**; prints the simulation alone |
-| `--backtest --benchmark REF` | `--target` | validate a target vs a canonical reference (`60-40` / `all-weather` / `permanent`) — drawdown-first legs + the walk-forward, Ulcer-first held-out verdict |
+| `--backtest --benchmark REF` | `--target` | validate a target vs a canonical reference (`60-40` / `all-weather` / `permanent`) — drawdown-first legs + the held-out recent-window, Ulcer-first verdict |
 | `--narrate` | `--book` + an LLM key | a plain-language **SUMMARY** at the top of the brief; the model writes only the words, every number is substituted and verified from the core (opt-in, off by default — see [Narration](#-narration-optional-plain-language-summary)) |
 
 All flags, grouped:
@@ -340,7 +340,7 @@ uv run python -m app --book your.csv --cache-dir /some/dir   # override the cach
 uv run python -m app --book your.csv --no-risk     # skip the holdings drawdown/risk panel
 uv run python -m app --book your.csv --metadata    # + SECURITIES panel (fund facts)
 uv run python -m app --book your.csv --screen QQQM,SCHD            # judge NEW candidates
-uv run python -m app --book your.csv --screen SCHD --target t.csv  # + the walk-forward role check
+uv run python -m app --book your.csv --screen SCHD --target t.csv  # + the held-out role check
 uv run python -m app --book your.csv --discover    # + DISCOVERY panel (gap-filling ETFs)
 uv run python -m app --book your.csv --narrate     # + the fenced plain-language SUMMARY
 # targets (propose-only)
@@ -356,6 +356,7 @@ uv run python -m app --backtest --target target.csv --benchmark 60-40   # + the 
 uv run python -m app --book your.csv --rebalance bands --backtest --target target.csv  # panels stack
 # delivery
 uv run python -m app --book your.csv --save        # also write reports/<asof>.md (markdown)
+uv run python -m app --book your.csv --save --reports-dir /elsewhere   # ...somewhere other than reports/
 uv run python -m app --book your.csv --send        # also email the brief as HTML via Resend
 ```
 
@@ -368,42 +369,42 @@ A `target.csv` is one you create with `--dump-target` / `--allocate-out` (or use
 
 ```text
 === DRAWDOWN (investment, time-weighted) ===
-Max drawdown:      -9.84%  (95% CI -17.03% .. -6.58%)
+Max drawdown:      -9.84%  (95% CI -17.49% .. -6.86%)
   peak 2025-02-19 → trough 2025-04-08 → 2025-06-10  (111 days)
-Ulcer index:       2.38%  (95% CI 1.62% .. 6.08%)
-CDaR (worst 5%):   6.66%  (95% CI 4.54% .. 14.33%)
+Ulcer index:       2.39%  (95% CI 1.62% .. 6.17%)
+CDaR (worst 5%):   6.67%  (95% CI 4.56% .. 14.04%)
 You've spent 81% of this period below a previous high.
 Gains given back: -$1,240  — peak profit $3,336 (2025-02-19) → $2,096 (2025-04-08) → 2025-06-10
   (dollars of profit given back from a peak; flow-neutral — funding & transfers don't distort it)
 
 === RISK-ADJUSTED (annualized, 252-day basis, risk-free 0%, ± bootstrap CI) ===
-Sharpe:   +1.61  (95% CI +0.57 .. +2.57)
-Sortino:  +2.42  (95% CI +0.81 .. +4.04)
-Calmar:   +1.81  (95% CI +0.39 .. +4.10)
+Sharpe:   +1.57  (95% CI +0.59 .. +2.49)
+Sortino:  +2.35  (95% CI +0.85 .. +3.97)
+Calmar:   +1.75  (95% CI +0.39 .. +4.07)
 
 === RETURNS (annualized, 252-day basis) ===
-Period: 2023-01-05 → 2026-07-22 (1294 days, ~3.54y)
-Time-weighted (true TWR):                +17.77%
-Money-weighted (IRR):                    +16.59%
-Modified Dietz (approx TWR):             +16.30%
+Period: 2023-01-05 → 2026-07-24 (1296 days, ~3.55y)
+Time-weighted (true TWR):                +17.26%
+Money-weighted (IRR):                    +16.15%
+Modified Dietz (approx TWR):             +15.87%
   (point figures: accounting identities over your cash flows, not sampled statistics → no band; see RISK-ADJUSTED for bootstrapped CIs)
 
 === HOLDINGS ===
 ticker     shares  avg cost    price    mkt value      unreal    realized
 -------------------------------------------------------------------------
-BND        50.000     72.26    72.52      3626.00      +13.00      +45.10
-IAU        25.000     37.23    76.82      1920.50     +989.87     +220.62
-VEA        15.000     40.27    70.47      1057.05     +453.05       +0.00
-VOO        12.000    375.13   687.87      8254.44    +3752.84     +295.80
+BND        50.000     72.26    72.25      3612.50       -0.50      +45.10
+IAU        25.000     37.23    76.15      1903.75     +973.13     +220.62
+VEA        15.000     40.27    69.78      1046.70     +442.70       +0.00
+VOO        12.000    375.13   678.61      8143.32    +3641.72     +295.80
 -------------------------------------------------------------------------
 Total cost basis (held): $9,649.23
-Market value (priced):   $14,857.99
-Unrealized P&L:          $+5,208.76
-Realized P&L (sells+div): $+561.52
-Fees paid (informational): $8.00
-Net P&L (unrealized + realized): $+5,770.29
+Market value (priced):   $14,706.27
+Unrealized P&L:          $+5,057.04
+Realized P&L (sells+div): $+549.37
+Fees paid (informational): $33.00
+Net P&L (unrealized + realized): $+5,606.42
 
-Prices: 4 cache  (age: 29m .. 29m old as of 2026-07-22 11:24 UTC)
+Prices: 4 cache  (age: 5.9h .. 5.9h old as of 2026-07-24 13:51 UTC)
 Generated by asset-management. Figures are deterministic and reconciled against ghostfolio + quantstats; this is not financial advice.
 ```
 
@@ -418,7 +419,7 @@ A **target is a complete spec** (`--target path`, columns `Ticker,Weight`; weigh
 - `to_total` — sell + buy to hit the target exactly (cash-neutral; deploys `--new-cash` too)
 - `cash_flow_only` — invest `--new-cash` into underweights; never sell (tax-friendly)
 - `fixed_dca` — buy the target mix with `--new-cash`, ignoring drift
-- `bands` — like `to_total` but only act when a ticker's drift exceeds its band; rebalances existing holdings only (ignores `--new-cash`). The band is the **smaller** of an absolute `--band` (default 5pp) or `--band-rel` × the ticker's target weight (the **"5/25 rule"**, default 25%) — so a small sleeve isn't handed a band many times its own size; a 0% target → 0 band → always exits
+- `bands` — `to_total`, but gated on a drift **trigger**: if no ticker is outside its band nothing trades, and if any ticker is, every leg goes back to target (including `--new-cash`). Trading only the breached leg would sell with nothing to buy, since the offsetting drift sits in the legs still inside their bands. The band is the **smaller** of an absolute `--band` (default 5pp) or `--band-rel` × the ticker's target weight (the **"5/25 rule"**, default 25%) — so a small sleeve isn't handed a band many times its own size; a 0% target → 0 band → always exits
 
 <details>
 <summary>Sample output — rebalance suggestions (demo book, target VOO 40 / BND 30 / IAU 15 / VEA 15)</summary>
@@ -429,24 +430,27 @@ A **target is a complete spec** (`--target path`, columns `Ticker,Weight`; weigh
 === SUGGESTED ACTIONS (rebalance to target) ===
 ticker    cur%   tgt% action            $      shares   why
 ------------------------------------------------------------------------------
-VOO       55.5   40.0   SELL     -2288.42      -3.350   55.5% vs 40.0% target
-VEA        7.1   15.0    BUY     +1170.61     +16.795   7.1% vs 15.0% target
-BND       24.7   30.0    BUY      +789.21     +10.832   24.7% vs 30.0% target
-IAU       12.8   15.0    BUY      +328.61      +4.352   12.8% vs 15.0% target
-Buy $2,288.42 · Sell $2,288.42 · net +$0.00 (cash to deploy)
+VOO       55.4   40.0   SELL     -2260.81      -3.332   55.4% vs 40.0% target
+VEA        7.1   15.0    BUY     +1159.24     +16.613   7.1% vs 15.0% target
+BND       24.6   30.0    BUY      +799.38     +11.064   24.6% vs 30.0% target
+IAU       12.9   15.0    BUY      +302.19      +3.968   12.9% vs 15.0% target
+Buy $2,260.81 · Sell $2,260.81 · net +$0.00 (cash-neutral)
 ```
 
-**`bands`** (the 5/25 rule) — same target, but IAU's drift is inside its band, so it holds:
+**`bands`** (the 5/25 rule) — same target. The band is a **trigger**: VOO sits 15.4pp outside its band, so the whole book goes back to target. IAU is inside its own band and still trades, because that's where the offsetting drift lives — its row says so:
 
 ```text
 === SUGGESTED ACTIONS (threshold-band rebalance) ===
-VOO       55.5   40.0   SELL     -2288.42      -3.350   drift +15.5pp exceeds 5.00pp band
-VEA        7.1   15.0    BUY     +1170.61     +16.795   drift -7.9pp exceeds 3.75pp band
-BND       24.7   30.0    BUY      +789.21     +10.832   drift -5.3pp exceeds 5.00pp band
-IAU       12.8   15.0   HOLD            -           -   within 3.75pp band
+ticker    cur%   tgt% action            $      shares   why
+------------------------------------------------------------------------------
+VOO       55.4   40.0   SELL     -2260.81      -3.332   drift +15.4pp exceeds 5.00pp band
+VEA        7.1   15.0    BUY     +1159.24     +16.613   drift -7.9pp exceeds 3.75pp band
+BND       24.6   30.0    BUY      +799.38     +11.064   drift -5.4pp exceeds 5.00pp band
+IAU       12.9   15.0    BUY      +302.19      +3.968   12.9% vs 15.0% target (rebalance triggered)
+Buy $2,260.81 · Sell $2,260.81 · net +$0.00 (cash-neutral)
 ```
 
-Propose-only — no trade is executed; every row cites the rule that fired, including the HOLD.
+If nothing is outside its band, nothing trades at all. Propose-only — no trade is executed; every row cites the rule that fired.
 </details>
 
 ### 📈 Backtest details
@@ -461,24 +465,35 @@ With `--benchmark`, the held-out verdict resolves through three named gates: the
 <summary>Sample output — held-out verdict vs 60-40</summary>
 
 ```text
-=== BENCHMARK (preset vs 60-40 · 2016-07-21 → 2026-07-21 — propose-only) ===
+=== BENCHMARK (preset vs 60-40 · 2016-07-25 → 2026-07-23 — propose-only) ===
                                             preset                   60-40
 --------------------------------------------------------------------------
-Max drawdown                               -22.38%                 -21.93%
-Ulcer index                                  5.83%                   6.45%
-CDaR (worst 5%)                             16.78%                  17.68%
-Sharpe (252-basis)                           +0.83                   +0.71
-Annualized return                           +9.36%                  +7.57%
-Final value                                $24,402                 $20,701
+Max drawdown                               -22.01%                 -21.14%
+  95% CI                          -35.2% .. -10.3%        -34.5% .. -10.9%
+Ulcer index                                  5.57%                   5.74%
+  95% CI                             2.6% .. 13.8%           2.6% .. 13.7%
+CDaR (worst 5%)                             16.25%                  16.59%
+  95% CI                             7.1% .. 30.5%           7.3% .. 29.8%
+Sharpe (252-basis)                           +0.88                   +0.89
+  95% CI                            +0.25 .. +1.63          +0.28 .. +1.67
+Sortino                                      +1.23                   +1.26
+  95% CI                            +0.33 .. +2.46          +0.38 .. +2.49
+Annualized return                           +9.42%                  +9.81%
+Final value                                $24,543                 $25,428
+  prices: cache · oldest fetch 2026-07-24
 
-Walk-forward (held-out): OOS (2023-07-20→2026-07-21, 752d): Ulcer 2.38% vs 2.50% 60-40;
-CDaR 6.93% vs 7.41%; max DD -11.3% vs -11.8% (context) — no clear drawdown difference from
-60-40 (the Ulcer gap is within the noise margin)
+Walk-forward (held-out): OOS (2023-07-24→2026-07-23, 752d): Ulcer 2.17% vs 2.29%
+60-40; CDaR 6.64% vs 6.86%; max DD -9.4% vs -11.2% (context); return +14.1% vs
++13.0%/yr (+1.1pp, context) — no clear drawdown difference from 60-40 (the Ulcer gap
+is within the noise margin)
 ```
 
-The target beats 60-40 on every in-sample number above — yet the held-out verdict is
+Read what it doesn't say. The preset carries slightly *less* drawdown pain than 60-40
+(Ulcer 5.57% vs 5.74%) and slightly *less* return (+9.42% vs +9.81%/yr) — a trade, not a
+win. And even the drawdown edge doesn't survive the held-out window: the verdict is
 **"no clear drawdown difference"**, because the Ulcer gain is inside the noise margin.
-Better in-sample is not a claim.
+The held-out line also prints the *return* cost alongside the drawdown gain, so a
+less-painful path can't be sold to you without its price tag.
 </details>
 
 ### 🔭 Discovery & the curated universe
@@ -535,6 +550,8 @@ It pulls the largest US ETFs per asset-class category from a screener (by fund *
 
 `--screen TICKER` judges a *new* ticker against your book — cost, liquidity, age, concentration, overlap with what you hold, whether it diversified your past drawdowns, and its **own** worst drawdown — each with a reason. Propose-only; a PASS is "sane, cheap, liquid, genuinely different", never a prediction.
 
+Add `--target` and it also runs the **held-out role check**: give the candidate a 5% sleeve, replay it, and judge only on a recent window the check didn't look at while deciding. Two honest limits on that verdict. **It measures drawdown pain, not return** — an uncorrelated fund makes the ride smoother even when it earns nothing, so the line prints the return cost beside the drawdown gain and you weigh both. And **when the candidate came from `--discover` rather than from you, the choosing happened over the full history**, including the window the check then holds out — so the verdict is not fully independent of it. Naming the ticker yourself (`--screen SCHD`) has no selection step and no such caveat. Details and the measured size of both effects: [MATH.md §12.3](MATH.md).
+
 <details>
 <summary>Sample output — same role, different risk (IEF vs TLT)</summary>
 
@@ -580,6 +597,7 @@ Explicit flags always win.
 ```bash
 # your book + target (Steps 1 & 3)
 ASSET_BOOK=data/my_data/transactions.csv
+# ASSET_CSV=...                       # legacy alias for ASSET_BOOK, still honored
 ASSET_TARGET=data/my_data/target.csv
 
 # prices — optional free second source for when Yahoo throttles (Step 2)
@@ -635,7 +653,7 @@ asset-management/
 │   ├── allocate.py   choose a target: equal_weight / inverse_vol + risk-posture presets + per-asset caps
 │   ├── onboard.py    step-0 risk quiz (pure): 3 questions → a conservative / moderate / aggressive posture
 │   ├── screen.py     judge NEW candidate tickers (diversifier / cost / liquidity / age / overlap)
-│   ├── backtest.py   notional simulation + the walk-forward role/benchmark verdicts (Ulcer-first)
+│   ├── backtest.py   notional simulation + the held-out role/benchmark verdicts (Ulcer-first)
 │   ├── pipeline.py   the shared book→prices→returns→risk bundle (cli + mcp_server) + cache warm + the --demo book
 │   ├── report.py     suggestions + backtest + state + prices + returns + risk → ReportData → text/markdown/HTML
 │   ├── narrate.py    fenced narration: validated figures → {{token}} prose → SUMMARY (pure; no number can be the model's)
@@ -646,6 +664,7 @@ asset-management/
 │   ├── universe.py   curated ETF universe loader (Candidate + roles); app/data/universe.csv, auto-built
 │   ├── discover.py   book → role gaps → shelf menus: lead-shelf default / full menu / index / drill (--discover, propose-only)
 │   ├── log_config.py logging setup
+│   ├── http_safe.py  the one no-redirect URL opener — a 3xx must not carry an API key to another host
 │   ├── __main__.py   python -m app
 │   └── __init__.py
 ├── tests/            automated suite (unit, property, regression) — offline, run on every change
@@ -663,10 +682,10 @@ asset-management/
 This tool runs entirely on your own machine. **It has no backend, no account, and no telemetry** — the author receives nothing, ever.
 
 - **What it collects.** Nothing. Your transaction log, derived holdings, and price cache are read and written only on your computer, at the paths you pass (`--book`, `--cache-dir`, or `ASSET_BOOK` / `ASSET_CACHE_DIR`). Nothing is uploaded, and no usage data, crash report, or analytics is emitted.
-- **What leaves your machine, and only these.** (1) **Price and fund data requests** — ticker symbols are sent to [Yahoo Finance](https://finance.yahoo.com) and, if you set `TIINGO_API_KEY`, to [Tiingo](https://www.tiingo.com), to fetch quotes, history, splits, and published fund facts. Ticker symbols only — never your quantities, cost basis, or balances. (2) **Narration**, `--narrate`, which is **off by default**: if you turn it on and supply your own LLM key, portfolio *figures* are sent to the provider you chose (OpenAI-compatible or Anthropic) to be written up as prose. The `ASSET_NARRATE_TIER` dial controls how much detail is sent; `local` keeps it on your machine. Turn it off and no LLM is contacted at all.
-- **Storage and retention.** The price cache lives in `.asset-management/prices` in your home folder (or `ASSET_CACHE_DIR`) and persists until you delete it. Reports written with `--save` go to `reports/`. Everything is a plain file you own; delete the folders and the data is gone. The author holds no copy and cannot.
-- **Third-party sharing.** None. The author shares nothing because the author has nothing. Data sent to Yahoo, Tiingo, or your chosen LLM provider is governed by that provider's own privacy policy.
-- **The MCP server.** Read-only, bound to your configured book, with no file-path arguments and no write tools. It performs two bounded, opt-out network fetches (a one-time cold-cache warm and an on-demand fetch when you screen an uncached ticker); `ASSET_MCP_OFFLINE=1` disables both. It sends nothing anywhere else.
+- **What leaves your machine, and only these.** (1) **Price and fund data requests** — ticker symbols are sent to [Yahoo Finance](https://finance.yahoo.com) and, if you set `TIINGO_API_KEY`, to [Tiingo](https://www.tiingo.com), to fetch quotes, history, splits, and published fund facts. Ticker symbols only — never your quantities, cost basis, or balances. (2) **Narration**, `--narrate`, which is **off by default**: if you turn it on and supply your own LLM key, portfolio *figures* are sent to the provider you chose (OpenAI-compatible or Anthropic) to be written up as prose. The `ASSET_NARRATE_TIER` dial controls how much detail is sent; `local` keeps it on your machine. Turn it off and no LLM is contacted at all. (3) **Email delivery**, `--send`, which is **off by default**: if you turn it on and supply your own [Resend](https://resend.com) API key, the rendered HTML brief — which contains your holdings, share counts, cost basis, and P&L — is POSTed to Resend to be delivered to the address you set. Nothing else is sent there, and without `--send` Resend is never contacted.
+- **Storage and retention.** The price cache lives in `data/prices` when you run from a clone, or `.asset-management/prices` in your home folder when the tool is installed as a package (override either with `ASSET_CACHE_DIR`), and persists until you delete it. The two are separate directories — warming from a clone does not warm the cache a wheel-installed Desktop addon reads. Reports written with `--save` go to `reports/`. Everything is a plain file you own; delete the folders and the data is gone. The author holds no copy and cannot.
+- **Third-party sharing.** The author shares nothing, and receives nothing to share. The only third parties involved are the ones you opt into above — Yahoo, Tiingo, your chosen LLM provider, and Resend — each governed by its own privacy policy.
+- **The MCP server.** It never writes to your ledger and never trades; it is bound to your configured book, takes no file-path arguments, and exposes no write tools. It does write its own price cache (and, with no book configured, a demo book) under `ASSET_CACHE_DIR`. It performs two bounded, opt-out network fetches (a one-time cold-cache warm and an on-demand fetch when you screen an uncached ticker); `ASSET_MCP_OFFLINE=1` disables both. It sends nothing anywhere else.
 - **Contact.** Open an issue at [github.com/disin7c9/asset-management/issues](https://github.com/disin7c9/asset-management/issues).
 
 ## 📜 License

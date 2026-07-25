@@ -119,16 +119,58 @@ def test_bands_acts_when_drift_exceeds_band() -> None:
     assert "band" in s["VOO"].reason
 
 
-def test_bands_5_25_catches_small_sleeve_but_not_large() -> None:
-    # The 5/25 rule: the band is min(absolute pp, band_rel x target). Same 1.5pp drift
-    # on both sleeves → it ACTS on the small one (4% target → 1pp band) but HOLDS the
-    # large one (96% target → 5pp absolute band). A flat 5pp band would hold both.
+def test_bands_5_25_is_triggered_by_the_small_sleeve_not_the_large() -> None:
+    # The 5/25 rule sizes the band as min(absolute pp, band_rel x target). Same 1.5pp drift
+    # on both sleeves → only the small one (4% target → 1pp band) BREACHES; the large one
+    # (96% target → 5pp absolute band) does not. A flat 5pp band would breach on neither.
     held = {"BIG": 9450.0, "SML": 550.0}          # 94.5% / 5.5% of $10k
     prices = {"BIG": 100.0, "SML": 50.0}
     target = {"BIG": 0.96, "SML": 0.04}           # both off by 1.5pp
     s = _by_ticker(suggest("bands", held, prices, target, band=0.05))  # band_rel default 0.25
     assert s["SML"].action == "sell" and "1.00pp band" in s["SML"].reason
-    assert s["BIG"].action == "hold"
+    # BIG did not breach, but the band is a TRIGGER: once SML fires, BIG has to absorb the
+    # proceeds or the book cannot converge. Its reason says so rather than naming a breach.
+    assert s["BIG"].action == "buy" and "rebalance triggered" in s["BIG"].reason
+
+
+def test_bands_holds_everything_when_no_leg_breaches() -> None:
+    # The trigger must still be a trigger: inside every band, nothing trades at all.
+    held = {"BIG": 9550.0, "SML": 450.0}          # 95.5% / 4.5% — SML off by 0.5pp (< 1pp band)
+    prices = {"BIG": 100.0, "SML": 50.0}
+    target = {"BIG": 0.96, "SML": 0.04}
+    s = suggest("bands", held, prices, target, band=0.05)
+    assert all(x.action == "hold" for x in s)
+    assert all("within" in x.reason for x in s)
+
+
+def test_bands_converges_instead_of_stranding_the_proceeds_in_cash() -> None:
+    """Regression: the band used to be a per-leg FILTER, so the breached leg sold and the
+    legs holding the offsetting drift — all comfortably inside their own bands — bought
+    nothing. The plan sold 9.3% of the book and left it in cash with the overweight still
+    overweight, in the mode the README recommends for the weekly brief."""
+    tot = 100_000.0
+    weights = {"VOO": 0.26, "VTI": 0.148, "BND": 0.148, "IAU": 0.148, "VEA": 0.148, "VWO": 0.148}
+    held = {tk: w * tot for tk, w in weights.items()}
+    prices = dict.fromkeys(held, 100.0)
+    target = dict.fromkeys(held, 1 / 6)           # VOO +9.33pp; the other five −1.87pp each
+    s = suggest("bands", held, prices, target)
+    buys = sum(x.dollars for x in s if x.action == "buy")
+    sells = sum(x.dollars for x in s if x.action == "sell")
+    assert sells == pytest.approx(buys, rel=1e-9)  # nothing stranded
+    assert sells > 0.0                             # ...and it did act
+
+
+def test_bands_puts_new_cash_to_work() -> None:
+    """Regression: `base` excluded new_cash for bands (only to_total added it), so buys were
+    sized off a total the cash was never in and a --new-cash run left it unallocated."""
+    held = {"AAA": 6000.0, "BBB": 4000.0}
+    prices = {"AAA": 100.0, "BBB": 100.0}
+    target = {"AAA": 0.5, "BBB": 0.5}              # AAA +10pp → breaches
+    s = suggest("bands", held, prices, target, new_cash=2000.0)
+    net = sum(x.dollars for x in s if x.action == "buy") - sum(
+        x.dollars for x in s if x.action == "sell"
+    )
+    assert net == pytest.approx(2000.0, rel=1e-9)  # the whole contribution is deployed
 
 
 def test_bands_5_25_zero_target_always_exits() -> None:

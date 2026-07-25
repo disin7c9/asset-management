@@ -7,6 +7,7 @@ wrappers (`_fetch_yf`, `_fetch_tiingo_json`) so no real HTTP happens.
 from __future__ import annotations
 
 import logging
+from dataclasses import FrozenInstanceError
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -66,8 +67,8 @@ def _write_cache_row(
 def test_fetch_returns_provenance(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(P, "_fetch_yf", lambda t, s, e: _fake_yf_df(100.0, date(2024, 1, 5)))
-    monkeypatch.setattr(P, "_fetch_tiingo_json", lambda t, s, e: None)
+    monkeypatch.setattr(P, "_fetch_yf", lambda t, s, e, **k: _fake_yf_df(100.0, date(2024, 1, 5)))
+    monkeypatch.setattr(P, "_fetch_tiingo_json", lambda t, s, e, **k: None)
     result = fetch_latest(["VOO"], asof_date=date(2024, 1, 6), cache_dir=tmp_path)
     assert isinstance(result, PricesResult)
     assert "VOO" in result.rows
@@ -84,7 +85,7 @@ def test_latest_missing_close_column_degrades_not_crashes(
     # renamed/partial frame) must degrade the ticker to .missing — never raise
     # KeyError and kill the whole batch. The series path already guarded this via
     # _normalize_close; the latest path now shares that one extractor.
-    def _yf(t, s, e):  # type: ignore[no-untyped-def]
+    def _yf(t, s, e, **k):  # type: ignore[no-untyped-def]
         if t == "BAD":
             return pd.DataFrame(
                 {"Adj Close": [1.0]}, index=pd.DatetimeIndex([pd.Timestamp("2024-01-05")])
@@ -92,7 +93,7 @@ def test_latest_missing_close_column_degrades_not_crashes(
         return _fake_yf_df(100.0, date(2024, 1, 5))
 
     monkeypatch.setattr(P, "_fetch_yf", _yf)
-    monkeypatch.setattr(P, "_fetch_tiingo_json", lambda t, s, e: None)
+    monkeypatch.setattr(P, "_fetch_tiingo_json", lambda t, s, e, **k: None)
     result = fetch_latest(["GOOD", "BAD"], asof_date=date(2024, 1, 6), cache_dir=tmp_path)
     assert result.rows["GOOD"].close == 100.0  # the bad ticker didn't poison the batch
     assert result.missing == ["BAD"]
@@ -101,7 +102,7 @@ def test_latest_missing_close_column_degrades_not_crashes(
 def test_fetch_writes_cache_after_live(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(P, "_fetch_yf", lambda t, s, e: _fake_yf_df(123.45, date(2024, 1, 5)))
+    monkeypatch.setattr(P, "_fetch_yf", lambda t, s, e, **k: _fake_yf_df(123.45, date(2024, 1, 5)))
     fetch_latest(["VOO"], asof_date=date(2024, 1, 6), cache_dir=tmp_path)
     cache_file = tmp_path / "VOO.parquet"
     assert cache_file.exists()
@@ -141,7 +142,7 @@ def test_fetch_bypasses_stale_cache(
         50.0,
         datetime.now(timezone.utc) - timedelta(days=3),
     )
-    monkeypatch.setattr(P, "_fetch_yf", lambda t, s, e: _fake_yf_df(75.0, asof))
+    monkeypatch.setattr(P, "_fetch_yf", lambda t, s, e, **k: _fake_yf_df(75.0, asof))
     result = fetch_latest(["VOO"], asof_date=asof, cache_dir=tmp_path)
     assert result.rows["VOO"].source == "yfinance"
     assert result.rows["VOO"].close == 75.0
@@ -154,8 +155,8 @@ def test_fetch_falls_back_to_tiingo(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     asof = date(2024, 1, 5)
-    monkeypatch.setattr(P, "_fetch_yf", lambda t, s, e: None)
-    monkeypatch.setattr(P, "_fetch_tiingo_json", lambda t, s, e: _fake_tiingo_rows(88.0, asof))
+    monkeypatch.setattr(P, "_fetch_yf", lambda t, s, e, **k: None)
+    monkeypatch.setattr(P, "_fetch_tiingo_json", lambda t, s, e, **k: _fake_tiingo_rows(88.0, asof))
     result = fetch_latest(["VOO"], asof_date=asof, cache_dir=tmp_path)
     assert result.rows["VOO"].source == "tiingo"
     assert result.rows["VOO"].close == 88.0
@@ -170,9 +171,9 @@ def test_fetch_returns_partial_on_missing(
     monkeypatch.setattr(
         P,
         "_fetch_yf",
-        lambda t, s, e: _fake_yf_df(100.0, asof) if t == "VOO" else None,
+        lambda t, s, e, **k: _fake_yf_df(100.0, asof) if t == "VOO" else None,
     )
-    monkeypatch.setattr(P, "_fetch_tiingo_json", lambda t, s, e: None)
+    monkeypatch.setattr(P, "_fetch_tiingo_json", lambda t, s, e, **k: None)
     result = fetch_latest(["VOO", "ZZZBAD"], asof_date=asof, cache_dir=tmp_path)
     assert "VOO" in result.rows
     assert "ZZZBAD" not in result.rows
@@ -191,8 +192,8 @@ def test_tiingo_malformed_rows_are_skipped(
         {"date": f"{asof.isoformat()}T00:00:00.000Z", "close": "nope"},  # bad close
         {"date": f"{asof.isoformat()}T00:00:00.000Z", "close": 77.0},   # good
     ]
-    monkeypatch.setattr(P, "_fetch_yf", lambda t, s, e: None)
-    monkeypatch.setattr(P, "_fetch_tiingo_json", lambda t, s, e: rows)
+    monkeypatch.setattr(P, "_fetch_yf", lambda t, s, e, **k: None)
+    monkeypatch.setattr(P, "_fetch_tiingo_json", lambda t, s, e, **k: rows)
     result = fetch_latest(["VOO"], asof_date=asof, cache_dir=tmp_path)
     assert result.rows["VOO"].close == 77.0
     assert result.rows["VOO"].source == "tiingo"
@@ -234,11 +235,18 @@ def test_no_tiingo_key_is_logged_exactly_once(
     assert len(hits) == 1
 
 
-def test_tiingo_refuses_redirects_so_the_key_cannot_follow() -> None:
+def test_every_credentialed_path_refuses_redirects_so_the_key_cannot_follow() -> None:
     # urllib re-sends every header on a 3xx and does NOT strip Authorization when the host
     # changes, so following a redirect would hand the user's API key to the target.
+    from app.http_safe import NoRedirect
+
     req = P.urllib.request.Request("https://api.tiingo.com/x")
-    assert P._NoRedirect().redirect_request(req, None, 302, "Found", {}, "https://evil.example") is None  # type: ignore[arg-type]
+    assert NoRedirect().redirect_request(req, None, 302, "Found", {}, "https://evil.example") is None  # type: ignore[arg-type]
+    # That the Tiingo path actually GOES through this opener is pinned behaviorally by the
+    # tests below, which patch `_TIINGO_OPENER.open` and would never fire if the code used a
+    # bare urlopen. The LLM path has its own end-to-end redirect test in test_llm.py.
+    # (Asserting `isinstance` over `opener.handlers` was tried here and deleted: it passes
+    # even when the caller ignores the opener, so it pinned nothing.)
 
 
 def test_tiingo_ticker_is_url_quoted(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -279,14 +287,14 @@ def test_tiingo_rebuilds_yfinance_split_adjusted_basis(
         _tiingo_row("2024-06-10", 121.79, split=10.0),   # the 10:1 split lands here
         _tiingo_row("2024-06-11", 120.91),               # post-split
     ]
-    monkeypatch.setattr(P, "_fetch_tiingo_json", lambda t, s, e: rows)
+    monkeypatch.setattr(P, "_fetch_tiingo_json", lambda t, s, e, **k: rows)
     pairs = dict(P._tiingo_closes("NVDA", date(2024, 6, 7), date(2024, 6, 11)))
     assert pairs[date(2024, 6, 7)] == pytest.approx(120.888)  # 1208.88 / 10 — matches yfinance
     assert pairs[date(2024, 6, 10)] == pytest.approx(121.79)  # split day: already post-split
     assert pairs[date(2024, 6, 11)] == pytest.approx(120.91)
     # And the phantom crash is gone: no fabricated ~-90% day.
     closes = [pairs[d] for d in sorted(pairs)]
-    worst = min(b / a - 1.0 for a, b in zip(closes, closes[1:]))
+    worst = min(b / a - 1.0 for a, b in zip(closes, closes[1:], strict=False))
     assert worst > -0.5
 
 
@@ -302,7 +310,7 @@ def test_tiingo_multi_split_uses_the_product_of_all_later_factors(
         _tiingo_row("2024-03-01", 100.0, split=3.0),  # 3:1 here → nothing later → ÷1
         _tiingo_row("2024-04-01", 110.0),             # after both → ÷1
     ]
-    monkeypatch.setattr(P, "_fetch_tiingo_json", lambda t, s, e: rows)
+    monkeypatch.setattr(P, "_fetch_tiingo_json", lambda t, s, e, **k: rows)
     pairs = dict(P._tiingo_closes("X", date(2024, 1, 1), date(2024, 4, 1)))
     assert pairs[date(2024, 1, 1)] == pytest.approx(100.0)  # 600 / (2*3)
     assert pairs[date(2024, 2, 1)] == pytest.approx(100.0)  # 300 / 3
@@ -321,7 +329,7 @@ def test_tiingo_reverse_split_scales_earlier_closes_up(
         _tiingo_row("2024-02-01", 52.0, split=0.1),  # 1:10 reverse lands here
         _tiingo_row("2024-03-01", 48.0),
     ]
-    monkeypatch.setattr(P, "_fetch_tiingo_json", lambda t, s, e: rows)
+    monkeypatch.setattr(P, "_fetch_tiingo_json", lambda t, s, e, **k: rows)
     pairs = dict(P._tiingo_closes("X", date(2024, 1, 1), date(2024, 3, 1)))
     assert pairs[date(2024, 1, 1)] == pytest.approx(50.0)  # 5.0 / 0.1
     assert pairs[date(2024, 2, 1)] == pytest.approx(52.0)
@@ -361,7 +369,7 @@ def test_tiingo_missing_or_bad_split_factor_defaults_to_no_adjustment(
         {"date": "2024-01-03T00:00:00.000Z", "close": 11.0, "splitFactor": 0},  # nonsense
         {"date": "2024-01-04T00:00:00.000Z", "close": 12.0, "splitFactor": "x"},
     ]
-    monkeypatch.setattr(P, "_fetch_tiingo_json", lambda t, s, e: rows)
+    monkeypatch.setattr(P, "_fetch_tiingo_json", lambda t, s, e, **k: rows)
     pairs = dict(P._tiingo_closes("X", date(2024, 1, 2), date(2024, 1, 4)))
     assert [pairs[d] for d in sorted(pairs)] == [10.0, 11.0, 12.0]  # untouched
 
@@ -374,8 +382,8 @@ def test_tiingo_non_dict_rows_degrade_to_missing_not_crash(
 ) -> None:
     # A valid JSON list whose elements aren't dicts (an error page, a format shift) used to
     # raise AttributeError out of the un-guarded per-ticker loop and blank the whole report.
-    monkeypatch.setattr(P, "_fetch_yf", lambda t, s, e: None)
-    monkeypatch.setattr(P, "_fetch_tiingo_json", lambda t, s, e: [None, 123, "oops"])
+    monkeypatch.setattr(P, "_fetch_yf", lambda t, s, e, **k: None)
+    monkeypatch.setattr(P, "_fetch_tiingo_json", lambda t, s, e, **k: [None, 123, "oops"])
     result = fetch_latest(["VOO"], asof_date=date(2024, 1, 5), cache_dir=tmp_path)
     assert result.missing == ["VOO"] and result.rows == {}
 
@@ -396,10 +404,10 @@ def test_tiingo_unusable_closes_are_skipped_never_priced(
     # The yfinance path drops these via _normalize_close's dropna; the Tiingo path must too.
     # A non-finite close would otherwise be cached and re-served as source="cache", poisoning
     # market value, weights, and every drawdown figure downstream.
-    monkeypatch.setattr(P, "_fetch_yf", lambda t, s, e: None)
+    monkeypatch.setattr(P, "_fetch_yf", lambda t, s, e, **k: None)
     monkeypatch.setattr(
         P, "_fetch_tiingo_json",
-        lambda t, s, e: [{"date": "2024-01-05T00:00:00.000Z", "close": close}],
+        lambda t, s, e, **k: [{"date": "2024-01-05T00:00:00.000Z", "close": close}],
     )
     result = fetch_latest(["VOO"], asof_date=date(2024, 1, 5), cache_dir=tmp_path)
     assert result.missing == ["VOO"], why
@@ -415,7 +423,7 @@ def test_tiingo_one_bad_row_does_not_drop_the_good_ones(
         {"date": "bad-date", "close": 5.0},
         {"date": "2024-01-03T00:00:00.000Z", "close": 11.0},
     ]
-    monkeypatch.setattr(P, "_fetch_tiingo_json", lambda t, s, e: rows)
+    monkeypatch.setattr(P, "_fetch_tiingo_json", lambda t, s, e, **k: rows)
     pairs = P._tiingo_closes("X", date(2024, 1, 1), date(2024, 1, 3))
     assert pairs == [(date(2024, 1, 3), 11.0)]
 
@@ -440,7 +448,7 @@ def test_tiingo_series_drops_zero_and_negative_closes(
         {"date": "2024-01-04T00:00:00.000Z", "close": -5.0},
         {"date": "2024-01-05T00:00:00.000Z", "close": 12.0},
     ]
-    monkeypatch.setattr(P, "_fetch_tiingo_json", lambda t, s, e: rows)
+    monkeypatch.setattr(P, "_fetch_tiingo_json", lambda t, s, e, **k: rows)
     pairs = P._tiingo_closes("X", date(2024, 1, 2), date(2024, 1, 5))
     assert pairs == [(date(2024, 1, 2), 10.0), (date(2024, 1, 5), 12.0)]
 
@@ -632,7 +640,7 @@ def test_empty_input_returns_empty_result(tmp_path: Path) -> None:
 def test_dedup_preserves_first_occurrence(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(P, "_fetch_yf", lambda t, s, e: _fake_yf_df(1.0, date(2024, 1, 5)))
+    monkeypatch.setattr(P, "_fetch_yf", lambda t, s, e, **k: _fake_yf_df(1.0, date(2024, 1, 5)))
     result = fetch_latest(["VOO", "VOO"], asof_date=date(2024, 1, 6), cache_dir=tmp_path)
     assert list(result.rows) == ["VOO"]
 
@@ -645,7 +653,7 @@ def test_price_row_is_immutable() -> None:
         source="yfinance",
         fetched_at=datetime.now(timezone.utc),
     )
-    with pytest.raises(Exception):  # noqa: PT011 — dataclass frozen raises FrozenInstanceError
+    with pytest.raises(FrozenInstanceError):
         row.close = 200.0  # type: ignore[misc]
 
 
@@ -659,8 +667,8 @@ def test_cache_refuses_future_fetched_at(
     asof = date(2024, 1, 5)
     future = datetime.now(timezone.utc) + timedelta(hours=24)
     _write_cache_row(tmp_path / "VOO.parquet", asof, 999.0, future)
-    monkeypatch.setattr(P, "_fetch_yf", lambda t, s, e: _fake_yf_df(50.0, asof))
-    monkeypatch.setattr(P, "_fetch_tiingo_json", lambda t, s, e: None)
+    monkeypatch.setattr(P, "_fetch_yf", lambda t, s, e, **k: _fake_yf_df(50.0, asof))
+    monkeypatch.setattr(P, "_fetch_tiingo_json", lambda t, s, e, **k: None)
     result = fetch_latest(["VOO"], asof_date=asof, cache_dir=tmp_path)
     assert result.rows["VOO"].source == "yfinance"
     assert result.rows["VOO"].close == 50.0
@@ -706,9 +714,9 @@ def test_fetch_series_returns_history_with_index(
 ) -> None:
     start = date(2024, 1, 1)
     monkeypatch.setattr(
-        P, "_fetch_yf", lambda t, s, e: _fake_yf_history([100.0, 101.0, 102.0], start)
+        P, "_fetch_yf", lambda t, s, e, **k: _fake_yf_history([100.0, 101.0, 102.0], start)
     )
-    monkeypatch.setattr(P, "_fetch_tiingo_json", lambda t, s, e: None)
+    monkeypatch.setattr(P, "_fetch_tiingo_json", lambda t, s, e, **k: None)
     result = fetch_series(["VOO"], start, date(2024, 1, 3), cache_dir=tmp_path)
     assert "VOO" in result.rows
     s = result.rows["VOO"]
@@ -720,13 +728,13 @@ def test_fetch_series_returns_history_with_index(
 def test_fetch_series_falls_back_to_tiingo(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(P, "_fetch_yf", lambda t, s, e: None)
+    monkeypatch.setattr(P, "_fetch_yf", lambda t, s, e, **k: None)
     rows: list[dict[str, object]] = [
         {"date": "2024-01-01T00:00:00.000Z", "close": 10.0},
         {"date": "2024-01-02T00:00:00.000Z", "close": 11.0},
         {"date": "2024-01-03T00:00:00.000Z", "close": 12.0},
     ]
-    monkeypatch.setattr(P, "_fetch_tiingo_json", lambda t, s, e: rows)
+    monkeypatch.setattr(P, "_fetch_tiingo_json", lambda t, s, e, **k: rows)
     result = fetch_series(["VOO"], date(2024, 1, 1), date(2024, 1, 3), cache_dir=tmp_path)
     assert list(result.rows["VOO"].round(1)) == [10.0, 11.0, 12.0]
     assert result.provenance["VOO"][0] == "tiingo"
@@ -736,8 +744,8 @@ def test_fetch_series_falls_back_to_tiingo(
 def test_fetch_series_missing_when_all_fail(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(P, "_fetch_yf", lambda t, s, e: None)
-    monkeypatch.setattr(P, "_fetch_tiingo_json", lambda t, s, e: None)
+    monkeypatch.setattr(P, "_fetch_yf", lambda t, s, e, **k: None)
+    monkeypatch.setattr(P, "_fetch_tiingo_json", lambda t, s, e, **k: None)
     result = fetch_series(["NOPE"], date(2024, 1, 1), date(2024, 1, 3), cache_dir=tmp_path)
     assert result.rows == {}
     assert result.missing == ["NOPE"]
@@ -749,7 +757,7 @@ def test_fetch_series_writes_and_reuses_cache(
     start = date(2024, 1, 1)
     end = date(2024, 1, 3)
     monkeypatch.setattr(
-        P, "_fetch_yf", lambda t, s, e: _fake_yf_history([100.0, 101.0, 102.0], start)
+        P, "_fetch_yf", lambda t, s, e, **k: _fake_yf_history([100.0, 101.0, 102.0], start)
     )
     fetch_series(["VOO"], start, end, cache_dir=tmp_path)
     assert (tmp_path / "VOO_series.parquet").exists()
@@ -765,8 +773,8 @@ def test_fetch_series_records_provenance(
 ) -> None:
     # A yfinance hit must be recorded as ("yfinance", <fetched_at>) so the CLI can
     # stamp honest provenance (P0-1) instead of a fabricated "series" label.
-    monkeypatch.setattr(P, "_fetch_yf", lambda tk, s, e: _fake_yf_df(100.0, date(2024, 1, 2)))
-    monkeypatch.setattr(P, "_fetch_tiingo_json", lambda tk, s, e: None)
+    monkeypatch.setattr(P, "_fetch_yf", lambda tk, s, e, **k: _fake_yf_df(100.0, date(2024, 1, 2)))
+    monkeypatch.setattr(P, "_fetch_tiingo_json", lambda tk, s, e, **k: None)
     res = fetch_series(["VOO"], date(2024, 1, 1), date(2024, 1, 3),
                        cache_dir=tmp_path, online=True)
     assert "VOO" in res.rows
@@ -807,8 +815,8 @@ def test_series_cache_stale_is_refetched(
         tmp_path / "VOO_series.parquet", _DAYS, [1.0, 2.0, 3.0],
         datetime.now(timezone.utc) - timedelta(days=3),  # stale
     )
-    monkeypatch.setattr(P, "_fetch_yf", lambda t, s, e: _fake_yf_history([10.0, 11.0, 12.0], date(2024, 1, 1)))
-    monkeypatch.setattr(P, "_fetch_tiingo_json", lambda t, s, e: None)
+    monkeypatch.setattr(P, "_fetch_yf", lambda t, s, e, **k: _fake_yf_history([10.0, 11.0, 12.0], date(2024, 1, 1)))
+    monkeypatch.setattr(P, "_fetch_tiingo_json", lambda t, s, e, **k: None)
     res = fetch_series(["VOO"], date(2024, 1, 1), date(2024, 1, 3), cache_dir=tmp_path)
     assert list(res.rows["VOO"].round(1)) == [10.0, 11.0, 12.0]  # refetched, not 1/2/3
     assert res.provenance["VOO"][0] == "yfinance"
@@ -821,8 +829,8 @@ def test_series_cache_future_stamp_is_refused(
         tmp_path / "VOO_series.parquet", _DAYS, [1.0, 2.0, 3.0],
         datetime.now(timezone.utc) + timedelta(hours=24),  # future-stamped
     )
-    monkeypatch.setattr(P, "_fetch_yf", lambda t, s, e: _fake_yf_history([10.0, 11.0, 12.0], date(2024, 1, 1)))
-    monkeypatch.setattr(P, "_fetch_tiingo_json", lambda t, s, e: None)
+    monkeypatch.setattr(P, "_fetch_yf", lambda t, s, e, **k: _fake_yf_history([10.0, 11.0, 12.0], date(2024, 1, 1)))
+    monkeypatch.setattr(P, "_fetch_tiingo_json", lambda t, s, e, **k: None)
     res = fetch_series(["VOO"], date(2024, 1, 1), date(2024, 1, 3), cache_dir=tmp_path)
     assert list(res.rows["VOO"].round(1)) == [10.0, 11.0, 12.0]  # refused → refetched
 
@@ -831,8 +839,8 @@ def test_series_cache_corrupt_is_nonfatal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     (tmp_path / "VOO_series.parquet").write_bytes(b"this is not parquet")
-    monkeypatch.setattr(P, "_fetch_yf", lambda t, s, e: _fake_yf_history([5.0, 6.0, 7.0], date(2024, 1, 1)))
-    monkeypatch.setattr(P, "_fetch_tiingo_json", lambda t, s, e: None)
+    monkeypatch.setattr(P, "_fetch_yf", lambda t, s, e, **k: _fake_yf_history([5.0, 6.0, 7.0], date(2024, 1, 1)))
+    monkeypatch.setattr(P, "_fetch_tiingo_json", lambda t, s, e, **k: None)
     res = fetch_series(["VOO"], date(2024, 1, 1), date(2024, 1, 3), cache_dir=tmp_path)
     assert list(res.rows["VOO"].round(1)) == [5.0, 6.0, 7.0]  # unreadable → refetched
 
@@ -936,9 +944,9 @@ def test_series_cache_stale_and_short_is_refetched(
     )
     monkeypatch.setattr(
         P, "_fetch_yf",
-        lambda t, s, e: _fake_yf_history([10.0, 11.0, 12.0], today - timedelta(days=2)),
+        lambda t, s, e, **k: _fake_yf_history([10.0, 11.0, 12.0], today - timedelta(days=2)),
     )
-    monkeypatch.setattr(P, "_fetch_tiingo_json", lambda t, s, e: None)
+    monkeypatch.setattr(P, "_fetch_tiingo_json", lambda t, s, e, **k: None)
     res = fetch_series(["ATVI"], today - timedelta(days=40), today, cache_dir=tmp_path)
     assert res.provenance["ATVI"][0] == "yfinance"  # went live, not the old cache
 
@@ -956,9 +964,9 @@ def test_series_cache_fresh_but_entirely_before_start_is_refetched(
     )
     monkeypatch.setattr(
         P, "_fetch_yf",
-        lambda t, s, e: _fake_yf_history([10.0, 11.0, 12.0], today - timedelta(days=2)),
+        lambda t, s, e, **k: _fake_yf_history([10.0, 11.0, 12.0], today - timedelta(days=2)),
     )
-    monkeypatch.setattr(P, "_fetch_tiingo_json", lambda t, s, e: None)
+    monkeypatch.setattr(P, "_fetch_tiingo_json", lambda t, s, e, **k: None)
     res = fetch_series(["VOO"], today - timedelta(days=40), today, cache_dir=tmp_path)
     assert res.provenance["VOO"][0] == "yfinance"
     assert list(res.rows["VOO"].round(1)) == [10.0, 11.0, 12.0]
@@ -997,8 +1005,8 @@ def test_online_latest_miss_does_not_serve_stale_series_tail(
         tmp_path / "VOO_series.parquet", _DAYS, [10.0, 11.0, 12.0],
         datetime.now(timezone.utc) - timedelta(hours=1),  # fresh, but dated 2024-01-03
     )  # no VOO.parquet → dedicated latest cache misses
-    monkeypatch.setattr(P, "_fetch_yf", lambda t, s, e: _fake_yf_df(99.0, date(2024, 1, 10)))
-    monkeypatch.setattr(P, "_fetch_tiingo_json", lambda t, s, e: None)
+    monkeypatch.setattr(P, "_fetch_yf", lambda t, s, e, **k: _fake_yf_df(99.0, date(2024, 1, 10)))
+    monkeypatch.setattr(P, "_fetch_tiingo_json", lambda t, s, e, **k: None)
     res = fetch_latest(["VOO"], asof_date=date(2024, 1, 10), cache_dir=tmp_path, online=True)
     assert res.rows["VOO"].source == "yfinance"  # fetched fresh, NOT the stale tail
     assert res.rows["VOO"].close == 99.0
@@ -1012,8 +1020,8 @@ def test_series_cache_nat_fetched_at_is_refused(
     pd.DataFrame(
         {"date": [pd.Timestamp("2024-01-01")], "close": [5.0], "fetched_at": [pd.NaT]}
     ).to_parquet(tmp_path / "VOO_series.parquet", index=False)
-    monkeypatch.setattr(P, "_fetch_yf", lambda t, s, e: _fake_yf_history([10.0, 11.0, 12.0], date(2024, 1, 1)))
-    monkeypatch.setattr(P, "_fetch_tiingo_json", lambda t, s, e: None)
+    monkeypatch.setattr(P, "_fetch_yf", lambda t, s, e, **k: _fake_yf_history([10.0, 11.0, 12.0], date(2024, 1, 1)))
+    monkeypatch.setattr(P, "_fetch_tiingo_json", lambda t, s, e, **k: None)
     res = fetch_series(["VOO"], date(2024, 1, 1), date(2024, 1, 3), cache_dir=tmp_path)
     assert list(res.rows["VOO"].round(1)) == [10.0, 11.0, 12.0]  # refused → refetched
     assert res.provenance["VOO"][0] == "yfinance"
@@ -1154,3 +1162,120 @@ def test_fetch_splits_skips_nat_date(
     s = pd.Series([5.0, 2.0], index=pd.DatetimeIndex([pd.NaT, pd.Timestamp("2024-01-01")]))
     monkeypatch.setattr(P, "_fetch_yf_splits", lambda tk: s)
     assert fetch_splits(["X"], cache_dir=tmp_path)["X"] == [(date(2024, 1, 1), 2.0)]
+
+
+# ── the return basis: raw (portfolio) vs total-return (notional simulation) ────
+
+
+def test_total_return_basis_asks_yfinance_for_adjusted_closes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The whole point of the basis: auto_adjust must reach yfinance. A price-only close
+    # books every coupon as a loss, which is how BIL (return = 100% coupon) simulated at ~0.
+    seen: list[bool] = []
+
+    def _yf(t: str, s: date, e: date, **k: object) -> pd.DataFrame:
+        seen.append(bool(k.get("adjusted")))
+        return _fake_yf_df(100.0, date(2024, 1, 2))
+
+    monkeypatch.setattr(P, "_fetch_yf", _yf)
+    monkeypatch.setattr(P, "_fetch_tiingo_json", lambda t, s, e, **k: None)
+    fetch_series(["VOO"], date(2024, 1, 1), date(2024, 1, 3),
+                 cache_dir=tmp_path, online=True, basis="total_return")
+    fetch_series(["BND"], date(2024, 1, 1), date(2024, 1, 3),
+                 cache_dir=tmp_path, online=True)  # default = raw
+    assert seen == [True, False]
+
+
+def test_the_two_bases_never_share_a_cache_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A raw close and a dividend-adjusted close for the same day are different numbers.
+    # If one file served both, warming either would silently corrupt the other.
+    def _yf(t: str, s: date, e: date, **k: object) -> pd.DataFrame:
+        return _fake_yf_df(120.0 if k.get("adjusted") else 100.0, date(2024, 1, 2))
+
+    monkeypatch.setattr(P, "_fetch_yf", _yf)
+    monkeypatch.setattr(P, "_fetch_tiingo_json", lambda t, s, e, **k: None)
+    raw = fetch_series(["BND"], date(2024, 1, 1), date(2024, 1, 3), cache_dir=tmp_path)
+    tr = fetch_series(["BND"], date(2024, 1, 1), date(2024, 1, 3),
+                      cache_dir=tmp_path, basis="total_return")
+    assert float(raw.rows["BND"].iloc[0]) == 100.0
+    assert float(tr.rows["BND"].iloc[0]) == 120.0
+    assert (tmp_path / "BND_series.parquet").exists()
+    assert (tmp_path / "BND_series_tr.parquet").exists()
+
+    # ...and each basis reads back its OWN file offline, not the other's.
+    raw2 = fetch_series(["BND"], date(2024, 1, 1), date(2024, 1, 3),
+                        cache_dir=tmp_path, online=False)
+    tr2 = fetch_series(["BND"], date(2024, 1, 1), date(2024, 1, 3),
+                       cache_dir=tmp_path, online=False, basis="total_return")
+    assert float(raw2.rows["BND"].iloc[0]) == 100.0
+    assert float(tr2.rows["BND"].iloc[0]) == 120.0
+
+
+def test_a_warm_raw_cache_does_not_satisfy_a_total_return_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Offline with only the raw cache warmed, the simulation basis must report the ticker
+    # MISSING rather than quietly serve price-only closes into a backtest verdict.
+    monkeypatch.setattr(P, "_fetch_yf", lambda t, s, e, **k: _fake_yf_df(100.0, date(2024, 1, 2)))
+    monkeypatch.setattr(P, "_fetch_tiingo_json", lambda t, s, e, **k: None)
+    fetch_series(["BND"], date(2024, 1, 1), date(2024, 1, 3), cache_dir=tmp_path)
+    out = fetch_series(["BND"], date(2024, 1, 1), date(2024, 1, 3),
+                       cache_dir=tmp_path, online=False, basis="total_return")
+    assert out.missing == ["BND"]
+    assert not out.rows
+
+
+def test_tiingo_total_return_uses_adjclose_not_the_split_reconstruction() -> None:
+    # Tiingo ships adjClose already split- AND dividend-adjusted — exactly the TR basis —
+    # so the splitFactor rebuild (right for the raw basis) must be skipped, not applied twice.
+    rows: list[dict[str, object]] = [
+        {"date": "2024-01-02T00:00:00.000Z", "close": 100.0, "adjClose": 90.0, "splitFactor": 1.0},
+        {"date": "2024-01-03T00:00:00.000Z", "close": 50.0, "adjClose": 45.5, "splitFactor": 2.0},
+    ]
+    raw = P._parse_tiingo_rows(rows)
+    tr = P._parse_tiingo_rows(rows, total_return=True)
+    assert [c for _, c in raw] == [50.0, 50.0]        # 100 / the later 2:1 split
+    assert [c for _, c in tr] == [90.0, 45.5]         # adjClose served verbatim
+
+
+def test_the_latest_cache_hits_when_asof_is_not_itself_a_trading_day(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: reads matched `asof_date == requested`, while the writer stores the
+    provider's ACTUAL close date. The README's flagship workflow is an 08:00 Monday cron —
+    before the US open — so yfinance hands back Friday's bar and the read missed on every
+    run, forever: fresh network call each time, one duplicate parquet row per run, and a 20h
+    TTL that never applied."""
+    calls: list[str] = []
+
+    def _yf(t: str, s: date, e: date, **k: object) -> pd.DataFrame:
+        calls.append(t)
+        return _fake_yf_df(100.0, date(2026, 7, 17))       # Friday's close
+
+    monkeypatch.setattr(P, "_fetch_yf", _yf)
+    monkeypatch.setattr(P, "_fetch_tiingo_json", lambda t, s, e, **k: None)
+    monday = date(2026, 7, 20)
+    rows = [
+        P.fetch_latest(["VOO"], monday, cache_dir=tmp_path, online=True).rows["VOO"]
+        for _ in range(3)
+    ]
+    assert len(calls) == 1                                  # was 3
+    assert [r.source for r in rows] == ["yfinance", "cache", "cache"]
+    assert len(pd.read_parquet(tmp_path / "VOO.parquet")) == 1   # was 3 duplicate rows
+    # The row must carry the close's OWN date — labelling Friday's price as Monday's would
+    # hide the lag from the report's stale-close display.
+    assert all(r.asof_date == date(2026, 7, 17) for r in rows)
+
+
+def test_the_latest_cache_still_refuses_a_close_past_the_staleness_floor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Matching on `<= asof` must not turn a delisted ticker's last-ever close into a
+    permanent 'current' price — the staleness floor still applies to the cached row."""
+    monkeypatch.setattr(P, "_fetch_yf", lambda t, s, e, **k: _fake_yf_df(50.0, date(2026, 1, 5)))
+    monkeypatch.setattr(P, "_fetch_tiingo_json", lambda t, s, e, **k: None)
+    P.fetch_latest(["DEAD"], date(2026, 1, 6), cache_dir=tmp_path, online=True)
+    assert P._from_cache("DEAD", date(2026, 6, 1), tmp_path, allow_stale=True) is None

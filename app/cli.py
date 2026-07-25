@@ -720,8 +720,6 @@ def _compute_suggestions(
         )
         run["rebalance"] = "skipped: unvalidated edge strategy"
         return None
-    if args.rebalance == "bands" and args.new_cash > 0:
-        log.warning("--rebalance bands ignores --new-cash (it rebalances existing holdings)")
     if args.rebalance in ("fixed_dca", "cash_flow_only") and args.new_cash <= 0:
         log.warning(
             "--rebalance %s deploys new cash but --new-cash is 0 → nothing to invest "
@@ -744,7 +742,8 @@ def _compute_suggestions(
     if omitted_held:
         log.warning(
             "--rebalance: target omits held tickers; they are treated as 0%% "
-            "(sold to $0; bands sells only past the band) — add them to keep them: %s",
+            "(sold to $0; under bands a 0%% target has a 0 band, so it always exits) "
+            "— add them to keep them: %s",
             ", ".join(omitted_held),
         )
     need = sorted((set(target) | set(held)) - set(combined))
@@ -990,7 +989,10 @@ def _warm_cache(
             scope = "core (full requested; universe unavailable)"
 
     counts = warm_cache(book_tickers, args.cache_dir, extra_tickers=extra, online=True)
-    run["warm"] = f"{scope}: {counts['tickers']} tickers, {counts['series_missing']} missing"
+    run["warm"] = (
+        f"{scope}: {counts['tickers']} tickers, {counts['series_missing']} missing; "
+        f"tr {counts['tr_tickers']}, {counts['tr_missing']} missing"
+    )
     # Success hinges on YOUR holdings when a book was warmed: the benchmark refs are liquid and
     # almost always land, so "got something" isn't "got your book". A refs-only warm (no book)
     # falls back to "did anything land". A book wholly unpriced → a non-zero, honest failure.
@@ -1013,6 +1015,20 @@ def _warm_cache(
         f"Warmed the offline cache ({scope}): {counts['tickers']} tickers fetched, "
         f"{counts['series_missing']} price-history misses{holdings_note}, "
         f"{counts['meta_missing']} metadata misses.\n"
+    )
+    # The simulation basis is a SECOND pass over its own cache files, and it can fail on its
+    # own — Yahoo throttles bursts, and this is the second full batch of the same run. Saying
+    # "warmed" while it silently missed would send the user to `--backtest --offline` only to
+    # be told to warm the cache they just warmed.
+    if counts["tr_missing"]:
+        sys.stdout.write(
+            f"  ⚠ but {counts['tr_missing']} of {counts['tr_tickers']} total-return series "
+            "missed — --backtest / --benchmark / the role check read that basis and will "
+            "report no history. Re-run --warm (already-cached tickers are skipped).\n"
+        )
+        if run["status"] == "ok":
+            run["status"] = "partial"
+    sys.stdout.write(
         "Your --offline runs and the read-only MCP server can now serve from the cache.\n"
     )
     _log_run_summary(run)
@@ -1148,6 +1164,10 @@ def _compute_allocation(
             return
         rows = None
         if needs_series(rule):  # rule weighs on return history (inverse_vol)
+            # Deliberately the RAW basis: this reuses the brief's own series rather than
+            # refetching, and the rule reads volatility, where the dividend adjustment is
+            # second-order (a few discrete steps a year). Not an oversight — the
+            # simulation paths above take `basis="total_return"` on purpose.
             src = series  # reuse the history already fetched for the brief (no refetch)
             if src is None:  # --no-risk path: nothing fetched yet → fetch now AND record it
                 start = today - timedelta(days=400)  # ~13 months → a full year of returns
@@ -1241,7 +1261,13 @@ def _screen_tickers(
         return None
     online = not args.offline
     start: date = daily.index[0].date()
-    cand_series = fetch_series(tickers, start, today, cache_dir=args.cache_dir, online=online)
+    # total_return on both fetches below: the candidate is judged against YOUR book, whose
+    # return series already carries its dividends (they are rows in the log), and the role
+    # check simulates it with no log at all. A raw close would understate a high-yield
+    # candidate's return and overstate its drawdown against a total-return yardstick.
+    cand_series = fetch_series(
+        tickers, start, today, cache_dir=args.cache_dir, online=online, basis="total_return"
+    )
     record_series_fetch(run, cand_series)
     held = set(state.held())
     tickers_set = set(tickers)
@@ -1265,7 +1291,7 @@ def _screen_tickers(
         else:
             tgt_series = fetch_series(
                 sorted(set(target) - set(cand_series.rows)), start, today,
-                cache_dir=args.cache_dir, online=online,
+                cache_dir=args.cache_dir, online=online, basis="total_return",
             )
             record_series_fetch(run, tgt_series)
             sim_series = {**tgt_series.rows, **cand_series.rows}
@@ -1377,12 +1403,23 @@ def _load_target_series(
         run["backtest"] = "skipped: bad target"
         return None
     lookback = args.backtest_start or (today - timedelta(days=HISTORY_DAYS))  # ~10y of history
+    # total_return: `simulate` holds these funds with no transaction log, so a raw close
+    # would book every coupon and dividend as a permanent loss — BIL, whose return is
+    # entirely coupon, would flatline at ~0 while carrying 25% of the `permanent` reference.
     series = fetch_series(
         sorted(set(target) | set(extra)), lookback, today,
-        cache_dir=args.cache_dir, online=not args.offline,
+        cache_dir=args.cache_dir, online=not args.offline, basis="total_return",
     )
     if not series.rows:
-        log.warning("--backtest: no price history for the target tickers")
+        # The simulation reads a total-return cache, which is a SEPARATE file from the brief's
+        # (`<T>_series_tr.parquet`). A cache warmed before v2.12.1 has only the raw one, so say
+        # what to do rather than leaving "no prices" to be read as a dead ticker.
+        log.warning(
+            "--backtest: no total-return price history for the target tickers%s",
+            " — the simulation reads its own cache; warm it once with `--warm` "
+            "(the brief's cache alone is the wrong basis for a backtest)"
+            if args.offline else "",
+        )
         run["backtest"] = "skipped: no prices"
         return None
     return target, series

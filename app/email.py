@@ -63,7 +63,7 @@ def send_report(
     }
     try:
         message_id = _dispatch(payload, api_key)
-    except Exception as exc:  # SDK / network errors must not crash the run
+    except Exception as exc:  # noqa: BLE001 — SDK / network errors must not crash the run
         log.error("email send failed: %s", exc)
         return EmailResult(False, f"send failed: {exc}")
     log.info("email sent to %s (id=%s)", to, message_id)

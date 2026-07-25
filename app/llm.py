@@ -25,7 +25,12 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlparse
 
+from app.http_safe import no_redirect_opener
+
 log = logging.getLogger(__name__)
+
+# Refuses 3xx so a redirect can't walk the API key (and the figures) to another host.
+_OPENER = no_redirect_opener()
 
 _ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
 _ANTHROPIC_VERSION = "2023-06-01"
@@ -160,10 +165,13 @@ def _post(
     url: str, headers: dict[str, str], body: dict[str, Any], timeout: float
 ) -> dict[str, Any]:
     data = json.dumps(body).encode("utf-8")
-    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
     # Scheme is https (anthropic is a fixed constant; the openai base_url is validated
     # by _is_safe_url in load_config), so the urlopen scheme is constrained, not arbitrary.
-    with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")  # noqa: S310
+    # ...but `_is_safe_url` only vets the CONFIGURED url — it has no say over where a 3xx
+    # points, and `headers` carries the user's API key plus their portfolio figures. A bare
+    # urlopen follows the redirect and re-sends both. Same opener as the Tiingo path.
+    with _OPENER.open(req, timeout=timeout) as resp:
         parsed: dict[str, Any] = json.loads(resp.read())
         return parsed
 

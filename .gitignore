@@ -30,7 +30,11 @@ data/sample_data/500-activities.json
 # Malformed CSVs for the manual D1 import-safety check (recreatable per docs/testing/
 # manual-test-plan-v2.8.1.md); the automated tests build their own malformed rows.
 data/sample_data/mal*.csv
-reports/
+# Anchored: a bare `reports/` matches a directory of that name at ANY depth, which silently
+# swallowed `docs/reports/` too — every point-in-time review in there was untracked in the
+# private backup for weeks while the CHANGELOG linked to them. Only the generated briefs at
+# the repo root are meant to be ignored.
+/reports/
 *.sqlite
 *.db
 t.csv

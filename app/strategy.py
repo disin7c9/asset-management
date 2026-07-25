@@ -14,8 +14,11 @@ Modes (v1):
     to_total        sell + buy to hit target weights exactly (deploys new cash too)
     cash_flow_only  invest new cash into underweights; never sell (tax-friendly)
     fixed_dca       buy the target mix with a fixed cash amount, ignoring drift
-    bands           like to_total, but only act on tickers whose drift exceeds a
-                    band (prevents churn); rebalances existing holdings only. The
+    bands           to_total, gated on a drift TRIGGER: if no ticker sits outside its
+                    band nothing trades at all; if any does, every leg goes back to
+                    target (new cash included). Trading only the breached leg would
+                    sell with nothing to buy — the offsetting drift lives in the legs
+                    still inside their bands. Prevents churn without stranding cash. The
                     band is the SMALLER of an absolute pp (`band`) or a relative
                     fraction of the target (`band_rel` × target — the "5/25 rule"),
                     so a small sleeve isn't handed a band many times its own size
@@ -127,8 +130,11 @@ def suggest(
     if mode == "cash_flow_only":
         return _cash_flow_only(universe, held_value, prices, target, total_value, new_cash)
     if mode in ("to_total", "bands"):
-        # Both trade toward target; bands then gates by drift.
-        base = total_value + (new_cash if mode == "to_total" else 0.0)
+        # Both trade toward target; `bands` only differs in WHETHER it fires (the drift
+        # trigger). Once it fires the plan is the same to_total plan, new cash included —
+        # excluding it here used to size the buys off a base the cash wasn't in, so a
+        # `--new-cash` run under `bands` left the money unallocated.
+        base = total_value + new_cash
         return _to_target(
             universe, held_value, prices, target, total_value, base,
             rule=mode, band=(band if mode == "bands" else None), band_rel=band_rel,
@@ -153,25 +159,47 @@ def _to_target(
     band: float | None,
     band_rel: float,
 ) -> list[Suggestion]:
-    """Trade each ticker toward target_weight × base. If `band` is set, only act on
-    tickers whose |current − target| exceeds the effective band — the SMALLER of the
-    absolute `band` (pp) or `band_rel × target_weight` (the 5/25 rule), so a small
-    sleeve isn't given a band many times its size. A target of 0 → band 0 → always
-    exit (above the $ floor). `band=None` is to_total (no band — act on any drift)."""
+    """Trade each ticker toward target_weight × base.
+
+    `band` is a **trigger, not a per-leg filter** — Swedroe's 5/25 rule. The effective band
+    per ticker is the SMALLER of the absolute `band` (pp) or `band_rel × target_weight`, so a
+    small sleeve isn't given a band many times its size; a target of 0 → band 0 → always exit
+    (above the $ floor). If NO ticker is outside its band, nothing trades. If ANY ticker is,
+    EVERY leg goes back to target.
+
+    Why the whole portfolio and not just the breached leg: a weight is a share of a total, so
+    one leg drifting up means the others drifted down, and their drift is usually spread thin
+    enough to sit inside their own bands. Trading only the breached leg therefore sells with
+    nothing to buy — the old behavior stranded 9.3% of a six-holding book in cash and left the
+    overweight still overweight, in the mode the README recommends for the weekly brief.
+
+    `band=None` is to_total (no trigger — act on any drift)."""
+    thresholds = {
+        # tgt 0 → 0 → an omitted/zeroed holding always breaches, i.e. always exits.
+        tk: min(band, band_rel * target.get(tk, 0.0)) if band is not None else None
+        for tk in universe
+    }
+    triggered = band is None or any(
+        abs(_cur_weight(held_value, tk, total_value) - target.get(tk, 0.0)) > th + _BAND_EPS
+        for tk, th in thresholds.items()
+        if th is not None
+    )
+    if not triggered:
+        return [
+            Suggestion(
+                tk, "hold", 0.0, 0.0, _cur_weight(held_value, tk, total_value),
+                target.get(tk, 0.0), rule,
+                f"within {(thresholds[tk] or 0.0) * 100:.2f}pp band",
+            )
+            for tk in universe
+        ]
+
     out: list[Suggestion] = []
     for tk in universe:
         tgt_w = target.get(tk, 0.0)  # held but not in target → target 0 → sell out
         cur_w = _cur_weight(held_value, tk, total_value)
         trade = tgt_w * base - held_value.get(tk, 0.0)
-        # 5/25 band: the no-trade region is the smaller of the absolute pp band and a
-        # relative fraction of the target (tgt 0 → 0 → always exit). None → to_total.
-        threshold = min(band, band_rel * tgt_w) if band is not None else None
-        if threshold is not None and abs(cur_w - tgt_w) <= threshold + _BAND_EPS:
-            out.append(Suggestion(
-                tk, "hold", 0.0, 0.0, cur_w, tgt_w, rule,
-                f"within {threshold * 100:.2f}pp band",
-            ))
-            continue
+        threshold = thresholds[tk]
         if abs(trade) < _MIN_TRADE_USD:
             out.append(Suggestion(tk, "hold", 0.0, 0.0, cur_w, tgt_w, rule, "on target"))
             continue
@@ -181,7 +209,13 @@ def _to_target(
             # Target 0% (explicitly, or by omission) → a full exit of the position.
             reason = "target 0% → full exit (raise its weight to keep it)"
         elif threshold is not None:
-            reason = f"drift {drift_pp:+.1f}pp exceeds {threshold * 100:.2f}pp band"
+            reason = (
+                f"drift {drift_pp:+.1f}pp exceeds {threshold * 100:.2f}pp band"
+                if abs(cur_w - tgt_w) > threshold + _BAND_EPS
+                # inside its own band, but a sibling breached: this leg is where the
+                # offsetting drift lives, so it has to absorb the trade for the book to converge
+                else f"{cur_w * 100:.1f}% vs {tgt_w * 100:.1f}% target (rebalance triggered)"
+            )
         else:
             reason = f"{cur_w * 100:.1f}% vs {tgt_w * 100:.1f}% target"
         out.append(Suggestion(

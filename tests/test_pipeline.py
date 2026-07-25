@@ -252,7 +252,10 @@ def test_warm_cache_set_composition(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     seen: dict[str, set[str]] = {}
 
     def rec_series(tickers: object, start: object, end: object, **k: object) -> SeriesResult:
-        seen["series"] = set(tickers)  # type: ignore[arg-type]
+        # warm_cache makes TWO passes: the raw basis over everything, then a total-return
+        # pass over the simulation set only (book ∪ refs — never the universe extras).
+        key = "series_tr" if k.get("basis") == "total_return" else "series"
+        seen[key] = set(tickers)  # type: ignore[arg-type]
         return SeriesResult()
 
     def rec_latest(tickers: object, **k: object) -> PricesResult:
@@ -275,6 +278,9 @@ def test_warm_cache_set_composition(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     counts = warm_cache(["VOO", "FOO", "CASH"], tmp_path, extra_tickers=["QQQM"])
     refs = set(benchmark_ref_tickers())
     assert seen["series"] == {"VOO", "FOO", "QQQM"} | refs   # CASH dropped
+    # the simulation basis skips the universe extras: discovery never simulates, so
+    # `--warm full` pays for one ~375-ticker round, not two
+    assert seen["series_tr"] == {"VOO", "FOO"} | refs
     assert seen["latest"] == {"VOO", "FOO"}                   # book only, no refs
     assert seen["splits"] == {"VOO", "FOO"}
     assert seen["meta"] == {"VOO", "FOO", "QQQM"}             # book ∪ extra, refs excluded

@@ -218,7 +218,7 @@ def _auto_pull(min_aum: float, per_category: int) -> dict[str, dict[str, str]]:
                     yf.ETFQuery("gt", ["fundnetassets", min_aum]),
                 ])
                 res = yf.screen(q, count=per_category, sortField="fundnetassets", sortAsc=False)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 — a dev tool: report the bad category and keep going
                 print(f"WARN ETFQuery {cat!r}: {exc}", file=sys.stderr)
                 continue
             quotes = (res.get("quotes") if isinstance(res, dict) else res) or []
@@ -232,7 +232,8 @@ def _auto_pull(min_aum: float, per_category: int) -> dict[str, dict[str, str]]:
                     seen[sym] = {"ticker": sym, "name": nm, "role": role,
                                  "summary": f"{cat} ETF.", "core": _seed_core(cat),
                                  "flavor": _seed_flavor(cat),
-                                 "_aum": float(r.get("fundnetassets") or r.get("marketCap") or 0.0)}
+                                 # sort key only (DictWriter drops it); a str keeps the row homogeneous
+                                 "_aum": str(float(r.get("fundnetassets") or r.get("marketCap") or 0.0))}
                     kept += 1
             print(f"  {role:16} {cat:28} +{kept}", file=sys.stderr)
     return seen
@@ -247,7 +248,7 @@ def _tickers_from_screens(screens: list[str], count: int) -> list[str]:
     for name in screens:
         try:
             res = yf.screen(name, count=count)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 — a dev tool: report the bad screen and keep going
             print(f"WARN screen {name}: {exc}", file=sys.stderr)
             continue
         quotes = (res.get("quotes") if isinstance(res, dict) else res) or []
@@ -255,10 +256,10 @@ def _tickers_from_screens(screens: list[str], count: int) -> list[str]:
         for r in quotes:
             sym = (r.get("symbol") or "").upper()
             nm = (r.get("shortName") or r.get("longName") or "").lower()
-            if sym and r.get("quoteType") == "ETF" and not any(x in nm for x in _EXCLUDE_NAME):
-                if sym not in seen:
-                    seen[sym] = None
-                    kept += 1
+            if (sym and r.get("quoteType") == "ETF"
+                    and not any(x in nm for x in _EXCLUDE_NAME) and sym not in seen):
+                seen[sym] = None
+                kept += 1
         print(f"screen {name}: {len(quotes)} rows -> +{kept} new ETFs", file=sys.stderr)
     return list(seen)
 
@@ -293,11 +294,11 @@ def main(argv: list[str] | None = None) -> int:
             # ahead of SCHD). Anchors lead their role; curated rows are core by construction.
             rows_by_ticker.pop(c["ticker"], None)
             rows_by_ticker[c["ticker"]] = {
-                **c, "core": "1", "flavor": c.get("flavor", ""), "_aum": float("inf"),
+                **c, "core": "1", "flavor": c.get("flavor", ""), "_aum": "inf",
             }
         # Group by role, biggest-AUM first within each role → discovery's "top 3" = the giants.
-        out_rows = sorted(rows_by_ticker.values(), key=lambda r: (r["role"], -float(r.get("_aum", 0.0))))
-        out = open(args.out, "w", newline="", encoding="utf-8") if args.out else sys.stdout
+        out_rows = sorted(rows_by_ticker.values(), key=lambda r: (r["role"], -float(r.get("_aum", "0"))))
+        out = open(args.out, "w", newline="", encoding="utf-8") if args.out else sys.stdout  # noqa: SIM115 — closed in the finally below; a `with` can't also yield stdout  # noqa: SIM115 — closed in the finally below; a `with` can't also yield stdout
         try:
             writer = csv.DictWriter(out, fieldnames=("ticker", "name", "role", "summary", "core", "flavor"),
                                     extrasaction="ignore")
@@ -326,11 +327,11 @@ def main(argv: list[str] | None = None) -> int:
     for t in tickers:
         try:
             rows.append(_fetch(t))
-        except Exception as exc:  # a dev tool: report and keep going
+        except Exception as exc:  # noqa: BLE001 — a dev tool: report and keep going
             print(f"WARN {t}: {exc}", file=sys.stderr)
             rows.append({"ticker": t, "name": "", "role": "REVIEW", "summary": "[fetch failed]"})
 
-    out = open(args.out, "w", newline="", encoding="utf-8") if args.out else sys.stdout
+    out = open(args.out, "w", newline="", encoding="utf-8") if args.out else sys.stdout  # noqa: SIM115 — closed in the finally below; a `with` can't also yield stdout
     try:
         writer = csv.DictWriter(out, fieldnames=("ticker", "name", "role", "summary", "core", "flavor"))
         writer.writeheader()

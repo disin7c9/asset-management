@@ -22,12 +22,13 @@ from app.returns import (
     price_basis_mismatches,
     summarize,
     true_twr_annualized,
+    twr_cumulative,
     twr_index,
     value_curve,
 )
 from app.returns import (
-    _snap_to_index,  # noqa: PLC2701 — exercised directly in tests
-    _xirr_newton,  # noqa: PLC2701 — exercised directly in tests
+    _snap_to_index,  # private, but exercised directly in tests
+    _xirr_newton,
 )
 
 
@@ -520,3 +521,144 @@ def test_price_basis_mismatches_flags_a_trade_before_the_history_starts() -> Non
     # A later, in-history trade doesn't un-flag the ticker: the early one still poisons.
     events.append(Event(date(2024, 2, 3), "TRUNC", "buy", quantity=1.0, price=90.0, fee=0.0))
     assert price_basis_mismatches(events, series) == ["TRUNC"]
+
+
+# ── the contribution-day denominator (day-level Modified Dietz) ────────────
+
+
+def _flat_market(days: int = 6, price: float = 100.0) -> dict[str, "pd.Series[float]"]:
+    """A market that never moves: every honest daily return over it is exactly 0."""
+    idx = pd.bdate_range("2024-01-02", periods=days)
+    return {"AAA": pd.Series([price] * days, index=idx, dtype=float)}
+
+
+def test_a_contribution_cannot_manufacture_a_return_in_a_flat_market() -> None:
+    """The day's flow must be in the DENOMINATOR, not just netted out of the numerator.
+
+    The shares bought on day d enter `value` at the CLOSE while their cash leaves at the
+    EXECUTION price, so the fill→close move is already inside `gain(d)`. Dividing it by the
+    pre-flow V(d-1) alone credits new money's gain to old money — unboundedly, since the
+    error scales as flow / V(d-1). Here: a $99,500 purchase against a $100 position filled
+    0.5% below the close reported **+500%** for the day before this was fixed.
+    """
+    series = _flat_market()
+    events = [
+        Event(date(2024, 1, 2), "AAA", "buy", quantity=1.0, price=100.0, fee=0.0),
+        Event(date(2024, 1, 4), "AAA", "buy", quantity=1000.0, price=99.5, fee=0.0),
+    ]
+    daily = build_daily_returns(events, series, asof_date=date(2024, 1, 9))
+    # $500 of fill discount earned on the $99,600 actually at work that day.
+    assert daily.max() == pytest.approx(500.0 / 99_600.0, rel=1e-9)
+    assert daily.max() < 0.01  # not +500%
+
+
+def test_a_contribution_cannot_manufacture_a_fake_drawdown() -> None:
+    """The mirror case, and the one that matters most: a fill ABOVE the close books a
+    fabricated DOWN day — a drawdown that never happened — in a drawdown-first tool."""
+    series = _flat_market()
+    events = [
+        Event(date(2024, 1, 2), "AAA", "buy", quantity=1.0, price=100.0, fee=0.0),
+        Event(date(2024, 1, 4), "AAA", "buy", quantity=1000.0, price=100.5, fee=0.0),
+    ]
+    daily = build_daily_returns(events, series, asof_date=date(2024, 1, 9))
+    assert daily.min() == pytest.approx(-500.0 / 100_600.0, rel=1e-9)
+    assert daily.min() > -0.01  # not -500%
+
+
+def test_a_fill_at_the_close_leaves_the_day_flat() -> None:
+    """No slippage → no return. The flow must cancel exactly on both sides of the ratio,
+    or the fix would trade one bias for another."""
+    series = _flat_market()
+    events = [
+        Event(date(2024, 1, 2), "AAA", "buy", quantity=1.0, price=100.0, fee=0.0),
+        Event(date(2024, 1, 4), "AAA", "buy", quantity=1000.0, price=100.0, fee=0.0),
+    ]
+    daily = build_daily_returns(events, series, asof_date=date(2024, 1, 9))
+    assert daily.abs().max() == pytest.approx(0.0, abs=1e-12)
+
+
+def test_a_sell_at_the_close_leaves_the_day_flat() -> None:
+    """Same invariant for an outflow: sell_proceeds must leave the denominator as it
+    entered the numerator (flow is signed, not two independent terms)."""
+    series = _flat_market()
+    events = [
+        Event(date(2024, 1, 2), "AAA", "buy", quantity=100.0, price=100.0, fee=0.0),
+        Event(date(2024, 1, 4), "AAA", "sell", quantity=40.0, price=100.0, fee=0.0),
+    ]
+    daily = build_daily_returns(events, series, asof_date=date(2024, 1, 9))
+    assert daily.abs().max() == pytest.approx(0.0, abs=1e-12)
+
+
+def test_income_is_still_return_not_flow() -> None:
+    """A dividend is money the holdings EARNED, so it belongs in the numerator only —
+    it must not be added to the capital base the way a contribution is."""
+    series = _flat_market()
+    events = [
+        Event(date(2024, 1, 2), "AAA", "buy", quantity=10.0, price=100.0, fee=0.0),
+        Event(date(2024, 1, 4), "AAA", "dividend", quantity=0.0, price=0.0, fee=0.0, cash=50.0),
+    ]
+    daily = build_daily_returns(events, series, asof_date=date(2024, 1, 9))
+    assert daily.max() == pytest.approx(50.0 / 1_000.0, rel=1e-9)  # 5% on the $1,000 held
+
+
+def test_selling_the_whole_sleeve_reports_the_real_loss_not_minus_one_hundred() -> None:
+    """An OUTFLOW must not shrink the capital base — the money that left was still at work
+    before it left, and that stretch is already inside `gain`.
+
+    Found by code review of the fix for the contribution bug above: subtracting the day's
+    net flow symmetrically made `denom` collapse toward `gain` as a sale approached the
+    whole sleeve, so a routine exit 2% under the close printed **-100%** — a fabricated
+    catastrophe in a tool that leads with drawdown. Guard both the limit and the interior:
+    a partial exit must scale, or the fix could be 'right' only at the boundary."""
+    series = _flat_market()
+    buy = Event(date(2024, 1, 2), "AAA", "buy", quantity=100.0, price=100.0, fee=0.0)
+
+    full = [buy, Event(date(2024, 1, 4), "AAA", "sell", quantity=100.0, price=98.0, fee=0.0)]
+    daily = build_daily_returns(full, series, asof_date=date(2024, 1, 9))
+    assert daily.min() == pytest.approx(-0.02, rel=1e-9)      # $10,000 sold for $9,800
+
+    part = [buy, Event(date(2024, 1, 4), "AAA", "sell", quantity=40.0, price=98.0, fee=0.0)]
+    daily = build_daily_returns(part, series, asof_date=date(2024, 1, 9))
+    assert daily.min() == pytest.approx(-0.008, rel=1e-9)     # 40% of the book, 2% under
+
+
+def test_a_sell_that_funds_a_same_day_buy_counts_the_money_once() -> None:
+    """The base adds NET inflow, not gross buys: rotating a position within a day must not
+    double-count the same dollars and halve the reported return."""
+    idx = pd.bdate_range("2024-01-02", periods=6)
+    series = {
+        "AAA": pd.Series([100.0] * 6, index=idx, dtype=float),
+        "BBB": pd.Series([100.0, 100.0, 101.0, 101.0, 101.0, 101.0], index=idx, dtype=float),
+    }
+    events = [
+        Event(date(2024, 1, 2), "AAA", "buy", quantity=10.0, price=100.0, fee=0.0),
+        Event(date(2024, 1, 3), "AAA", "sell", quantity=10.0, price=100.0, fee=0.0),
+        Event(date(2024, 1, 3), "BBB", "buy", quantity=10.0, price=100.0, fee=0.0),
+    ]
+    daily = build_daily_returns(events, series, asof_date=date(2024, 1, 9))
+    # $1,000 was at work and earned $10 — +1.0%, not +0.5% off a doubled base.
+    assert daily.max() == pytest.approx(0.01, rel=1e-9)
+
+
+def test_the_annualization_floor_sits_above_the_blow_up_not_below_it() -> None:
+    """Regression: the floor was 20 observations — roughly four calendar weeks, and exactly
+    one observation BELOW the explosion it existed to prevent. A 20-day +25% book printed
+    '+1,563.7%' under the label 'Time-weighted (true TWR)'."""
+    def const(n: int, cum: float) -> "pd.Series[float]":
+        return pd.Series(
+            [(1 + cum) ** (1 / n) - 1] * n, index=pd.bdate_range("2026-01-01", periods=n)
+        )
+
+    assert true_twr_annualized(const(20, 0.25)) is None      # was +1563.7%
+    assert true_twr_annualized(const(125, 0.25)) is None
+    ann = true_twr_annualized(const(126, 0.25))              # half a trading year: allowed
+    assert ann is not None and ann < 1.0                     # and no longer absurd
+
+
+def test_a_short_window_still_reports_its_actual_growth() -> None:
+    """Refusing to annualize must not throw the information away: the cumulative figure is
+    defined at any length, because it is the exponent that explodes, not the growth."""
+    r = pd.Series([0.01] * 20, index=pd.bdate_range("2026-01-01", periods=20))
+    assert true_twr_annualized(r) is None
+    cum = twr_cumulative(r)
+    assert cum is not None and cum == pytest.approx(1.01**20 - 1.0, rel=1e-12)

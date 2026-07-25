@@ -38,7 +38,11 @@ _VALUE_DUST = 1e-6  # portfolio values below this are treated as "no position"
 # (e.g. 21% over 2 days → millions of % per year). Below these floors we
 # refuse to annualize and return None so the report shows "n/a".
 _MIN_ANNUALIZE_DAYS = 30      # calendar-day floor for MWR / Modified Dietz
-_MIN_ANNUALIZE_OBS = 20       # trading-day-observation floor for true TWR
+# ~half a trading year for true TWR. The old floor of 20 observations (~4 calendar weeks)
+# sat one observation BELOW the blow-up it was written to prevent: 20 days at +25% printed
+# "+1,563.7%" under the label "Time-weighted (true TWR)". Nothing is lost by raising it —
+# `twr_cumulative` carries the same window's actual growth, unannualized and labelled.
+_MIN_ANNUALIZE_OBS = 126
 
 
 class IRRError(ValueError):
@@ -65,6 +69,10 @@ class ReturnsSummary:
     # series in the composition root and folded in here. A plain value (no CI):
     # the bootstrapped-metric convention (MetricCI triples) is for risk.py only.
     true_twr_annualized: float | None = None
+    # The same window's CUMULATIVE time-weighted growth — no annualization, so it is
+    # defined at any length. Carries the figure when the window is too short to annualize
+    # honestly, instead of dropping the user to a bare `n/a`.
+    twr_cumulative: float | None = None
 
     @property
     def period_days(self) -> int:
@@ -198,6 +206,7 @@ def summarize(
     asof_date: date,
     *,
     true_twr: float | None = None,
+    twr_cum: float | None = None,
     fully_priced: bool = True,
 ) -> ReturnsSummary:
     """Compute the per-period numbers the report layer renders.
@@ -215,7 +224,8 @@ def summarize(
     weighted measure and is left as-is.)
     """
     if not events:
-        return ReturnsSummary(asof_date, asof_date, 0.0, 0.0, true_twr_annualized=true_twr)
+        return ReturnsSummary(asof_date, asof_date, 0.0, 0.0,
+                              true_twr_annualized=true_twr, twr_cumulative=twr_cum)
     # Period starts at the first *investment* event, not a funding deposit that may
     # precede the first buy — an idle cash gap would lengthen the annualization
     # window with no offsetting flow and dilute the money-weighted figures. (This
@@ -224,7 +234,8 @@ def summarize(
     invested = [ev.date for ev in events if ev.action not in ("deposit", "withdraw")]
     period_start = min(invested) if invested else min(ev.date for ev in events)
     if not fully_priced:
-        return ReturnsSummary(period_start, asof_date, None, None, true_twr_annualized=true_twr)
+        return ReturnsSummary(period_start, asof_date, None, None,
+                              true_twr_annualized=true_twr, twr_cumulative=twr_cum)
     cfs = cash_flows_from_events(events)
     period_days = (asof_date - period_start).days
     mwr = _mwr_from_cfs(cfs, current_value, asof_date)
@@ -236,6 +247,7 @@ def summarize(
         money_weighted_annualized=mwr,
         modified_dietz_annualized=md_ann,
         true_twr_annualized=true_twr,
+        twr_cumulative=twr_cum,
     )
 
 
@@ -392,8 +404,19 @@ def build_daily_returns(
     reflects investment performance, not contribution timing. Dividend/interest
     income is added back as return the holdings earned.
 
-        gain(d) = V(d) - V(d-1) - buy_cost(d) + sell_proceeds(d) + income(d)
-        r(d)    = gain(d) / V(d-1)        (only where V(d-1) > dust)
+        flow(d) = buy_cost(d) - sell_proceeds(d)                  (net external money in)
+        gain(d) = V(d) - V(d-1) - flow(d) + income(d)
+        r(d)    = gain(d) / (V(d-1) + flow(d))     (only where V(d-1) > dust)
+
+    **The denominator carries the day's flow** (a day-level Modified Dietz, the same
+    treatment `modified_dietz` applies over a window). It must: the shares bought on day
+    *d* enter `V(d)` at the CLOSE while their cash leaves at the EXECUTION price, so the
+    fill→close move is already inside `gain(d)`. Dividing that by the pre-flow $V(d-1)$
+    alone attributes new money's gain to old money. The error scales as
+    flow/V(d-1) and is unbounded: in a flat market where no price ever moved, buying 1000
+    shares at a 0.5% discount to the close against a $100 starting position produced a
+    +500% "daily return" — and a fill ABOVE the close manufactures a fake DOWN day, i.e. a
+    drawdown that never happened, in a tool that leads with drawdown.
 
     V(d) is `value_curve` (the priced sub-portfolio's market value); the cli passes
     it in precomputed (shared with the dollar drawdown). Empty Series if there is no
@@ -426,8 +449,21 @@ def build_daily_returns(
                 income[d] -= ev.fee
 
     prev_value = value.shift(1)
-    gain = value - prev_value - buy_cost + sell_proceeds + income
-    daily = gain / prev_value
+    flow = buy_cost - sell_proceeds  # net external money into the priced sub-portfolio
+    gain = value - prev_value - flow + income
+    # The capital that actually earned `gain`. Inflows and outflows are NOT symmetric here:
+    #   money IN  — a buy's shares land in V(d) at the CLOSE while its cash left at the
+    #               EXECUTION price, so the fill→close move is inside `gain`; the cash that
+    #               earned it must be in the base, or new money's gain is credited to old.
+    #   money OUT — a sell's shares are gone from V(d), but they were at work from the prior
+    #               close until the sale, and that stretch is ALSO inside `gain`. Subtracting
+    #               the proceeds would remove capital that genuinely earned part of the day.
+    #               Taken to the limit it is catastrophic: liquidating the whole sleeve makes
+    #               `denom` collapse toward `gain`, so an ordinary −2% exit printed −100%.
+    # So inflows raise the base and outflows leave it alone. Netting first (rather than adding
+    # gross buys) keeps a sell-funds-a-buy day honest — the same dollars can't count twice.
+    denom = prev_value + flow.clip(lower=0.0)
+    daily = gain / denom
     daily = daily[prev_value > _VALUE_DUST]  # only where prior value was a real position
     return daily.dropna()
 
@@ -448,8 +484,8 @@ def true_twr_annualized(daily_returns: "pd.Series[float]") -> float | None:
     calendar span) also means a cash gap mid-history neither dilutes nor
     inflates the figure.
 
-    Returns None when there are fewer than `_MIN_ANNUALIZE_OBS` return days
-    (annualizing a sub-month window explodes nonsensically).
+    Returns None below `_MIN_ANNUALIZE_OBS` return days — see `twr_cumulative`, which is
+    defined at any window length and is what the report prints instead.
     """
     n = len(daily_returns)
     if daily_returns.empty or n < _MIN_ANNUALIZE_OBS:
@@ -458,6 +494,16 @@ def true_twr_annualized(daily_returns: "pd.Series[float]") -> float | None:
     if total_growth <= 0.0:
         return None
     return float(total_growth ** (_TRADING_DAYS_PER_YEAR / n) - 1.0)
+
+
+def twr_cumulative(daily_returns: "pd.Series[float]") -> float | None:
+    """Total time-weighted growth over the window — NOT annualized, so it is honest at any
+    length. This is the figure to show when the window is too short to annualize: raising
+    something to the 252/n power is what explodes, not the underlying growth."""
+    if daily_returns.empty:
+        return None
+    total_growth = float((1.0 + daily_returns).prod())
+    return total_growth - 1.0 if total_growth > 0.0 else None
 
 
 def price_basis_mismatches(

@@ -133,6 +133,13 @@ def simulate(
 
     Rebalancing is value-preserving (no cash in/out): on a rebalance day the
     holdings are reset to the target weights at that day's prices.
+
+    **Basis contract — pass a TOTAL-RETURN series** (`prices.fetch_series(...,
+    basis="total_return")`). This function holds funds with no transaction log, so there is
+    nowhere for income to enter: on a raw close every coupon and dividend is booked as a
+    permanent loss, which understates return AND deepens drawdown for exactly the sleeves the
+    references lean on (60-40 is 40% BND; `permanent` is 25% BIL, whose return is entirely
+    coupon). Nothing here can detect the wrong basis — the callers own it.
     """
     tickers = _priced_tickers(series, target)
     if not tickers:
@@ -430,12 +437,25 @@ def _oos_figure_clause(oos: RoleWindow, baseline: str) -> str:
     the two reasons render the same statistics one way: 'Ulcer W vs WO <baseline>; CDaR W
     vs WO; max DD W vs WO (context)'. Ulcer is the verdict statistic, CDaR the tail check;
     max DD trails as descriptive context. Ulcer/CDaR print at 2dp so a gap near the 0.25pp
-    margin is legible; ``baseline`` labels the without-leg ('without', 'the reference', …)."""
-    return (
+    margin is legible; ``baseline`` labels the without-leg ('without', 'the reference', …).
+
+    The RETURN cost is printed too. The verdict is deliberately drawdown-first, but a
+    less-painful path is usually bought with return, and that price was already computed
+    here (`ret_with`/`ret_without`) and previously discarded — so a candidate could earn a
+    passing role on a favourable Ulcer while quietly costing percent-a-year. Stating it is
+    not a change of verdict; it is refusing to hide the trade-off behind the one it makes."""
+    clause = (
         f"Ulcer {oos.ulcer_with * 100:.2f}% vs {oos.ulcer_without * 100:.2f}% {baseline}; "
         f"CDaR {oos.cdar_with * 100:.2f}% vs {oos.cdar_without * 100:.2f}%; "
         f"max DD {oos.dd_with * 100:.1f}% vs {oos.dd_without * 100:.1f}% (context)"
     )
+    if oos.ret_with is not None and oos.ret_without is not None:
+        gap = (oos.ret_with - oos.ret_without) * 100
+        clause += (
+            f"; return {oos.ret_with * 100:+.1f}% vs {oos.ret_without * 100:+.1f}%/yr "
+            f"({gap:+.1f}pp, context)"
+        )
+    return clause
 
 
 def role_check(
@@ -553,7 +573,27 @@ def validate_from_role(rc: RoleCheck) -> bool:
     This is the ONLY sanctioned producer of ``validated=True`` for
     ``allocate(..., validated=)`` and ``strategy.may_suggest(..., backtest_validated=)``
     — an edge rule or AI-surfaced suggestion opens the gate by passing a real
-    walk-forward role check, never by a caller asserting it.
+    held-out role check, never by a caller asserting it.
+
+    **WHAT "improved" DOES NOT MEAN — read before writing the first caller.** It means the
+    held-out window's drawdown pain was lower, and nothing else. It is deliberately silent
+    about return, and that silence is not an oversight in the verdict — it is what
+    drawdown-first means. Measured on this exact function (200 trials, 5% sleeve, ~270
+    held-out days, `docs/reports/v2.12-AI-agent-reviews/verdict-calibration-2026-07-24.md`):
+    a candidate UNCORRELATED with the book genuinely lowers Ulcer even when it earns
+    nothing (true gain +0.32pp, positive in 94% of draws) — diversification alone buys
+    ~4.9% less volatility — and it *still* lowers Ulcer while destroying -15%/yr (true gain
+    +0.17pp, positive in 80%). So a high-fee, low-correlation product earns an honest
+    "improved" 8% of the time.
+
+    The verdict is right; using it alone as authorization would not be. **A caller must
+    check the return cost itself** — `rc.oos.ret_with` / `rc.oos.ret_without` carry it, and
+    `_oos_figure_clause` already renders it. This function is intentionally NOT given a
+    return veto: that would overload one word with two meanings and make every existing
+    "improved" ambiguous. Keep the verdict single-meaning; put the policy in the caller.
+
+    (There are no production callers today — every shipped rule is `discipline` and passes
+    the gate freely. This is a live contract for the first edge strategy, not dead code.)
     """
     return rc.verdict == "improved"
 

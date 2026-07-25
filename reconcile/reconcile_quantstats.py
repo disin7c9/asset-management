@@ -19,6 +19,7 @@ shared convention rather than looking like a discrepancy.
 
 from __future__ import annotations
 
+import sys
 from datetime import date
 from pathlib import Path
 
@@ -26,14 +27,27 @@ import quantstats as qs
 
 from app.backtest import backtest_compare, simulate
 from app.derive import derive
-from app.events import load_events
+from app.events import load_events, load_target
 from app.prices import fetch_series
 from app.returns import build_daily_returns, true_twr_annualized, twr_index
 from app.risk import calmar, max_drawdown, sharpe, sortino, summarize_risk
-from app.strategy import load_target
 
 _SAMPLE_CSV = Path("data/sample_data/transactions.csv")
 _SAMPLE_TARGET = Path("data/sample_data/target.csv")
+
+# The README claims agreement "to 4 decimals" — so that is the gate, not a 5% band.
+# The one legitimate exception is the CAGR row, where quantstats' calendar-day count
+# differs from our 365.25 convention; it carries its own stated tolerance.
+_TOL = 1e-4
+_FAILURES: list[str] = []
+
+
+def _check(name: str, ours: float, theirs: float, tol: float = _TOL) -> str:
+    """Record a comparison and return its flag. Any CHECK exits non-zero at the end."""
+    if abs(ours - theirs) < tol:
+        return "OK"
+    _FAILURES.append(f"{name}: ours={ours:+.6f} quantstats={theirs:+.6f} (tol {tol:g})")
+    return "CHECK"
 
 
 def main() -> None:
@@ -41,6 +55,8 @@ def main() -> None:
     derive(events)  # sanity: replay must succeed
     traded = sorted({ev.ticker for ev in events})
     start = min(ev.date for ev in events)
+    # RAW basis for the portfolio half: dividends are rows in the transaction log, so a
+    # dividend-adjusted close would count every one twice.
     series = fetch_series(traded, start, date.today())
     daily = build_daily_returns(events, series.rows, asof_date=date.today())
 
@@ -66,9 +82,9 @@ def main() -> None:
     twr_252 = total_growth ** (252.0 / n) - 1.0
     twr_365 = total_growth ** (365.25 / span_days) - 1.0
 
-    def row(name: str, ours: float, theirs: float, note: str = "") -> None:
+    def row(name: str, ours: float, theirs: float, note: str = "", tol: float = _TOL) -> None:
         delta = ours - theirs
-        flag = "OK" if abs(delta) < max(0.02, abs(theirs) * 0.05) else "CHECK"
+        flag = _check(name, ours, theirs, tol)
         print(f"  {name:24} ours={ours:+.4f}   quantstats={theirs:+.4f}   Δ={delta:+.4f}  [{flag}] {note}")
 
     print(f"\nPortfolio: {traded}   return-days={n}   span={span_days}d   total growth={total_growth:.4f}\n")
@@ -79,7 +95,10 @@ def main() -> None:
     print()
     print("ANNUALIZED RETURN (basis matters — see note)")
     row("TWR (252-day, ours)", our_twr_252 or float("nan"), twr_252, "← our reported figure")
-    row("CAGR (365-day, qs)", twr_365, qs_cagr, "← quantstats' basis; we match it when recomputed")
+    # 2e-3: quantstats counts calendar days differently than our 365.25 convention, so this
+    # row reconciles the BASIS, not the last decimal. Every other row is held to 1e-4.
+    row("CAGR (365-day, qs)", twr_365, qs_cagr, "← quantstats' basis; we match it when recomputed",
+        tol=2e-3)
     print(f"\n  Calmar (ours, no qs equiv shown): {our_calmar:+.4f}")
     print("\n  Interpretation: Sharpe/Sortino/MaxDD should match closely (independent libs).")
     print("  The two annualized-return rows differ only by 252-day vs 365-day basis;")
@@ -91,7 +110,12 @@ def main() -> None:
     print(f"\n  risk panel n_days={rk.n_days}  noisy={rk.is_noisy}  "
           f"maxDD CI=[{rk.max_drawdown_ci.low:+.4f}, {rk.max_drawdown_ci.high:+.4f}]")
 
-    _reconcile_backtest(series.rows)
+    # ...but the backtest half must reconcile what production actually computes, and
+    # `simulate` runs on TOTAL RETURN (it holds funds with no log, so a raw close books every
+    # coupon as a loss). Handing it `series.rows` reconciled a curve the tool never produces —
+    # and it passed, because both sides were computed from the same wrong basis.
+    tr = fetch_series(traded, start, date.today(), basis="total_return")
+    _reconcile_backtest(tr.rows)
 
 
 def _reconcile_backtest(series: dict) -> None:  # type: ignore[type-arg]
@@ -113,9 +137,15 @@ def _reconcile_backtest(series: dict) -> None:  # type: ignore[type-arg]
             (f"{leg.label} MaxDD", leg.risk.max_drawdown_ci.point, qs_maxdd),
         ):
             delta = ours - theirs
-            flag = "OK" if abs(delta) < max(0.02, abs(theirs) * 0.05) else "CHECK"
+            flag = _check(name, ours, theirs)
             print(f"  {name:28} ours={ours:+.4f}   quantstats={theirs:+.4f}   Δ={delta:+.4f}  [{flag}]")
 
 
 if __name__ == "__main__":
     main()
+    if _FAILURES:
+        print(f"\nRECONCILE FAILED — {len(_FAILURES)} metric(s) outside tolerance:", file=sys.stderr)
+        for line in _FAILURES:
+            print(f"  {line}", file=sys.stderr)
+        sys.exit(1)
+    print("\nRECONCILE OK — every metric within tolerance.")
