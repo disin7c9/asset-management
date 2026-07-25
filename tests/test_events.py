@@ -7,6 +7,7 @@ than only exercised indirectly through derive/cli.
 
 from __future__ import annotations
 
+import logging
 from datetime import date
 from math import isclose
 from pathlib import Path
@@ -374,3 +375,66 @@ def test_csv_dividend_with_quantity_collapses(tmp_path: Path) -> None:
     # income rule handles it (Price 0.62 × Quantity 5 → $3.10), while ours stays Quantity 0.
     assert isclose(load_events(_csv(tmp_path, _HEADER + "2024-02-01,VOO,YAHOO,USD,0.62,5,dividend,0,\n"))[0].cash, 3.10)
     assert load_events(_csv(tmp_path, _HEADER + "2024-02-01,VOO,YAHOO,USD,22.40,0,dividend,0,\n"))[0].cash == 22.40
+
+
+def test_a_target_that_does_not_sum_to_a_whole_warns_before_normalizing(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Weights are relative by design (percent and fractions both work), but that silently
+    # turns "VTI 50, BND 20" — plausibly someone reserving 30% cash — into 71.4/28.6, and on
+    # a complete-spec target that plan force-exits everything omitted. Normalizing is fine;
+    # doing it without a word is not.
+    p = tmp_path / "t.csv"
+    p.write_text("Ticker,Weight\nVTI,50\nBND,20\n", encoding="utf-8")
+    with caplog.at_level(logging.WARNING):
+        w = load_target(p)
+    assert abs(w["VTI"] - 0.714) < 0.001 and abs(w["BND"] - 0.286) < 0.001
+    assert "weights sum to 70" in caplog.text
+
+    # Both conventional spellings are silent — the warning must not cry wolf every run.
+    for text in ("Ticker,Weight\nVTI,60\nBND,40\n", "Ticker,Weight\nVTI,0.6\nBND,0.4\n"):
+        caplog.clear()
+        p.write_text(text, encoding="utf-8")
+        with caplog.at_level(logging.WARNING):
+            load_target(p)
+        assert "weights sum to" not in caplog.text
+
+
+def test_cash_cannot_be_a_target_weight(tmp_path: Path) -> None:
+    # CASH is the ledger's pseudo-ticker for external flows, not a security. Accepted as a
+    # target leg it reached the rebalance panel as "BUY 53.078 shares" of cash at a derived
+    # price. Refuse it at the boundary with the alternative named.
+    p = tmp_path / "t.csv"
+    p.write_text("Ticker,Weight\nVOO,50\nBND,20\nCASH,30\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="CASH cannot be a target weight"):
+        load_target(p)
+
+
+def test_a_ticker_that_is_not_a_ticker_is_refused_at_the_door(tmp_path: Path) -> None:
+    # The CSV loader is the path that reaches the filesystem, the price cache and every CSV
+    # we write; it only used to .upper() the symbol. Real symbols pass; a formula, a path
+    # traversal and an overlong blob do not.
+    p = tmp_path / "b.csv"
+    head = "Date,Code,DataSource,Currency,Price,Quantity,Action,Fee,Note\n"
+    for ok in ("BRK.B", "RDS-A", "VWRL.AS"):
+        p.write_text(head + f"2024-01-02,{ok},YAHOO,USD,10,1,buy,0,\n", encoding="utf-8")
+        assert load_events(p)[0].ticker == ok
+    for bad in ("=HYPERLINK(1)", "../../etc/passwd", "A" * 20):
+        p.write_text(head + f"2024-01-02,{bad},YAHOO,USD,10,1,buy,0,\n", encoding="utf-8")
+        with pytest.raises(ValueError, match="not a valid ticker"):
+            load_events(p)
+
+
+def test_a_target_ticker_cannot_escape_the_cache_directory(tmp_path: Path) -> None:
+    # load_target feeds fetch_series/fetch_latest, which name cache files
+    # `cache_dir / f"{ticker}…"`. An unvalidated ticker therefore writes parquet OUTSIDE
+    # the cache dir — the invariant mcp_server enforces on its own free-text argument.
+    # Validating only load_events left this, the second file-fed path, wide open.
+    p = tmp_path / "t.csv"
+    p.write_text("Ticker,Weight\n../../../../tmp/evil,60\nVOO,40\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="not a valid ticker"):
+        load_target(p)
+
+    # Real symbols with dots and hyphens still load.
+    p.write_text("Ticker,Weight\nBRK.B,50\nRDS-A,50\n", encoding="utf-8")
+    assert set(load_target(p)) == {"BRK.B", "RDS-A"}

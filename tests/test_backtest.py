@@ -223,6 +223,33 @@ def test_role_check_clone_is_inconclusive() -> None:
     assert "no clear out-of-sample improvement" in rc.reason
 
 
+def test_the_figure_clause_prints_the_return_cost_of_a_drawdown_win() -> None:
+    # The verdict is drawdown-first, so a candidate can earn "improved" on Ulcer while
+    # costing percent-a-year — measured: an uncorrelated fund losing 15%/yr still lowers
+    # Ulcer 80% of the time. Both figures were already computed here and were being
+    # discarded. Rendering the cost is what stops a drawdown win reading as a free one.
+    from app.backtest import RoleWindow, _oos_figure_clause
+
+    def win(ret_wo: float | None, ret_w: float | None) -> RoleWindow:
+        return RoleWindow(
+            label="out-of-sample", start=date(2025, 1, 1), end=date(2025, 6, 1), n_days=100,
+            dd_without=-0.18, dd_with=-0.12, ulcer_without=0.10, ulcer_with=0.06,
+            cdar_without=0.15, cdar_with=0.14, vol_without=0.15, vol_with=0.13,
+            ret_without=ret_wo, ret_with=ret_w,
+        )
+
+    clause = _oos_figure_clause(win(0.130, 0.160), "without")
+    assert "return +16.0% vs +13.0%/yr (+3.0pp, context)" in clause
+
+    # A candidate that smooths the ride while LOSING money must say so in the same breath.
+    assert "return -15.0% vs +13.0%/yr (-28.0pp, context)" in _oos_figure_clause(
+        win(0.130, -0.150), "without"
+    )
+
+    # Absent returns stay absent — never a fabricated 0.0pp.
+    assert "return" not in _oos_figure_clause(win(None, None), "without")
+
+
 def test_oos_verdict_gates_name_their_cause() -> None:
     # The three verdict gates (v2.9.0) each name what blocked them; the cause lands in
     # role_check / benchmark_compare reasons so "inconclusive" is never unexplained.

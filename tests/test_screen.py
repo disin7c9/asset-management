@@ -7,6 +7,7 @@ from datetime import date, datetime, timezone
 
 import pandas as pd
 
+from app.backtest import in_sample_end
 from app.metadata import SecurityMeta
 from app.screen import (
     CandidateScreen,
@@ -299,7 +300,11 @@ def test_role_row_maps_verdicts_and_carries_values() -> None:
     assert c.values["oos_ulcer_with"] == 0.05 and c.values["oos_cdar_without"] == 0.18
     assert c.values["sleeve"] == 0.05
 
-    for verdict, status in (("worsened", "fail"), ("inconclusive", "warn"),
+    # "inconclusive" is n/a, not warn: the test ran and concluded nothing, which is the
+    # same absence of evidence as "insufficient" (it could not run). It is also the MAJORITY
+    # outcome on a few years of history — as warn it fired on 24/24 candidates and made PASS
+    # unreachable whenever a --target was supplied.
+    for verdict, status in (("worsened", "fail"), ("inconclusive", "n/a"),
                             ("insufficient", "n/a")):
         rc2 = RoleCheck("CAND", 0.05, "quarterly", (), verdict, "…")  # type: ignore[arg-type]
         assert _check(_screen_one(role={"CAND": rc2}), "role").status == status
@@ -330,9 +335,11 @@ def _flat_then_drop(n_flat: int, n_low: int, level: float) -> "pd.Series[float]"
     return pd.Series(vals, index=idx, dtype=float)
 
 
-def test_own_drawdown_warns_when_deeper_than_the_book() -> None:
-    # The disclosure the diversifier check can't make: a fund can PASS on correlation
-    # while carrying drawdowns deeper than anything the book has lived through.
+def test_own_drawdown_warns_on_the_absolute_equity_scale_bar() -> None:
+    # The disclosure the diversifier check can't make: a fund can PASS on correlation while
+    # falling like equity on its own. This bar is ABSOLUTE (_OWN_DD_WARN), so it holds with
+    # no peer and no book — unlike the old "deeper than your book" trigger, which compared
+    # one asset against a diversified blend and therefore fired on almost anything.
     from app.risk import max_drawdown
     from app.screen import _check_own_drawdown
 
@@ -340,7 +347,8 @@ def test_own_drawdown_warns_when_deeper_than_the_book() -> None:
     book_dd = max_drawdown(_flat_then_drop(400, 400, 90.0))  # the book's worst: -10%
     r = _check_own_drawdown(cand, book_dd)
     assert r.status == "warn"
-    assert "deeper than your book" in r.reason
+    assert "equity-scale drawdowns of its own" in r.reason
+    assert "deeper than your book" not in r.reason  # the tautological trigger is gone
     assert r.values is not None and r.values["depth"] < -0.4
 
 
@@ -379,3 +387,151 @@ def test_own_drawdown_non_date_index_degrades_not_raises() -> None:
     r = _check_own_drawdown(s, None)
     assert r.status == "n/a"
     assert "date index" in r.reason
+
+
+# --- selection sits INSIDE the split (v2.12.1) ---
+
+
+def _split_series(n: int, seed: int) -> "tuple[pd.Series[float], pd.Series[float]]":
+    """A portfolio and a candidate over the same calendar, both driven by one RNG."""
+    import numpy as np
+
+    rng = np.random.default_rng(seed)
+    idx = pd.bdate_range("2019-01-02", periods=n)
+    port = pd.Series(rng.normal(0.0004, 0.011, n), index=idx, dtype=float)
+    cand = pd.Series(rng.normal(0.0003, 0.012, n), index=idx, dtype=float)
+    return port, (1.0 + cand).cumprod() * 100.0
+
+
+def test_the_held_out_window_cannot_influence_which_candidates_are_selected() -> None:
+    # THE selection-leak test. When a role check follows, this screen gates what reaches it,
+    # so it must not read the window that check holds out. Proof by construction: rewrite the
+    # held-out tail of the candidate into something wildly different and demand the screen's
+    # verdict not move by one character. Without a role check there is no selection step, and
+    # the same rewrite MUST show up — that asymmetry is the whole fix.
+    port, close = _split_series(600, seed=7)
+    tampered = close.copy()
+    cut = in_sample_end(port.index)
+    assert cut is not None
+    # A violent, obviously-visible tail: perfectly correlated with the book and collapsing.
+    tail = tampered.index > cut
+    tampered.loc[tail] = tampered.loc[tail].iloc[0] * pd.Series(
+        [0.5 ** (i / 50.0) for i in range(int(tail.sum()))], index=tampered.index[tail]
+    )
+
+    # The trigger is that a role check FOLLOWS, i.e. the dict exists; its contents only
+    # feed the separate `role` row (n/a here), never the cut.
+    role: dict[str, object] = {}
+    gated_clean = _screen_one(close=close, port=port, role=role)
+    gated_tampered = _screen_one(close=tampered, port=port, role=role)
+    assert [(c.name, c.status, c.reason) for c in gated_clean.checks] == [
+        (c.name, c.status, c.reason) for c in gated_tampered.checks
+    ], "the held-out window changed a gating verdict — the leak is back"
+
+    # Control: with no role check the screen is descriptive, not selective, so it sees all.
+    described_clean = _screen_one(close=close, port=port)
+    described_tampered = _screen_one(close=tampered, port=port)
+    assert _check(described_clean, "own-drawdown").reason != _check(
+        described_tampered, "own-drawdown"
+    ).reason, "the control never saw the tail — the test proves nothing"
+
+
+def test_gated_figures_name_the_window_they_were_computed_over() -> None:
+    # The number that gates must be the number shown: when the series are cut, every
+    # return-bearing reason says so, and the structural checks stay unlabelled (they read
+    # full history and carry no return information, so nothing can leak through them).
+    port, close = _split_series(600, seed=11)
+    cut = in_sample_end(port.index)
+    assert cut is not None
+    r = _screen_one(close=close, port=port, meta=_meta(), role={})
+
+    for name in ("diversifier", "own-drawdown"):
+        assert f"[in-sample through {cut.date()}]" in _check(r, name).reason
+    for name in ("cost", "liquidity", "age", "concentration"):
+        assert "in-sample" not in _check(r, name).reason
+
+    # And a bare --screen (no target, no role check) carries no such label at all.
+    bare = _screen_one(close=close, port=port, meta=_meta())
+    assert "in-sample" not in _check(bare, "diversifier").reason
+
+
+def _role_with_in_sample_end(end: str) -> object:
+    """A RoleCheck carrying only what the cut reads: its in-sample window's end date."""
+    from datetime import date as _d
+
+    from app.backtest import RoleCheck, RoleWindow
+
+    y, m, dd = (int(x) for x in end.split("-"))
+    win = RoleWindow(
+        label="in-sample", start=_d(2019, 1, 2), end=_d(y, m, dd), n_days=200,
+        dd_without=-0.1, dd_with=-0.1, ulcer_without=0.05, ulcer_with=0.05,
+        cdar_without=0.1, cdar_with=0.1, vol_without=0.1, vol_with=0.1,
+        ret_without=None, ret_with=None,
+    )
+    return RoleCheck(candidate="CAND", sleeve=0.05, schedule="never",
+                     windows=(win,), verdict="inconclusive", reason="x")
+
+
+def test_the_cut_follows_role_checks_own_window_not_the_books() -> None:
+    # role_check splits ITS OWN common window (candidate ∩ target price history), not the
+    # book's return index. When a candidate's series ends before the book's — delisted,
+    # halted, or a staler cache entry — its real split lands EARLIER, and a cutoff derived
+    # only from the book reads months past it, back into the window being protected.
+    port, close = _split_series(600, seed=3)
+    book_cut = in_sample_end(port.index)
+    assert book_cut is not None
+
+    early = (book_cut - pd.Timedelta(days=200)).date().isoformat()
+    r = _screen_one(close=close, port=port, role={"CAND": _role_with_in_sample_end(early)})
+    shown = _check(r, "diversifier").reason
+    assert f"[in-sample through {early}]" in shown, (
+        f"cut at the book's boundary, not the candidate's: {shown}"
+    )
+
+    # And it only ever cuts MORE: a role window ending after the book's cutoff must not
+    # widen the screen back out to the candidate's later split.
+    late = (book_cut + pd.Timedelta(days=200)).date().isoformat()
+    r2 = _screen_one(close=close, port=port, role={"CAND": _role_with_in_sample_end(late)})
+    assert f"[in-sample through {book_cut.date()}]" in _check(r2, "diversifier").reason
+
+
+def test_the_cut_never_breaks_the_never_raises_contract() -> None:
+    # screen.py's contract is "degrades per-check, never raises" — _check_own_drawdown has an
+    # explicit guard for a series with no date index. The truncation runs BEFORE the checks,
+    # outside that guard, so it must not become the one place the module throws.
+    port, _ = _split_series(400, seed=5)
+    no_dates = pd.Series([100.0, 101.0, 99.0] * 150, dtype=float)  # RangeIndex
+
+    r = _screen_one(close=no_dates, port=port, role={})   # must not raise
+    assert r.verdict in ("pass", "warn", "fail", "n/a")
+    assert _check(r, "own-drawdown").status == "n/a"
+
+
+def test_own_drawdown_compares_against_a_held_fund_not_the_blend() -> None:
+    # A candidate is ONE asset; the book is a blend, and a blend falls less than its parts by
+    # construction. Judging a fund against the blended book therefore fired on nearly every
+    # equity fund — on the bundled example it would have flagged 3 of the 4 funds the book
+    # already holds (VOO -19.0%, IAU -26.4%, VEA -14.4% vs a blend of -9.8%). The honest peer
+    # is the deepest-falling fund already in the book.
+    from app.risk import DrawdownInfo
+    from app.screen import _check_own_drawdown
+
+    cand = _flat_then_drop(400, 260, 82.0)      # ~-18% over ~2.6y
+    blend = DrawdownInfo(depth=-0.098, peak_date=date(2025, 2, 19),
+                         trough_date=date(2025, 4, 8), recovery_date=None,
+                         duration_days=48, time_underwater_pct=0.5)
+
+    # Deeper than the BLEND but shallower than a fund actually held → not a warning.
+    ok = _check_own_drawdown(cand, blend, "", ("IAU", -0.264))
+    assert ok.status == "pass"
+    assert "shallower than IAU" in ok.reason
+    assert "-26.4%" in ok.reason
+
+    # Deeper than the worst thing held → a real finding, and it names the peer.
+    worse = _check_own_drawdown(cand, blend, "", ("BND", -0.088))
+    assert worse.status == "warn"
+    assert "deeper than anything you hold" in worse.reason and "BND" in worse.reason
+
+    # With no peer available the blend is still reported, as context only.
+    none = _check_own_drawdown(cand, blend, "", None)
+    assert "your book's worst is -9.8%" in none.reason

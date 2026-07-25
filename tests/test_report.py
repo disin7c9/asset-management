@@ -6,6 +6,7 @@ summaries directly so we never touch the network or the price cache.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 
 import pytest
@@ -180,6 +181,30 @@ def test_na_when_returns_degenerate(state, prices) -> None:
     out = render_text(build_report_data(state, prices, degenerate, None))
     assert "Time-weighted (true TWR):                n/a" in out
     assert "(n/a = period too short to annualize, or no real solution)" in out
+
+
+def test_a_too_short_window_shows_cumulative_growth_labelled_not_annualized(
+    state, prices
+) -> None:
+    # A young book can't state a per-year TWR honestly (returns._MIN_ANNUALIZE_OBS), but its
+    # actual growth is real and known. Printing only `n/a` threw it away; printing it bare
+    # would invite reading a 53-day figure as a rate. So it renders, explicitly labelled.
+    young = ReturnsSummary(
+        period_start=date(2026, 5, 30),
+        asof_date=date(2026, 6, 2),
+        money_weighted_annualized=None,
+        modified_dietz_annualized=None,
+        true_twr_annualized=None,
+        twr_cumulative=-0.0268,
+    )
+    out = render_text(build_report_data(state, prices, young, None))
+    assert "Time-weighted (true TWR):                n/a" in out
+    assert "cumulative so far (NOT annualized):  -2.68%" in out
+    assert "too short to state a per-year rate honestly" in out
+
+    # No cumulative figure → no line at all (never a bare 0.00%).
+    bare = replace(young, twr_cumulative=None)
+    assert "cumulative so far" not in render_text(build_report_data(state, prices, bare, None))
 
 
 def test_holdings_only_when_no_risk_no_returns(state) -> None:
@@ -374,3 +399,73 @@ def test_shelf_index_drill_hint_skips_blank_flavors() -> None:
     )
     text = "\n".join(_section_discoveries(all_blank, []).lines)
     assert "e.g. --discover" not in text  # no runnable example exists → no hint line
+
+
+def test_a_sub_cent_net_never_prints_a_signed_zero() -> None:
+    # Cash-neutral reallocations sum the same dollars on both sides, but float addition
+    # is not associative, so net lands ~1e-13 either way. Branching on exact zero while
+    # printing cents produced `net -$0.00 (cash freed)`: sign, label and amount all
+    # disagreeing in one line. Sign and label must follow the number actually shown.
+    from app.report import _section_suggestions
+
+    def sugg(tk: str, action: str, dollars: float) -> Suggestion:
+        return Suggestion(ticker=tk, action=action, shares=1.0, dollars=dollars,
+                          current_weight=0.5, target_weight=0.5,
+                          rule="to_total", reason="x")
+
+    # 0.1 + 0.2 != 0.3 in binary: the classic residue, landing just below zero.
+    below = _section_suggestions([sugg("A", "buy", 0.3), sugg("B", "sell", 0.1),
+                                  sugg("C", "sell", 0.2)])
+    text = "\n".join(below.lines)
+    assert "-$0.00" not in text
+    assert "cash-neutral" in text and "cash freed" not in text
+
+    # A real one-cent difference is NOT swallowed — the threshold is the printed precision.
+    real = _section_suggestions([sugg("A", "buy", 1.00), sugg("B", "sell", 1.01)])
+    assert "cash freed" in "\n".join(real.lines)
+
+
+def test_totals_stay_comparable_when_a_holding_is_unpriced(returns) -> None:
+    # Cost basis spans every holding; market value can only span the priced ones. Reading
+    # one against the other across different sets shows a loss the size of the missing
+    # position's cost — the panel contradicting itself while the warning sits elsewhere.
+    s = DerivedState()
+    s.positions["VOO"] = Position("VOO", shares=10.0, cost_basis=3000.0)
+    s.positions["DARK"] = Position("DARK", shares=5.0, cost_basis=2500.0)  # no price
+    now = datetime.now(timezone.utc)
+    priced = {"VOO": PriceRow("VOO", date(2026, 6, 2), 320.0, "series", now)}
+
+    out = render_text(build_report_data(s, priced, returns, None))
+    assert "Total cost basis (held): $5,500.00" in out
+    assert "of which priced:      $3,000.00" in out
+    assert "1 holding(s) unpriced" in out
+    assert "Market value (priced):   $3,200.00" in out
+
+    # Fully priced → no subtotal line at all (it would be noise).
+    s2 = DerivedState()
+    s2.positions["VOO"] = Position("VOO", shares=10.0, cost_basis=3000.0)
+    assert "of which priced" not in render_text(build_report_data(s2, priced, returns, None))
+
+
+def test_discovery_panel_states_whether_the_role_check_ran(state, prices) -> None:
+    # The panel looks identical with and without a target, but with one the candidates also
+    # face the held-out role check and the return-based checks are cut to the in-sample
+    # window. The only previous trace was an ABSENT "using ASSET_TARGET from .env" line in
+    # stderr startup noise — an absence is not something a reader can notice.
+    from app.discover import Discovery
+    from app.report import _section_discoveries
+    from app.screen import CandidateScreen, CheckResult
+    from app.universe import Candidate
+
+    cand = Candidate(ticker="VNQ", name="Vanguard Real Estate", role="reit",
+                     summary="", core=True, flavor="us")
+    disc = Discovery(gaps=("reit",), exposure={"reit": 0.0}, candidates=(cand,))
+    cost = CheckResult("cost", "pass", "0.12% — cheap")
+
+    off = _section_discoveries(disc, [CandidateScreen("VNQ", (cost,))])
+    assert any("Held-out role check: OFF" in ln for ln in off.lines)
+    assert any("--target" in ln for ln in off.lines)   # and how to turn it on
+
+    role = CheckResult("role", "n/a", "OOS (…) with a 5% sleeve: …")
+    on = _section_discoveries(disc, [CandidateScreen("VNQ", (cost, role))])
+    assert any("Held-out role check: ON" in ln for ln in on.lines)

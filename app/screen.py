@@ -23,7 +23,7 @@ Per-field degradation carries through: a missing fact makes that ONE check
 
 A "pass" here is necessary, not sufficient: it means the candidate is a sane,
 cheap, liquid, genuinely-different instrument — NOT a prediction. The
-walk-forward **role check** (did adding it actually improve drawdown/vol on a
+held-out **role check** (did adding it actually improve drawdown/vol on a
 held-out window?) is the edge gate's evidence: `backtest.role_check` computes
 it, and when the caller supplies its results a `role` row joins the checks.
 """
@@ -38,7 +38,7 @@ from typing import Literal
 
 import pandas as pd
 
-from app.backtest import RoleCheck
+from app.backtest import RoleCheck, in_sample_end
 from app.metadata import SecurityMeta
 from app.returns import twr_index
 from app.risk import DrawdownInfo, max_drawdown
@@ -189,14 +189,19 @@ def _check_diversifier(
     cand_close: "pd.Series[float] | None",
     portfolio_returns: "pd.Series[float]",
     portfolio_dd: DrawdownInfo | None,
+    window_note: str = "",
 ) -> CheckResult:
     """The role test: does it move differently from what you already own?
 
-    Three views, one verdict: full-period Pearson ρ (the gate), ρ on your red
+    Three views, one verdict: Pearson ρ over the judged window (the gate), ρ on your red
     days (diversification that vanishes in stress is the classic trap), and the
     candidate's return during your worst drawdown window (the bluntest, most
     legible fact). `portfolio_dd` is candidate-independent, so the caller
     computes it once and passes it in.
+
+    `window_note` labels the span these figures were computed over. It is non-empty exactly
+    when a role check follows and the series were cut to the in-sample side (see
+    `screen_candidates`) — the number that gates must be the number shown.
     """
     if cand_close is None or cand_close.empty or portfolio_returns.empty:
         return CheckResult("diversifier", "n/a", "no usable price history")
@@ -259,7 +264,7 @@ def _check_diversifier(
     if status == "pass" and downside is not None and downside - rho > _DOWNSIDE_ESCALATE:
         status = "warn"
         parts.append("diversification weakens exactly on your red days")
-    return CheckResult("diversifier", status, "; ".join(parts), values)
+    return CheckResult("diversifier", status, "; ".join(parts) + window_note, values)
 
 
 # The candidate's own worst fall: history shorter than this is n/a (a young fund's shallow
@@ -271,12 +276,21 @@ _OWN_DD_WARN = -0.30
 def _check_own_drawdown(
     cand_close: "pd.Series[float] | None",
     portfolio_dd: DrawdownInfo | None,
+    window_note: str = "",
+    held_worst: tuple[str, float] | None = None,
 ) -> CheckResult:
-    """The candidate's OWN worst price fall over its fetched history, vs the book's worst.
+    """The candidate's OWN worst price fall over the judged window, vs the book's worst.
 
     The drawdown-first disclosure the diversifier check can't make: long treasuries or
     junk bonds PASS on correlation (they do move differently) while carrying equity-scale
-    drawdowns of their own — the computed number says so; the tool never editorializes."""
+    drawdowns of their own — the computed number says so; the tool never editorializes.
+
+    `window_note` is non-empty when a role check follows and the series was cut to the
+    in-sample side. That cut costs history — usually ~30%, but MORE when the candidate's own
+    span is shorter than the book's, and in the limit the truncated series is empty — so a
+    fund can drop below `_OWN_DD_MIN_YEARS` (or to "no usable price history") here that would
+    have been judged on full history. An honest n/a is the right answer; the alternative is
+    choosing on the held-out window."""
     if cand_close is None or cand_close.empty:
         return CheckResult("own-drawdown", "n/a", "no usable price history")
     try:
@@ -289,27 +303,43 @@ def _check_own_drawdown(
         return CheckResult(
             "own-drawdown", "n/a",
             f"only {years:.1f}y of history (< {_OWN_DD_MIN_YEARS:.0f}y) — too short to judge; "
-            "a young fund's shallow drawdown is false comfort",
+            "a young fund's shallow drawdown is false comfort" + window_note,
         )
     dd = max_drawdown(cand_close)
     if dd is None or dd.depth >= 0:
-        return CheckResult("own-drawdown", "pass", f"no drawdown in {years:.1f}y of history")
+        return CheckResult(
+            "own-drawdown", "pass", f"no drawdown in {years:.1f}y of history" + window_note
+        )
     values: dict[str, float] = {"depth": dd.depth, "history_years": years}
     desc = f"worst fall {dd.depth * 100:.1f}% ({dd.peak_date}→{dd.trough_date}) in {years:.1f}y"
-    if portfolio_dd is not None and portfolio_dd.depth < 0:
-        values["book_depth"] = portfolio_dd.depth
-        if dd.depth < portfolio_dd.depth:
+    # Compare LIKE WITH LIKE. The old bar was the blended book's worst fall, but a single
+    # fund almost always falls harder than a diversified mix — that is what diversification
+    # IS — so the trigger was near-tautological: on the bundled example it would have flagged
+    # 3 of the 4 funds the book already holds (VOO -19.0%, IAU -26.4%, VEA -14.4% against a
+    # blend of -9.8%). The honest peer is the deepest-falling fund you ALREADY own: clearing
+    # that says "no worse than what you live with", and failing it is a real fact about this
+    # candidate. The blend is still reported, as context, because it is what you actually felt.
+    if held_worst is not None and held_worst[1] < 0:
+        peer_tk, peer_depth = held_worst
+        values["held_worst_depth"] = peer_depth
+        if dd.depth < peer_depth:
             return CheckResult(
                 "own-drawdown", "warn",
-                f"{desc} — deeper than your book's worst ({portfolio_dd.depth * 100:.1f}%)",
+                f"{desc} — deeper than anything you hold "
+                f"(worst: {peer_tk} {peer_depth * 100:.1f}%)" + window_note,
                 values,
             )
-        desc += f"; your book's worst is {portfolio_dd.depth * 100:.1f}%"
+        desc += f"; shallower than {peer_tk}, which you already hold ({peer_depth * 100:.1f}%)"
+    if portfolio_dd is not None and portfolio_dd.depth < 0:
+        values["book_depth"] = portfolio_dd.depth
+        if held_worst is None:
+            desc += f"; your book's worst is {portfolio_dd.depth * 100:.1f}%"
     if dd.depth <= _OWN_DD_WARN:
         return CheckResult(
-            "own-drawdown", "warn", f"{desc} — equity-scale drawdowns of its own", values
+            "own-drawdown", "warn",
+            f"{desc} — equity-scale drawdowns of its own" + window_note, values,
         )
-    return CheckResult("own-drawdown", "pass", desc, values)
+    return CheckResult("own-drawdown", "pass", desc + window_note, values)
 
 
 def _check_overlap(
@@ -354,16 +384,23 @@ def _check_overlap(
     return CheckResult("overlap", "n/a", "no look-through holdings to compare")
 
 
+# Verdict → screen status. "inconclusive" is n/a, NOT warn: the test ran and reached no
+# conclusion, which is an absence of evidence exactly like its sibling "insufficient" (the
+# test could not run at all) — not a finding against the candidate. Measured 2026-07-24, the
+# held-out check returns inconclusive in 77–100% of trials on ~3y of personal history, so
+# mapping it to warn fired on 24/24 candidates and made PASS unreachable on the
+# `--discover --target` path. The full reason text still prints under `--screen TICKER`;
+# the DISCOVERY panel shows only warn/fail rows, so browsing stays uncluttered.
 _ROLE_STATUS: dict[str, CheckStatus] = {
     "improved": "pass",
     "worsened": "fail",
-    "inconclusive": "warn",
+    "inconclusive": "n/a",
     "insufficient": "n/a",
 }
 
 
 def _check_role(rc: RoleCheck | None) -> CheckResult:
-    """The walk-forward role check's verdict as a screen row (evidence behind
+    """The held-out role check's verdict as a screen row (evidence behind
     the edge gate: judged on the held-out window only)."""
     if rc is None:
         return CheckResult("role", "n/a", "role check unavailable for this candidate")
@@ -389,16 +426,81 @@ def screen_candidates(
     *,
     asof: date,
     role: dict[str, RoleCheck] | None = None,
+    held_worst: tuple[str, float] | None = None,
 ) -> list[CandidateScreen]:
-    """Run every check per candidate. Pure; degrades per-check, never raises."""
-    # The portfolio's worst drawdown window is candidate-independent: compute once.
-    portfolio_dd: DrawdownInfo | None = None
-    if not portfolio_returns.empty and float(portfolio_returns.std()) > 0.0:
-        portfolio_dd = max_drawdown(twr_index(portfolio_returns))
+    """Run every check per candidate. Pure; degrades per-check, never raises.
+
+    SELECTING vs DESCRIBING. When `role` is supplied this screen is a **gate in front of**
+    the held-out role check: a candidate that fails here never reaches that verdict. Judging
+    the gate on full history would pick candidates using the very window `role_check` then
+    holds out — held out from the final comparison, but not from the choosing, which is the
+    part that makes an out-of-sample number mean anything. So the return-bearing checks
+    (correlation, red-day ρ, drawdown-window return, own drawdown) are cut to the in-sample
+    side. The structural facts — cost, liquidity, age, concentration, overlap,
+    leveraged/inverse structure — carry no return information, so nothing can leak through
+    them and they stay on full history, where they are strongest.
+
+    The cut is **per candidate**, and takes the boundary from that candidate's OWN
+    `RoleCheck` window when one exists, falling back to `in_sample_end` over the book's
+    return index. Deriving it from the book alone was wrong: `role_check` splits its own
+    `common` window (candidate ∩ target price history), so when a candidate's series ends
+    before the book's — delisted, halted, or just a staler cache entry — its real split
+    lands EARLIER and a book-derived cutoff reads months past it, back into the window this
+    exists to protect. Taking the tighter of the two can only ever cut more, never less.
+
+    Without `role` (a bare `--screen TICKER`) there is no selection step and nothing to
+    protect: you named the ticker, so every check runs on everything available.
+    """
+    book_cutoff = (
+        in_sample_end(portfolio_returns.index)
+        if role is not None and not portfolio_returns.empty
+        else None
+    )
+
+    def _role_cutoff(tk: str) -> "pd.Timestamp | None":
+        """The end of the in-sample window `role_check` actually judged for this candidate."""
+        rc = role.get(tk) if role is not None else None
+        if rc is None:
+            return None
+        win = next((w for w in rc.windows if w.label == "in-sample"), None)
+        return pd.Timestamp(win.end) if win is not None else None
+
+    # Truncating the book's series and re-deriving its drawdown is the expensive part, and
+    # most candidates share one cutoff — memoize on the date so the common case pays once.
+    _ctx: dict[object, tuple["pd.Series[float]", DrawdownInfo | None]] = {}
+
+    def _context(cut: "pd.Timestamp | None") -> tuple["pd.Series[float]", DrawdownInfo | None]:
+        if cut not in _ctx:
+            pr = (
+                portfolio_returns
+                if cut is None
+                else portfolio_returns[portfolio_returns.index <= cut]
+            )
+            dd = (
+                max_drawdown(twr_index(pr))
+                if not pr.empty and float(pr.std()) > 0.0
+                else None
+            )
+            _ctx[cut] = (pr, dd)
+        return _ctx[cut]
 
     out: list[CandidateScreen] = []
     for tk in candidates:
         m = meta.get(tk)
+        close = candidate_close.get(tk)
+        # The tighter of the two boundaries — never read past what role_check held out.
+        cuts = [c for c in (book_cutoff, _role_cutoff(tk)) if c is not None]
+        cutoff = min(cuts) if cuts else None
+        window_note = f" [in-sample through {cutoff.date()}]" if cutoff is not None else ""
+        if cutoff is not None and close is not None:
+            try:
+                close = close[close.index <= cutoff]
+            except TypeError:
+                # A series without a date index cannot be windowed. The per-check guards
+                # below already answer "n/a" for it; this module promises to degrade per
+                # check and NEVER raise, so the slice must not be the one place it does.
+                close = None
+        portfolio_window, portfolio_dd = _context(cutoff)
         checks: list[CheckResult] = []
         if tk in held:
             checks.append(
@@ -410,10 +512,10 @@ def screen_candidates(
         checks.append(_check_liquidity(m))
         checks.append(_check_age(m, asof))
         checks.append(_check_concentration(m))
-        checks.append(_check_diversifier(candidate_close.get(tk), portfolio_returns, portfolio_dd))
-        checks.append(_check_own_drawdown(candidate_close.get(tk), portfolio_dd))
+        checks.append(_check_diversifier(close, portfolio_window, portfolio_dd, window_note))
+        checks.append(_check_own_drawdown(close, portfolio_dd, window_note, held_worst))
         checks.append(_check_overlap(m, held_meta))
-        if role is not None:  # a target was supplied → the walk-forward evidence row
+        if role is not None:  # a target was supplied → the held-out evidence row
             checks.append(_check_role(role.get(tk)))
         out.append(CandidateScreen(ticker=tk, checks=tuple(checks)))
         log.info("screened %s: %s", tk, out[-1].verdict)

@@ -14,7 +14,7 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Iterable
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, timedelta
 from typing import TYPE_CHECKING, Any
 
 from pathlib import Path
@@ -49,7 +49,13 @@ from app.returns import (
     twr_index,
     value_curve,
 )
-from app.risk import DollarDrawdown, RiskSummary, dollar_drawdown, summarize_risk
+from app.risk import (
+    DollarDrawdown,
+    RiskSummary,
+    dollar_drawdown,
+    max_drawdown,
+    summarize_risk,
+)
 
 log = logging.getLogger(__name__)
 
@@ -131,6 +137,30 @@ def load_book(
     if changed:
         log.info("split-adjusted share counts for: %s", ", ".join(changed))
     return adjusted, derive(adjusted)
+
+
+def deepest_held(
+    series: "SeriesResult | None", held: set[str]
+) -> tuple[str, float] | None:
+    """The held fund with the worst own drawdown — the screen's like-with-like peer bar.
+
+    A candidate is one asset; the BOOK is a blend, and a blend falls less than its parts by
+    construction, so "deeper than your book" fires on nearly any equity fund (it would flag
+    3 of the bundled example's own 4 holdings). The fair question is whether a candidate
+    falls harder than the worst thing already in the book."""
+    if series is None:
+        return None
+    worst: tuple[str, float] | None = None
+    for tk in sorted(held):
+        s = series.rows.get(tk)
+        if s is None or s.empty:
+            continue
+        dd = max_drawdown(s)
+        if dd is None or dd.depth >= 0:
+            continue
+        if worst is None or dd.depth < worst[1]:
+            worst = (tk, dd.depth)
+    return worst
 
 
 def record_series_fetch(run: dict[str, Any], series: SeriesResult) -> None:
@@ -312,9 +342,19 @@ def compute_prices_returns_risk(
                     # status "partial", MWR/Dietz and dollar-DD suppressed, rebalance
                     # refused), and the exclusion above keeps it out of TWR & risk.
                     continue
-                source, fetched_at = series.provenance.get(
-                    tk, ("cache", datetime.now(timezone.utc))
-                )
+                prov = series.provenance.get(tk)
+                if prov is None:
+                    # No stamp means we do not know where this close came from or when.
+                    # The old default invented one — ("cache", now()) — which renders a
+                    # price of unknown origin as freshly cached, 0 hours old: the one field
+                    # whose job is to let the reader distrust a number claiming maximum
+                    # confidence precisely where it knows least. Unreachable today (every
+                    # `rows[]` site sets provenance), but `provenance` defaults to an empty
+                    # dict, so any future construction site would inherit the lie for free.
+                    # Same answer as the stale tail above: no price beats a forged pedigree.
+                    log.warning("no provenance for %s — leaving it unpriced", tk)
+                    continue
+                source, fetched_at = prov
                 prices[tk] = PriceRow(
                     ticker=tk,
                     asof_date=s.index[-1].date(),

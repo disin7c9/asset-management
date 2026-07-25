@@ -38,7 +38,6 @@ from __future__ import annotations
 import logging
 import math
 import os
-import re
 from collections.abc import Collection
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -52,6 +51,7 @@ from mcp.types import ToolAnnotations
 from pydantic import BaseModel, Field
 
 from app.pipeline import (
+    deepest_held,
     HISTORY_DAYS,
     cache_is_cold,
     candidate_and_held_facts,
@@ -72,7 +72,7 @@ from app.backtest import (
 )
 from app.derive import DerivedState
 from app.discover import Discovery, find_gaps, role_menu
-from app.events import CASH_TICKER, Event, load_events, load_target
+from app.events import CASH_TICKER, TICKER_RE, Event, load_events, load_target
 from app.log_config import setup_logging
 from app.metadata import fetch_metadata
 from app.prices import PriceRow, SeriesResult, fetch_series
@@ -675,7 +675,7 @@ class ProposedAllocation(BaseModel):
     )
     verdict: BenchmarkVerdict | None = Field(
         None,
-        description="walk-forward held-out drawdown comparison; null when the reference "
+        description="held-out recent-window drawdown comparison; null when the reference "
         "history isn't cached (see validation_note) or validation was skipped",
     )
     validation_note: str
@@ -1044,7 +1044,7 @@ def screen_candidate(ticker: str) -> CandidateVerdict:
     tk = ticker.strip().upper()
     if not tk or tk == CASH_TICKER:
         raise ValueError(f"{ticker!r} is not a screenable security.")
-    if not re.fullmatch(r"[A-Z0-9.\-]{1,15}", tk):
+    if not TICKER_RE.fullmatch(tk):
         # The one free-text argument on this surface: reject anything that isn't a
         # plain ticker (no path separators / traversal), upholding the "bound to one
         # book, can't point at an arbitrary file" invariant.
@@ -1086,7 +1086,12 @@ def screen_candidate(ticker: str) -> CandidateVerdict:
         [tk], held, cache, online_candidate=online, online_held=False,
     )
     results = screen_candidates(
-        [tk], cand_series.rows, b.daily, cand_meta, held_facts, held, asof=today, role=None
+        [tk], cand_series.rows, b.daily, cand_meta, held_facts, held, asof=today, role=None,
+        # Same peer bar the CLI uses. Omitting it here would leave this surface comparing a
+        # single fund against the BLENDED book — a bar a diversified book almost always
+        # clears, and the sixth hand-maintained CLI/MCP divergence in a codebase that
+        # already lists five as a known weakness.
+        held_worst=deepest_held(b.series, held),
     )
     r = results[0]
     checks = [
@@ -1164,7 +1169,7 @@ def _benchmark_verdict(
     annotations=_read_only("Propose an allocation", fetches=True),
     description="Propose a strategic target allocation for a risk posture (conservative / "
     "moderate / aggressive) over the user's book + the curated universe, and validate it "
-    "against a canonical reference (60-40 / all-weather / permanent) with a walk-forward "
+    "against a canonical reference (60-40 / all-weather / permanent) with a held-out "
     "held-out drawdown verdict. Use to answer 'what should a moderate portfolio look like for "
     "me, and is it sound'. Propose-only: never trades, never a recommendation or return "
     "forecast — every weight comes from the deterministic core. The weights are always "

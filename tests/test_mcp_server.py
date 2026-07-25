@@ -1221,3 +1221,20 @@ def test_every_tool_that_can_answer_on_demo_data_says_so(monkeypatch: pytest.Mon
         if sc is None or "note" not in sc:
             continue  # the tool errored for an unrelated reason (no target file, etc.)
         assert "DEMO DATA" in sc["note"], f"{tool} did not disclose demo data: {sc['note'][:120]}"
+
+
+def test_screen_candidate_uses_the_same_peer_bar_as_the_cli(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # own-drawdown compares a candidate against the deepest fund the user HOLDS, not against
+    # the blended book (a blend falls less than its parts, so that bar is near-tautological).
+    # The CLI got that peer; this surface calls the same screen and must pass the same thing,
+    # or the two answer differently for one ticker — the hand-maintained-parity failure mode
+    # this codebase already carries five of.
+    import inspect
+
+    from app.mcp_server import screen_candidate
+
+    src = inspect.getsource(screen_candidate)
+    assert "held_worst=" in src, "MCP screen_candidate no longer passes the peer bar"
+    assert "deepest_held(" in src, "MCP must use the shared helper, not its own copy"

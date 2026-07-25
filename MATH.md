@@ -82,7 +82,7 @@ cannot honestly represent that case).
 $$
 R_{\text{ann}}=(1+R)^{1/y}-1,\qquad y=\frac{\text{days}}{365.25}.
 $$
-Refused (→ None) for windows under $30$ days; a total loss ($1+R\le 0$) returns $-1$.
+Refused (→ None) for windows under $183$ days (half a year — the one floor shared by every measure in the RETURNS panel, §12.4); a total loss ($1+R\le 0$) returns $-1$.
 
 ---
 
@@ -136,7 +136,7 @@ so return and risk are comparable; a cash gap neither dilutes nor inflates it):
 $$
 R_{\text{TWR}}=\Bigl(\prod_{\tau}(1+r(\tau))\Bigr)^{252/n}-1 .
 $$
-Returns None for $n<20$ observations.
+Returns None for $n<126$ observations (half a trading year — §12.4).
 
 ### 2.6 Split-mismatch detector — `price_basis_mismatches`
 Flags an unhandled split when a trade's execution price diverges from the price *history* by a factor $\phi=2$:
@@ -434,21 +434,36 @@ $$
 require $n_{\text{is}}\ge 60$ **and** $n_{\text{oos}}\ge 60$ else the verdict is **insufficient**. Fresh
 capital each window; legs date-aligned by inner join (never positional truncation).
 
-**Known limitation — selection sits OUTSIDE the split.** The *evaluation* above is clean: nothing
-is tuned, and the statistics are computed on the held-out window alone. But on the `--discover`
-path the candidate is chosen upstream by `screen.py`, whose correlation and drawdown-window checks
-read the **full** history — including the very window this split then holds out. So a fund that
-happened to behave well in that window is somewhat likelier to be the one you are shown, and the
-verdict about it is not fully independent of it. This is why the output says *held-out
-recent-window*, not *walk-forward*: a walk-forward guarantee requires selection to happen inside
-the training window, repeatedly.
+**Selection sits inside the split (v2.12.1).** The *evaluation* was always clean: nothing is
+tuned, and the statistics are computed on the held-out window alone. Selection was not. On the
+`--discover` path the candidate is chosen upstream by `screen.py`, and its correlation and
+drawdown-window checks read the **full** history — including the window this split then holds
+out. A fund that happened to behave well there was likelier to be the one you were shown, so the
+verdict about it was not independent of the data it was measured on.
 
-Two things bound the damage. Most screen checks carry no return information at all (expense ratio,
-liquidity, fund age, leveraged/inverse rejection, holdings overlap), and the screen is a pass/fail
-**gate rather than a ranker** — threshold pressure is far weaker than an optimizer's. When you name
-the ticker yourself (`--screen SCHD`) there is no selection step, so no leak. The fix — computing
-the return-based checks on the in-sample window only when a role check will follow — is recorded as
-the first item of the next patch.
+`screen_candidates` now separates the two jobs. When a role check will follow, the return-bearing
+checks — Pearson $\rho$, red-day $\rho$, drawdown-window return, and the candidate's own drawdown —
+are computed on the in-sample window only. The cut is **per candidate** and takes the tighter
+of two boundaries: that candidate's own `RoleCheck` in-sample window end, and
+`backtest.in_sample_end` over the book's return index. Taking the candidate's own window is
+what makes the guarantee hold — `role_check` splits its OWN common window (candidate ∩ target
+price history), so a candidate whose series ends before the book's (delisted, halted, or a
+staler cache entry) has an EARLIER real split, and a book-derived cutoff alone would read past
+it. The minimum can only ever cut more, never less. Every figure so computed is labelled
+`[in-sample through YYYY-MM-DD]`: what gates is what is shown. The structural checks — expense
+ratio, liquidity, fund age, concentration, holdings overlap, leveraged/inverse rejection — carry no
+return information, so nothing can leak through them and they keep reading full history, where they
+are most informative. Naming the ticker yourself (`--screen SCHD`) has no selection step, so nothing
+is cut.
+
+The cut has a price, and it is paid in the honest direction: with ~30% less history the candidate
+has less room to fall, so a fund near the two-year `own-drawdown` floor now returns **n/a** where it
+previously gave a verdict. Refusing to judge is the correct answer when the only way to judge would
+be to look at the held-out window.
+
+This still is not **walk-forward**, and the output still says *held-out recent-window*. Walk-forward
+means repeated re-fitting across rolling origins; this is one split, judged once. What changed is
+that the one split is now honest on both sides of the line.
 
 ### 12.4 Window statistics — `_window_stats`
 Per leg (with-candidate, without), over the held-out window: **Ulcer index** (§5.4 — the verdict
@@ -511,7 +526,7 @@ noise band — the property that keeps the gate from passing overfit noise.
 | trading days / year | $252$ | returns, risk, backtest | annualization basis |
 | calendar days / year | $365.25$ | returns, metadata | CAGR, fund age |
 | risk-free rate | $0$ | risk | Sharpe/Sortino |
-| min days to annualize | $30$ (MWR/MD), $20$ obs (TWR) | returns | refuse short windows |
+| min to annualize | $183$ d (MWR/MD), $126$ obs (TWR) — one duration, §12.4 | returns | refuse short windows |
 | noisy threshold | $504$ days | risk | flag thin samples |
 | bootstrap resamples $B$ | $1000$ | risk, backtest | CI precision |
 | CI level $c$ | $0.95$ | risk, backtest | band width |

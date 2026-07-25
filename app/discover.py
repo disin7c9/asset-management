@@ -25,7 +25,7 @@ a gap is always role-level ("you hold no treasuries"), never shelf-level ("you l
 long-duration"), because that would be duration/sector advice.
 
 This core never predicts — it only surfaces *where you have nothing* and *what could fill
-it*. The screen + walk-forward role check vet the candidates; the AI edge (ranking /
+it*. The screen + held-out role check vet the candidates; the AI edge (ranking /
 explaining among them) narrates in P3b.
 """
 

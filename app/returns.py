@@ -35,14 +35,20 @@ _TRADING_DAYS_PER_YEAR = 252.0  # matches empyrical's daily annualization basis
 _VALUE_DUST = 1e-6  # portfolio values below this are treated as "no position"
 
 # Annualizing a return over a very short window explodes nonsensically
-# (e.g. 21% over 2 days → millions of % per year). Below these floors we
-# refuse to annualize and return None so the report shows "n/a".
-_MIN_ANNUALIZE_DAYS = 30      # calendar-day floor for MWR / Modified Dietz
-# ~half a trading year for true TWR. The old floor of 20 observations (~4 calendar weeks)
-# sat one observation BELOW the blow-up it was written to prevent: 20 days at +25% printed
-# "+1,563.7%" under the label "Time-weighted (true TWR)". Nothing is lost by raising it —
-# `twr_cumulative` carries the same window's actual growth, unannualized and labelled.
-_MIN_ANNUALIZE_OBS = 126
+# (e.g. 21% over 2 days → millions of % per year). Below this floor we refuse to
+# annualize and return None so the report shows "n/a".
+#
+# ONE floor for the whole RETURNS panel, in two units. The measures count time
+# differently — TWR has a return series and annualizes on the 252-trading-day basis,
+# while MWR (an XIRR span) and Modified Dietz work in calendar days — so a single
+# constant would have to mean two different durations. Deriving both from one number
+# keeps them the same LENGTH of time, which is what the reader compares. They were
+# allowed to disagree once (20 obs vs 30 calendar days) and the panel printed
+# "Time-weighted: n/a" two lines above "Money-weighted (IRR): +49.57%" on a 53-day
+# book: the strict measure refusing while the looser one annualized the same window.
+_MIN_ANNUALIZE_YEARS = 0.5
+_MIN_ANNUALIZE_DAYS = round(_MIN_ANNUALIZE_YEARS * _DAYS_PER_YEAR)            # 183 calendar
+_MIN_ANNUALIZE_OBS = round(_MIN_ANNUALIZE_YEARS * _TRADING_DAYS_PER_YEAR)     # 126 observations
 
 
 class IRRError(ValueError):
@@ -135,7 +141,7 @@ def _mwr_from_cfs(
     t0 = min(cf.date for cf in cfs_full)
     span_days = (asof_date - t0).days
     if span_days < _MIN_ANNUALIZE_DAYS:
-        # Annualizing an IRR over a sub-month window is meaningless.
+        # Annualizing an IRR over less than half a year is meaningless.
         return None
     pairs = [((cf.date - t0).days / _DAYS_PER_YEAR, cf.amount) for cf in cfs_full]
     if all(amt <= 0 for _, amt in pairs) or all(amt >= 0 for _, amt in pairs):
@@ -187,7 +193,8 @@ def annualize_return(period_return: float | None, days: int) -> float | None:
     """Convert a period return to an annualized rate.
 
     Returns None when the input is None or the window is shorter than
-    `_MIN_ANNUALIZE_DAYS` (annualizing a sub-month return explodes nonsensically).
+    `_MIN_ANNUALIZE_DAYS` (~half a year; annualizing a shorter return explodes
+    nonsensically — 21% over 2 days is millions of % per year).
     """
     if period_return is None:
         return None

@@ -1279,3 +1279,18 @@ def test_the_latest_cache_still_refuses_a_close_past_the_staleness_floor(
     monkeypatch.setattr(P, "_fetch_tiingo_json", lambda t, s, e, **k: None)
     P.fetch_latest(["DEAD"], date(2026, 1, 6), cache_dir=tmp_path, online=True)
     assert P._from_cache("DEAD", date(2026, 6, 1), tmp_path, allow_stale=True) is None
+
+
+def test_a_small_clock_step_does_not_invalidate_every_cache() -> None:
+    # WSL/VM resume and NTP both step the clock; a file written just before a step is
+    # legitimately stamped ahead. With zero tolerance that one step failed all four caches
+    # at once and the tool blamed a cold cache — the wrong diagnosis, and the user re-fetches
+    # everything. Minutes of grace are physical; hours are a tampered file and still refused.
+    from app.prices import _CLOCK_SKEW_GRACE, _now_utc, fresh
+
+    now = _now_utc()
+    ttl = timedelta(hours=20)
+    assert fresh(now + timedelta(minutes=1), ttl, what="x")          # inside the grace
+    assert fresh(now + _CLOCK_SKEW_GRACE - timedelta(seconds=5), ttl, what="x")
+    assert not fresh(now + _CLOCK_SKEW_GRACE + timedelta(minutes=1), ttl, what="x")
+    assert not fresh(now + timedelta(days=1), ttl, what="x")         # nonsense, still refused

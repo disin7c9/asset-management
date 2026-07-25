@@ -374,6 +374,23 @@ _CHECK_WORDS: dict[str, dict[str, str]] = {
 }
 
 
+_MAX_LABEL_NAME = 80
+
+
+def _one_line(text: str) -> str:
+    """Collapse a provider-controlled string to a single bounded line.
+
+    Fund names come from the metadata provider and from `ASSET_UNIVERSE`, which a user can
+    repoint at any CSV — neither is ours. They are interpolated into the claim label, and
+    the label is rendered into the prompt as one `{{token}} — label` LINE per claim. A name
+    carrying a newline therefore writes new lines into the prompt, where anything after it
+    reads as further instructions to the narrator. The fence still stops fabricated FIGURES
+    (the renderer substitutes validated values), but prose direction is not numeric, so this
+    is the layer that has to hold. Collapsing whitespace removes the mechanism entirely.
+    """
+    return " ".join(text.split())[:_MAX_LABEL_NAME]
+
+
 def _fit_phrase(screen: CandidateScreen) -> str:
     """A number-free role-fit phrase from the screen's headline checks (cost / liquidity
     / overlap / diversifier) — the qualitative judgement the model may echo. The exact
@@ -411,7 +428,7 @@ def build_discovery_claims(
         r = by_ticker.get(c.ticker)
         if r is None:
             continue
-        label = f"{c.name}, a {c.role} fund — the screen rates it {r.verdict.upper()}"
+        label = f"{_one_line(c.name)}, a {c.role} fund — the screen rates it {r.verdict.upper()}"
         fit = _fit_phrase(r)
         if fit:
             label += f" ({fit})"
@@ -466,7 +483,7 @@ def build_discovery_prompt(claim_set: dict[str, Claim], *, tier: str) -> tuple[s
 #
 # The SAME fence, pointed at --benchmark's result. The note is drawdown-first and HONEST:
 # where the posture's drawdown landed vs a canonical reference (60-40 / all-weather /
-# permanent), with the walk-forward verdict injected as FIXED framing — never "beats" /
+# permanent), with the held-out verdict injected as FIXED framing — never "beats" /
 # "outperforms", never a forward prediction. Only the two legs' drawdown DEPTHS and the
 # reference's name are citable figures; the verdict is words the prompt pins, so the model
 # can't strengthen "no clear difference" into a win.
@@ -529,7 +546,7 @@ _BENCHMARK_SYSTEM_PROMPT = (
     "conservative / moderate / aggressive preset mix) compares to a well-known reference "
     "portfolio — DRAWDOWN-FIRST.\n"
     "You are given each side's overall drawdown pain (its Ulcer index) and ONE fixed verdict "
-    "sentence stating what a held-out (walk-forward) test found. Put that verdict in plain "
+    "sentence stating what a held-out recent-window test found. Put that verdict in plain "
     "words for the owner.\n"
     "HARD RULES:\n"
     "- Refer to every figure AND the reference's name ONLY by its {{token}} placeholder. "

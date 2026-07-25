@@ -47,6 +47,14 @@ log = logging.getLogger(__name__)
 
 _CACHE_DIR_DEFAULT = Path("data/prices")
 _CACHE_TTL = timedelta(hours=20)  # roughly one business day
+# A future `fetched_at` means a tampered or corrupted cache file, so it is refused — but not
+# every future stamp is a lie. WSL and suspended VMs step their clock on resume, NTP corrects
+# drift in both directions, and a file written seconds before such a step is legitimately
+# "ahead". Without slack that one step invalidates ALL FOUR caches at once and the tool
+# reports "the cache looks cold", sending the user to re-fetch everything over a wrong
+# diagnosis. This grace is physical (clock corrections are seconds-to-minutes), not a
+# weakening of the check: anything further ahead is still refused.
+_CLOCK_SKEW_GRACE = timedelta(minutes=5)
 # Don't pass off a close older than this as a "current" price — beyond it, report the holding
 # unpriced rather than quote a stale close. The brief is weekly, so ~10 days covers a normal gap
 # (plus a little slack); older than that, calling the price "current" would mislead — a
@@ -382,15 +390,16 @@ def _coerce_fetched_at(value: object) -> datetime | None:
 def fresh(
     fetched_at: datetime, ttl: timedelta, *, what: str, allow_stale: bool = False
 ) -> bool:
-    """The one freshness gate for every on-disk cache: reject a future-stamped row
-    (clock skew / tampered file) and anything older than ``ttl``. Centralized so the
+    """The one freshness gate for every on-disk cache: reject a row stamped more than
+    ``_CLOCK_SKEW_GRACE`` in the future (a tampered file; minutes of physical clock
+    correction are tolerated — see the constant) and anything older than ``ttl``. Centralized so the
     rule can't drift between the latest-price, series, splits, and metadata caches
     (public: `metadata.py` imports it). ``allow_stale`` (set by offline reads) keeps the
     future-stamp rejection but waives the age limit: the TTL exists to force a re-fetch,
     and offline there is nothing to fetch — serving the newest cached value (honestly
     dated) beats returning nothing."""
     now = _now_utc()
-    if fetched_at > now:
+    if fetched_at > now + _CLOCK_SKEW_GRACE:
         log.warning(
             "cache for %s has fetched_at in the future (%s > %s); refusing",
             what, fetched_at, now,

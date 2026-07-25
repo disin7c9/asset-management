@@ -152,11 +152,33 @@ def test_annualize_doubles_for_half_year_return() -> None:
 
 
 def test_annualize_refuses_short_window() -> None:
-    # Below the ~30-day floor, annualizing is meaningless → None (not a number).
+    # Below the half-year floor, annualizing is meaningless → None (not a number).
+    from app.returns import _MIN_ANNUALIZE_DAYS
+
     assert annualize_return(0.10, 0) is None
     assert annualize_return(0.10, 2) is None
-    assert annualize_return(0.10, 29) is None
-    assert annualize_return(0.10, 30) is not None
+    assert annualize_return(0.10, _MIN_ANNUALIZE_DAYS - 1) is None
+    assert annualize_return(0.10, _MIN_ANNUALIZE_DAYS) is not None
+
+
+def test_every_return_measure_annualizes_from_the_same_duration() -> None:
+    # The panel prints TWR, MWR and Modified Dietz side by side, so their floors must be
+    # the same LENGTH OF TIME even though they count it in different units (TWR on the
+    # 252-trading-day basis, MWR/Dietz in calendar days). When they disagreed, a 53-day
+    # book printed "Time-weighted: n/a" directly above "Money-weighted (IRR): +49.57%".
+    from app.returns import (
+        _DAYS_PER_YEAR,
+        _MIN_ANNUALIZE_DAYS,
+        _MIN_ANNUALIZE_OBS,
+        _TRADING_DAYS_PER_YEAR,
+    )
+
+    calendar_years = _MIN_ANNUALIZE_DAYS / _DAYS_PER_YEAR
+    trading_years = _MIN_ANNUALIZE_OBS / _TRADING_DAYS_PER_YEAR
+    assert abs(calendar_years - trading_years) < 0.01, (
+        f"the floors describe different durations: {calendar_years:.3f}y of calendar vs "
+        f"{trading_years:.3f}y of trading — the panel will contradict itself again"
+    )
 
 
 def test_annualize_passes_through_none() -> None:

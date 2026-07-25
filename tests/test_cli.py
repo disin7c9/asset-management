@@ -202,7 +202,7 @@ def test_rebalance_skips_when_holdings_unpriced(
 
     monkeypatch.setattr("app.cli.fetch_latest", empty_fetch)
     rc = main(["--csv", str(SAMPLE), "--no-risk", "--rebalance", "to_total", "--target", str(TARGET)])
-    assert rc == 0
+    assert rc == 1  # nothing priced at all → the run is blind, and a cron must hear about it
     out = capsys.readouterr().out
     assert "SUGGESTED ACTIONS" not in out  # skipped, not partial/wrong
     assert "=== HOLDINGS ===" in out
@@ -280,7 +280,11 @@ def test_cli_backtest_renders_section(
 
     def fake_fetch_series(tickers, *a, **k):  # type: ignore[no-untyped-def]
         present = {tk: rows[tk] for tk in tickers if tk in rows}
-        return SeriesResult(rows=present, missing=[tk for tk in tickers if tk not in rows])
+        # Provenance for every row, as the real adapter always does: a row without one
+        # is now refused rather than stamped ("cache", now()). See pipeline's guard.
+        prov = {tk: ("cache", datetime.now(timezone.utc)) for tk in present}
+        return SeriesResult(rows=present, missing=[tk for tk in tickers if tk not in rows],
+                            provenance=prov)
 
     monkeypatch.setattr("app.cli.fetch_series", fake_fetch_series)
     # --no-prices skips the holdings price panel; --backtest still fetches series.
@@ -481,7 +485,11 @@ def test_screen_with_target_adds_role_row(
     assert rc == 0
     assert "] role:" in out and "OOS" in out
     assert "held-out simulation, not a prediction" in out  # footer switched
-    assert _run_summary(caplog)["screen"] == "QQQM:warn"
+    # The role row no longer drags the verdict: an INCONCLUSIVE held-out check is n/a, not
+    # warn — absence of evidence, like its sibling "insufficient". As warn it fired on the
+    # majority outcome and made PASS unreachable whenever a --target was supplied.
+    assert _run_summary(caplog)["screen"] == "QQQM:pass"
+    assert "[ n/a] role:" in out
 
 
 def test_screen_drops_cash_pseudo_ticker(
@@ -658,8 +666,8 @@ def test_discover_satellites_only_when_named(
 def test_discover_with_target_runs_the_role_check(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
 ) -> None:
-    # --discover --target: discovered gap-fillers now also get the walk-forward role check
-    # (#1) — the same held-out evidence a hand-typed --screen candidate gets.
+    # --discover --target: discovered gap-fillers also get the held-out role check (#1)
+    # — the same evidence a hand-typed --screen candidate gets.
     from app.metadata import MetadataResult, SecurityMeta
 
     now = datetime.now(timezone.utc)
@@ -690,11 +698,24 @@ def test_discover_with_target_runs_the_role_check(
             }
         ),
     )
+    # Assert the CHECK RAN, not that a row rendered: the DISCOVERY panel prints only
+    # warn/fail rows, and an inconclusive role verdict is n/a, so the row is deliberately
+    # absent while browsing. `--screen TICKER` still shows it in full (covered separately).
+    import app.cli as C
+
+    seen: list[str] = []
+    real = C.role_check
+
+    def spy(series, target, tk, **k):  # type: ignore[no-untyped-def]
+        seen.append(tk)
+        return real(series, target, tk, **k)
+
+    monkeypatch.setattr(C, "role_check", spy)
     rc = main(["--csv", str(SAMPLE), "--discover", "reit", "--target", str(TARGET)])
     out = capsys.readouterr().out
     assert rc == 0
     assert "DISCOVERY (roles you're light in" in out
-    assert "role:" in out  # the walk-forward role check ran for the discovered candidates
+    assert seen, "the held-out role check never ran for the discovered candidates"
 
 
 def test_metadata_not_double_fetched_with_screen(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1091,7 +1112,7 @@ def test_offline_never_touches_the_network(
         P, "_fetch_tiingo_json", lambda *a, **k: pytest.fail("network call in --offline")
     )
     rc = main(["--csv", str(SAMPLE), "--offline", "--cache-dir", str(tmp_path)])
-    assert rc == 0
+    assert rc == 1  # cold cache + offline = nothing priced; the brief prints, the exit warns
     assert "=== HOLDINGS ===" in capsys.readouterr().out
 
 
@@ -1466,7 +1487,10 @@ def _split_vol_series(tickers, *_a, **_k):  # type: ignore[no-untyped-def]
         rows[tk] = pd.Series(
             [100.0 + (i % 2) * step for i in range(n)], index=dates, dtype=float
         )
-    return SeriesResult(rows=rows, missing=[], provenance={})
+    # Real fetches always stamp provenance; an empty dict is an object the adapter never
+    # produces, and pipeline now refuses to price from one rather than invent a stamp.
+    prov = {tk: ("cache", datetime.now(timezone.utc)) for tk in rows}
+    return SeriesResult(rows=rows, missing=[], provenance=prov)
 
 
 def _weights_from(path: Path) -> dict[str, float]:
@@ -1549,7 +1573,8 @@ def test_allocate_surfaces_omitted_holding(
             for tk in tickers if tk != "VOO"
         }
         missing = ["VOO"] if "VOO" in tickers else []
-        return SeriesResult(rows=rows, missing=missing, provenance={})
+        prov = {tk: ("cache", datetime.now(timezone.utc)) for tk in rows}
+        return SeriesResult(rows=rows, missing=missing, provenance=prov)
 
     monkeypatch.setattr("app.cli.fetch_series", drop_voo)
     rc = main(["--csv", str(SAMPLE), "--allocate", "equal_weight", "--allocate-out", str(tmp_path / "t.csv")])
@@ -2135,6 +2160,35 @@ def test_warm_core_fetches_book_and_refs(
     assert _run_summary(caplog)["warm"].startswith("core:")
 
 
+def test_warm_reports_partial_when_the_total_return_pass_missed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # The simulation basis is a SECOND pass over its own cache files and can fail alone
+    # (Yahoo throttles the second full batch of a run). Printing "Warmed the offline cache"
+    # and exiting 0 would send the user to --backtest --offline to be told to warm the cache
+    # they just warmed — the cron-reports-success failure mode, one layer in.
+    from app.metadata import MetadataResult
+
+    def series(tickers: object, start: object, end: object, **k: object) -> SeriesResult:
+        if k.get("basis") == "total_return":
+            return SeriesResult(missing=list(tickers))  # type: ignore[arg-type]
+        return SeriesResult()
+
+    monkeypatch.setattr("app.pipeline.fetch_series", series)
+    monkeypatch.setattr("app.pipeline.fetch_latest", lambda t, **k: PricesResult())
+    monkeypatch.setattr("app.pipeline.fetch_splits", lambda t, **k: {})
+    monkeypatch.setattr("app.pipeline.fetch_metadata", lambda t, **k: MetadataResult())
+
+    with caplog.at_level(logging.INFO):
+        rc = main(["--book", str(SAMPLE), "--warm", "--cache-dir", str(tmp_path)])
+    out = capsys.readouterr().out
+
+    assert rc == 0                                   # a partial warm is not a crash
+    assert "total-return series" in out and "⚠" in out
+    assert _run_summary(caplog)["status"] == "partial"  # the cron can see it
+
+
 def test_warm_full_adds_the_universe(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2250,3 +2304,96 @@ def test_explicit_cache_dir_wins_over_env(
     capsys.readouterr()
     assert rc == 0
     assert seen["cache_dir"] == explicit  # an explicit flag still beats the env var
+
+
+# ── F20 / F24: a run that could not do its job must not exit 0 ───────────────
+
+
+def test_a_totally_unpriced_run_exits_nonzero_and_says_why(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # The cron failure mode: provider unreachable, brief renders from the ledger, every
+    # priced panel is n/a, DRAWDOWN and RISK-ADJUSTED vanish — and the scheduler is told
+    # the Monday went fine. The brief still prints (the ledger figures are real), but the
+    # exit code and the run log both have to carry the failure.
+    monkeypatch.setattr(
+        "app.cli.fetch_latest",
+        lambda tickers, *a, **k: PricesResult(rows={}, missing=list(tickers)),
+    )
+    with caplog.at_level(logging.INFO):
+        rc = main(["--csv", str(SAMPLE), "--no-risk"])
+    out = capsys.readouterr().out
+
+    assert rc == 1
+    assert "could not price a single holding" in out
+    assert "--warm" in out and "TIINGO_API_KEY" in out   # both recovery routes named
+    assert "=== HOLDINGS ===" in out                     # ledger figures still shown
+    assert _run_summary(caplog)["status"] == "error"
+
+
+def test_one_missing_price_is_partial_and_still_exits_zero(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # The other side of the same rule, and the reason it is not simply "partial → 1":
+    # a single delisted or unfetchable ticker is normal operation. Only a run that priced
+    # NOTHING is blind. Getting this boundary wrong makes the cron cry wolf every week.
+    now = datetime.now(timezone.utc)
+
+    def one_miss(tickers, *a, **k):  # type: ignore[no-untyped-def]
+        rows = {tk: PriceRow(tk, date.today(), 100.0, "test", now)
+                for tk in tickers if tk != "IAU"}
+        return PricesResult(rows=rows, missing=["IAU"] if "IAU" in tickers else [])
+
+    monkeypatch.setattr("app.cli.fetch_latest", one_miss)
+    with caplog.at_level(logging.INFO):
+        rc = main(["--csv", str(SAMPLE), "--no-risk"])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "could not price a single holding" not in out
+    assert _run_summary(caplog)["status"] == "partial"
+
+
+def test_a_book_with_zero_transactions_is_refused_on_both_paths(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    # Header row, no data — what a truncated or over-filtered broker export looks like.
+    # --dry-run used to print "✓ import would succeed"; the real run then produced nothing
+    # but the disclaimer, exit 0. Both now name it and exit non-zero, with one wording.
+    book = tmp_path / "empty.csv"
+    book.write_text("Date,Code,DataSource,Currency,Price,Quantity,Action,Fee,Note\n",
+                    encoding="utf-8")
+
+    assert main(["--book", str(book), "--dry-run", "--offline"]) == 2
+    assert "0 transactions" in capsys.readouterr().out
+
+    assert main(["--book", str(book), "--offline"]) == 2
+    assert "0 transactions" in capsys.readouterr().out
+
+
+def test_asset_target_reaches_discover_like_every_other_action(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    # An .env default applies wherever the setting is MEANINGFUL, not where it is mandatory.
+    # The fallback list began as "commands that refuse to run without a target", --screen
+    # joined it as a command that merely benefits from one, and --discover (same optional
+    # use, added a week later) was never added — so the command proposing funds the user has
+    # never evaluated was the one silently skipping the held-out evidence step.
+    monkeypatch.setenv("ASSET_TARGET", str(TARGET))
+    monkeypatch.setattr("app.cli.fetch_series", _flat_series)
+    monkeypatch.setattr("app.pipeline.price_basis_mismatches", lambda *a, **k: [])
+
+    with caplog.at_level(logging.INFO):
+        main(["--csv", str(SAMPLE), "--discover", "reit", "--cache-dir", str(tmp_path)])
+    assert "using ASSET_TARGET from .env" in caplog.text
+
+    # An explicit flag still wins over the environment.
+    other = tmp_path / "other.csv"
+    other.write_text("Ticker,Weight\nVOO,60\nBND,40\n", encoding="utf-8")
+    caplog.clear()
+    with caplog.at_level(logging.INFO):
+        main(["--csv", str(SAMPLE), "--discover", "reit", "--target", str(other),
+              "--cache-dir", str(tmp_path)])
+    assert "using ASSET_TARGET from .env" not in caplog.text

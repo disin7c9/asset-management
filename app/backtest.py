@@ -233,7 +233,7 @@ def backtest_compare(
     )
 
 
-# ── walk-forward role check (v1.9.0) ────────────────────────────────────────
+# ── held-out recent-window role check (v1.9.0) ────────────────────────────────────────
 
 RoleVerdict = Literal["improved", "worsened", "inconclusive", "insufficient"]
 
@@ -432,6 +432,31 @@ def _oos_verdict(
     return "inconclusive", ci, "bootstrap_unconfirmed"
 
 
+def in_sample_end(index: "pd.DatetimeIndex") -> "pd.Timestamp | None":
+    """The last date a held-out check may TRAIN on, given a daily calendar.
+
+    `role_check` splits its own common window `_OOS_FRACTION` from the end and judges only
+    the tail. Anything that *selects which candidates reach that check* must not read past
+    this date: choosing on the held-out window makes it held out from the final comparison
+    but not from the choosing, and the verdict stops being independent of the data it is
+    measured on.
+
+    This is `screen.py`'s FALLBACK boundary, not the authoritative one. `role_check` splits
+    its own `common` window (candidate ∩ target price history), which is a different index
+    from the book's return series, so the same formula over the two gives different dates
+    whenever a candidate's history ends early. `screen.py` therefore prefers that
+    candidate's actual `RoleCheck` window end and uses this only when none exists.
+
+    `None` when the calendar cannot support both windows — `role_check` returns
+    "insufficient" there, so no verdict exists to protect and nothing needs holding back.
+    """
+    n = len(index)
+    n_is = n - int(n * _OOS_FRACTION)
+    if n_is < _MIN_WINDOW_DAYS or (n - n_is) < _MIN_WINDOW_DAYS:
+        return None
+    return index[n_is - 1]
+
+
 def _oos_figure_clause(oos: RoleWindow, baseline: str) -> str:
     """The Ulcer-first OOS figure fragment shared by role_check and benchmark_compare, so
     the two reasons render the same statistics one way: 'Ulcer W vs WO <baseline>; CDaR W
@@ -561,7 +586,11 @@ def role_check(
 
 
 def validate_from_role(rc: RoleCheck) -> bool:
-    """The walk-forward evidence → the edge gate's ``validated`` flag.
+    """The held-out recent-window evidence → the edge gate's ``validated`` flag.
+
+    NOTE the gap this bridges: the gate's contract is a WALK-FORWARD validation, and what
+    it is handed here is ONE held-out split. That is weaker evidence, and the first edge
+    strategy to call this must either strengthen the check or narrow its own claim.
 
     Returns True ONLY when the held-out role check came back ``improved`` — which
     already requires the out-of-sample Ulcer (RMS drawdown) to be lower beyond the
@@ -620,7 +649,7 @@ def benchmark_weights(reference: str) -> dict[str, float]:
 @dataclass(frozen=True)
 class BenchmarkResult:
     """A preset target vs a canonical reference over their COMMON priced window:
-    full-history legs (drawdown-first) + a walk-forward held-out verdict. The verdict is
+    full-history legs (drawdown-first) + a held-out recent-window verdict. The verdict is
     "where the preset's drawdown lands vs the reference", NOT "beats it" — usually
     'inconclusive' on a short history. `ulcer_gain_ci` is the 95% CI of the out-of-sample
     Ulcer gain (reference − preset; positive = the preset carried less drawdown pain), or
@@ -671,7 +700,7 @@ def benchmark_compare(
     provenance: dict[str, tuple[str, datetime]] | None = None,
 ) -> BenchmarkResult | None:
     """Compare a preset `target` against a `reference` portfolio over their common priced
-    window: full-history legs (`simulate` + `_leg`), then a walk-forward held-out verdict
+    window: full-history legs (`simulate` + `_leg`), then a held-out recent-window verdict
     (70/30 split, OOS-only, paired-bootstrap CI) reusing `_oos_verdict` with the preset as
     the leg under test and the reference as the baseline. None if either side lacks usable
     history; never raises."""

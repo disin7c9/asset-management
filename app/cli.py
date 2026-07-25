@@ -20,7 +20,15 @@ from dotenv import load_dotenv
 
 from app.derive import DerivedState, derive
 from app.email import send_report
-from app.events import CASH_TICKER, Event, load_events, load_events_report, load_target
+from app.events import (
+    CASH_TICKER,
+    Event,
+    csv_safe,
+    validate_ticker,
+    load_events,
+    load_events_report,
+    load_target,
+)
 from app.log_config import setup_logging
 from app.metadata import MetadataResult, fetch_metadata
 from app.screen import CandidateScreen, screen_candidates
@@ -49,6 +57,7 @@ from app.universe import ROLES, Candidate, load_universe
 from app.returns import ReturnsSummary
 from app.risk import DollarDrawdown, RiskSummary
 from app.pipeline import (
+    deepest_held,
     HISTORY_DAYS,
     candidate_and_held_facts,
     compute_prices_returns_risk,
@@ -189,7 +198,7 @@ def main(argv: list[str] | None = None) -> int:
         help="judge NEW candidate tickers against your book (comma-separated, e.g. "
         "QQQM,SCHD): diversifier/cost/liquidity/age/concentration/structure/overlap "
         "checks, each with a named reason. Add --target (or ASSET_TARGET in .env) for "
-        "the walk-forward ROLE check — did a 5%% sleeve improve drawdown/vol on a "
+        "the held-out recent-window ROLE check — did a 5%% sleeve improve drawdown/vol on a "
         "held-out window? Needs the price pipeline (not compatible with --no-prices/"
         "--no-risk) and is propose-only (no --rebalance/--backtest/--allocate in the "
         "same run).",
@@ -235,9 +244,11 @@ def main(argv: list[str] | None = None) -> int:
         "--target",
         type=Path,
         default=None,
-        help="target-allocation CSV (Ticker,Weight); REQUIRED with --rebalance. A target "
-        "is a COMPLETE spec: held tickers not listed are sold to $0. Bootstrap one with "
-        "--dump-target, or use data/sample_data/target.csv for the bundled example. "
+        help="target-allocation CSV (Ticker,Weight); REQUIRED with --rebalance. Weights are "
+        "RELATIVE and normalized to 100%%, so percent (50/30/20) and fractions (0.5/0.3/0.2) "
+        "both work and 50/20 means 71.4/28.6 — you cannot reserve cash by summing to less. "
+        "A target is a COMPLETE spec: held tickers not listed are sold to $0. Bootstrap one "
+        "with --dump-target, or use data/sample_data/target.csv for the bundled example. "
         "Set ASSET_TARGET in .env to make it the default.",
     )
     parser.add_argument(
@@ -294,7 +305,7 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="with --backtest --target: compare the target against a canonical reference "
         "(60-40 / all-weather / permanent) over the common history, drawdown-first + a "
-        "walk-forward held-out verdict — instead of rebalanced-vs-buy-and-hold",
+        "held-out recent-window verdict — instead of rebalanced-vs-buy-and-hold",
     )
     parser.add_argument(
         "--allocate",
@@ -399,11 +410,25 @@ def main(argv: list[str] | None = None) -> int:
     # Personal defaults from .env (gitignored; loaded above). ASSET_BOOK (or ASSET_CSV,
     # back-compat) fills --book for runs that want a book; a pure `--backtest --target` run
     # stays notional (book-free) by contract — pass --book explicitly to include your book.
-    # ASSET_TARGET fills --target only when a rule needs one. Explicit flags win. A --demo
-    # run skips BOTH fallbacks: a demo must never mix the bundled book with a personal
+    # ASSET_TARGET fills --target for EVERY action that can use one. Explicit flags win.
+    #
+    # THE RULE, because the list below has drifted once already: an .env default applies
+    # wherever the setting is meaningful, not where it is mandatory. It began (2026-06-12)
+    # as "commands that REFUSE to run without a target" — rebalance and backtest — which is
+    # why the parser.error below names only those two. `--screen` joined it twelve hours
+    # later as a command that merely BENEFITS from a target, quietly widening the meaning;
+    # `--discover` arrived a week after that with the same optional use and was never added,
+    # so for a year the command that proposes funds you have never evaluated was the one
+    # silently skipping the held-out evidence step. Adding an action here is the default;
+    # leaving one out needs a reason stated in this comment.
+    #
+    # --demo skips BOTH fallbacks: a demo must never mix the bundled book with a personal
     # target (or vice versa) — "sell the demo, buy my real tickers" is not a demo.
-    if args.target is None and (args.rebalance or args.backtest or args.screen) and not args.demo:
-        args.target = _env_path("ASSET_TARGET")  # screen: enables the role check row
+    wants_target = (
+        args.rebalance or args.backtest or args.screen or args.discover is not None
+    )
+    if args.target is None and wants_target and not args.demo:
+        args.target = _env_path("ASSET_TARGET")
     if (args.rebalance or args.backtest) and args.target is None:
         parser.error(
             "--rebalance/--backtest require --target (bootstrap one from your holdings "
@@ -530,6 +555,20 @@ def main(argv: list[str] | None = None) -> int:
             run["error"] = str(exc)
             _log_run_summary(run)
             return 2
+        if not events:
+            # Header-only / fully-filtered export: the parser is happy and there is nothing
+            # to report on. Rendering an empty brief and exiting 0 is the same lie --dry-run
+            # was telling; refuse here too, with the same wording, so both paths agree.
+            msg = (
+                f"{book_path} parsed but contains 0 transactions — check the export "
+                "(right columns, no rows: a truncated or filtered download looks like this)"
+            )
+            log.error("%s", msg)
+            sys.stdout.write(f"\n✗ {msg}\n")
+            run["status"] = "error"
+            run["error"] = "book contains 0 transactions"
+            _log_run_summary(run)
+            return 2
 
     prices: dict[str, PriceRow] | None = None
     returns: ReturnsSummary | None = None
@@ -540,7 +579,8 @@ def main(argv: list[str] | None = None) -> int:
     series: SeriesResult | None = None
     daily: pd.Series[float] | None = None
 
-    if not args.no_prices and state.held():
+    prices_required = not args.no_prices and bool(state.held())
+    if prices_required:
         prices, returns, risk, missing, twr_excluded, dollar_dd, series, daily = (
             _compute_prices_returns_risk(events, state, args, run, today)
         )
@@ -583,13 +623,14 @@ def main(argv: list[str] | None = None) -> int:
 
     cands: list[CandidateScreen] | None = None
     if args.screen:
-        cands = _compute_screen(state, args, run, today, daily, held_meta=meta)
+        cands = _compute_screen(state, args, run, today, daily, held_meta=meta,
+                                series=series)
 
     discovery: Discovery | None = None
     discovery_results: list[CandidateScreen] | None = None
     if args.discover is not None:
         discovery, discovery_results = _compute_discover(
-            state, prices, args, run, today, daily, held_meta=meta
+            state, prices, args, run, today, daily, held_meta=meta, series=series
         )
 
     summary_section: Section | None = None
@@ -629,10 +670,26 @@ def main(argv: list[str] | None = None) -> int:
     sys.stdout.write(render_text(data) + "\n")
     save_path = args.reports_dir / f"{data.asof_date}.md" if args.save else None
     delivered = _deliver(data, run, save_path=save_path, send=args.send)
+
+    # TOTAL price failure is not a "partial" run. With the provider unreachable the brief
+    # still renders — holdings, cost basis and realized P&L come from the ledger — but every
+    # priced panel is `n/a` and DRAWDOWN/RISK-ADJUSTED vanish silently. Exiting 0 there tells
+    # the cron the README promotes that a page of n/a was a good Monday. A per-ticker miss
+    # stays 0 (that is what "partial" is for); nothing priced at all does not.
+    blind = prices_required and not prices
+    if blind:
+        sys.stdout.write(
+            "\n⚠ could not price a single holding — the price provider was unreachable.\n"
+            "  Returns, drawdown and risk are unavailable this run (the holdings and "
+            "realized figures above come from your ledger and are unaffected).\n"
+            "  Fix: check your connection, warm the offline cache with --warm, or set "
+            "TIINGO_API_KEY for a second source.\n"
+        )
+        run["status"] = "error"
     _log_run_summary(run)
     # A requested sink that failed → non-zero exit so a scheduler (cron) alerts,
     # even though the brief was already printed to stdout.
-    return 0 if delivered else 1
+    return 0 if delivered and not blind else 1
 
 
 def _deliver(
@@ -800,7 +857,11 @@ def _write_target_csv(weights: dict[str, float], path: Path) -> bool:
                 w_str = f"{pct:.2f}"
                 if float(w_str) == 0.0 and w > 0.0:
                     w_str = f"{max(pct, 1e-6):.6f}"
-                writer.writerow([tk, w_str])
+                # A ticker opening with =/+/-/@ is a FORMULA to Excel and Sheets, and this
+                # file is written expressly to be opened and edited there. events.TICKER_RE
+                # already refuses most of it at ingest, but '-' is legal inside a symbol, so
+                # neutralize at the write boundary too — the layer that knows the format.
+                writer.writerow([csv_safe(tk), w_str])
     except OSError as exc:
         log.error("could not write target to %s: %s", path, exc)
         return False
@@ -939,6 +1000,21 @@ def _dry_run(args: argparse.Namespace, run: dict[str, Any]) -> int:
     realized = state.total_realized()
     if realized:
         out.append(f"  realized P&L (sells + dividends, net of fees): ${realized:+,.2f}")
+    # A file that parses to nothing is the shape of a botched export — right columns, no
+    # rows — and it is the one "success" the user cannot act on. Calling it ✓ sends them to
+    # the full brief to receive a disclaimer and an exit 0. Name it, and exit non-zero so a
+    # scripted import fails where the data went missing rather than three steps later.
+    if not events:
+        out.append(
+            "  ✗ your book parsed but contains 0 transactions — check the export "
+            "(right columns, no rows: a truncated or filtered download looks exactly like this)"
+        )
+        sys.stdout.write("\n".join(out) + "\n")
+        run["status"] = "error"
+        run["dry_run"] = f"empty: {fmt}, 0 events"
+        _log_run_summary(run)
+        return 2
+
     out.append("  ✓ import would succeed — run without --dry-run for the full brief")
     sys.stdout.write("\n".join(out) + "\n")
     run["dry_run"] = f"ok: {fmt}, {len(events)} events, {len(held)} holdings, {len(skipped)} skipped"
@@ -1213,11 +1289,19 @@ def _compute_screen(
     today: date,
     daily: "pd.Series[float] | None",
     held_meta: MetadataResult | None = None,
+    series: "SeriesResult | None" = None,
 ) -> list[CandidateScreen] | None:
     """Judge NEW candidate tickers (from --screen) against the book (propose-only).
     ``held_meta`` is the run's --metadata fetch when present, reused so the held set
     isn't fetched twice."""
-    tickers = sorted({t.strip().upper() for t in args.screen.split(",") if t.strip()})
+    try:
+        # Third ingest point for a ticker, and the same rule as the book/target loaders:
+        # these flow into fetch_series/fetch_metadata, which name cache files after them.
+        tickers = sorted({validate_ticker(t) for t in args.screen.split(",") if t.strip()})
+    except ValueError as exc:
+        log.error("--screen: %s", exc)
+        run["screen"] = "skipped: invalid ticker"
+        return None
     if CASH_TICKER in tickers:
         # The pseudo-ticker is not a screenable security; dropping it here keeps
         # fetch_series from a doomed network round-trip (metadata already skips it).
@@ -1229,7 +1313,7 @@ def _compute_screen(
         return None
     return _screen_tickers(
         state, tickers, args, run, today, daily,
-        status_key="screen", with_role=True, held_meta=held_meta,
+        status_key="screen", with_role=True, held_meta=held_meta, series=series,
     )
 
 
@@ -1244,12 +1328,13 @@ def _screen_tickers(
     status_key: str,
     with_role: bool,
     held_meta: MetadataResult | None = None,
+    series: "SeriesResult | None" = None,
 ) -> list[CandidateScreen] | None:
     """Fetch the candidates' price history + metadata, and the held tickers' metadata (the
     overlap test compares look-through holdings), then hand everything to the pure screen.
     Shared by --screen (user tickers) and --discover (universe gap-fillers). Non-fatal: a
     missing pipeline degrades with a logged reason — the rest of the brief still prints.
-    ``with_role`` runs the walk-forward role check when a --target is present. ``held_meta``
+    ``with_role`` runs the held-out recent-window role check when a --target is present. ``held_meta``
     reuses the run's --metadata fetch (the held set) when present, so the held tickers
     aren't fetched twice; otherwise their facts are fetched here.
     """
@@ -1282,7 +1367,7 @@ def _screen_tickers(
 
     role: dict[str, RoleCheck] | None = None
     if with_role and args.target is not None:
-        # The walk-forward role check (the edge gate's evidence): simulate the
+        # The held-out recent-window role check (the edge gate's evidence): simulate the
         # target vs target+sleeve per candidate, judged on the held-out window.
         try:
             target = load_target(args.target)
@@ -1298,7 +1383,8 @@ def _screen_tickers(
             role = {tk: role_check(sim_series, target, tk) for tk in tickers}
 
     results = screen_candidates(
-        tickers, cand_series.rows, daily, cand_meta, held_facts, held, asof=today, role=role
+        tickers, cand_series.rows, daily, cand_meta, held_facts, held, asof=today, role=role,
+        held_worst=deepest_held(series, held),
     )
     run[status_key] = " ".join(f"{r.ticker}:{r.verdict}" for r in results)
     return results
@@ -1312,11 +1398,12 @@ def _compute_discover(
     today: date,
     daily: "pd.Series[float] | None",
     held_meta: MetadataResult | None = None,
+    series: "SeriesResult | None" = None,
 ) -> tuple[Discovery | None, list[CandidateScreen] | None]:
     """Suggest tickers for the book's role GAPS from the curated universe, each judged by the
     same screen (propose-only). Bare ``--discover`` covers every gap; ``--discover reit,tips``
     targets specific roles. Needs current prices; non-fatal at every step. With a ``--target``,
-    each gap-filler also gets the walk-forward role check (held-out evidence) — one simulation
+    each gap-filler also gets the held-out recent-window role check (evidence) — one simulation
     per candidate, so it only runs when you opt in with a target.
     """
     if not prices:
@@ -1371,6 +1458,7 @@ def _compute_discover(
     results = _screen_tickers(
         state, [c.ticker for c in discovery.candidates], args, run, today, daily,
         status_key="discover", with_role=args.target is not None, held_meta=held_meta,
+        series=series,
     )
     if results is None:
         if not discovery.more_shelves:
@@ -1449,7 +1537,7 @@ def _compute_benchmark(
     args: argparse.Namespace, run: dict[str, Any], today: date
 ) -> BenchmarkResult | None:
     """--backtest --benchmark: compare the --target against a canonical reference (60-40
-    etc.) over their common history — full-history legs (drawdown-first) + a walk-forward
+    etc.) over their common history — full-history legs (drawdown-first) + a held-out recent-window
     held-out verdict. Notional, target-only; non-fatal at every step."""
     ref_weights = benchmark_weights(args.benchmark)
     loaded = _load_target_series(args, run, today, extra=ref_weights)
@@ -1551,7 +1639,7 @@ def _compute_benchmark_narration(
     run: dict[str, Any],
 ) -> Section | None:
     """Opt-in (`--backtest --benchmark --narrate`): explain where the posture's drawdown
-    landed vs the reference — drawdown-first, the walk-forward verdict stated as-is, never
+    landed vs the reference — drawdown-first, the held-out verdict stated as-is, never
     "beats" — in a fenced note leading the BENCHMARK panel."""
     return _narrate(
         run=run, run_key="benchmark_narrate", flag="--backtest --benchmark --narrate",

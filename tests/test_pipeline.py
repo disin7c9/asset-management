@@ -364,3 +364,46 @@ def test_candidate_and_held_facts_online_split_and_reuse(monkeypatch: pytest.Mon
     )
     assert calls == [(("CCC",), True)]            # held NOT re-fetched, only the candidate
     assert set(held2) == {"AAA", "BBB"}
+
+
+def test_a_close_with_no_provenance_is_left_unpriced_not_stamped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Provenance is the field that lets a reader distrust a price. The old default invented
+    # one — ("cache", now()) — rendering a close of unknown origin as freshly cached and
+    # zero hours old: maximum confidence exactly where the code knows least. Refuse instead,
+    # which routes the ticker into the machinery that already exists for missing prices.
+    import logging
+
+    from app.pipeline import compute_prices_returns_risk
+    from app.prices import PricesResult, SeriesResult
+
+    dates = pd.bdate_range("2024-01-01", pd.Timestamp.today().normalize())
+    s = pd.Series([100.0] * len(dates), index=dates, dtype=float)
+    monkeypatch.setattr(
+        "app.pipeline.fetch_series",
+        lambda tickers, *a, **k: SeriesResult(
+            rows={tk: s for tk in tickers}, missing=[], provenance={}   # rows, no stamps
+        ),
+    )
+    monkeypatch.setattr(
+        "app.pipeline.fetch_latest", lambda tickers, *a, **k: PricesResult(missing=list(tickers))
+    )
+    monkeypatch.setattr("app.pipeline.fetch_splits", lambda tickers, *a, **k: {})
+
+    events = [
+        Event(date(2024, 1, 2), "VOO", "buy", quantity=10.0, price=100.0, fee=1.0),
+    ]
+    state = derive(events)
+    with caplog.at_level(logging.WARNING):
+        run: dict[str, object] = {
+            "status": "ok", "n_prices_fetched": 0, "n_prices_missing": 0,
+            "n_series_fetched": 0, "n_series_missing": 0, "fallbacks_used": 0,
+        }
+        prices = compute_prices_returns_risk(
+            events, state, no_risk=False, offline=True, cache_dir=tmp_path,
+            today=date.today(), run=run,
+        )[0]
+
+    assert prices == {}, "a price with no provenance was published anyway"
+    assert "no provenance" in caplog.text

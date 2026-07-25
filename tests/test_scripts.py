@@ -236,3 +236,31 @@ def test_build_universe_core_seed_map() -> None:
     assert mod._seed_flavor("Miscellaneous Sector") == ""
     # Mis-shelved funds stay dropped: a refresh must not silently restore them.
     assert {"SPHB", "MTBA", "LMBS"} <= set(mod._DROP_TICKERS)
+
+
+def test_the_ghostfolio_converter_does_nothing_on_import(tmp_path: Path) -> None:
+    # It used to run at module scope: importing it — a doc tool, a test collector, an
+    # editor's symbol indexer — read the source CSV and OVERWROTE the output file.
+    import importlib.util
+
+    src = ROOT / "reconcile" / "ghostfolio" / "to_ghostfolio_csv.py"
+    out = ROOT / "reconcile" / "ghostfolio" / "ghostfolio_import.csv"
+    before = out.read_bytes() if out.exists() else None
+
+    spec = importlib.util.spec_from_file_location("_gf_probe", src)
+    assert spec is not None and spec.loader is not None
+    spec.loader.exec_module(importlib.util.module_from_spec(spec))  # must be inert
+
+    assert (out.read_bytes() if out.exists() else None) == before
+
+
+def test_exported_csv_neutralizes_spreadsheet_formulas() -> None:
+    # --dump-target and the ghostfolio converter both write files meant to be opened in
+    # Excel/Sheets, where a cell opening with = + - @ executes. '-' is legal inside a real
+    # symbol, so the ticker regex alone can't cover this; neutralize at the write boundary.
+    from app.events import csv_safe
+
+    for hostile in ("=HYPERLINK(\"http://x\")", "+1+1", "-2+3", "@SUM(A1)", "\tx", "\rx"):
+        assert csv_safe(hostile).startswith("'")
+    for benign in ("VOO", "BRK.B", "VWRL.AS"):
+        assert csv_safe(benign) == benign

@@ -236,7 +236,12 @@ def _section_suggestions(suggestions: list[Suggestion]) -> Section:
             f"{s.ticker:7}{s.current_weight * 100:7.1f}{s.target_weight * 100:7.1f}"
             f"{s.action.upper():>7}{dollars}{shares}   {s.reason}"
         )
-    net = buy_total - sell_total
+    # Round to the printed precision BEFORE deciding sign and label. A cash-neutral
+    # reallocation sums the same dollars on both sides, but float addition is not exact,
+    # so `net` lands ~1e-13 off zero. Branching on exact zero while displaying cents then
+    # printed `net -$0.00 (cash freed)` — a minus sign and "money came back" on a line
+    # that simultaneously says the amount is nothing. One rounding makes all three agree.
+    net = round(buy_total - sell_total, 2)
     lines.append(
         f"Buy ${buy_total:,.2f} · Sell ${sell_total:,.2f} · "
         f"net {'+' if net >= 0 else '-'}${abs(net):,.2f} "
@@ -356,6 +361,7 @@ def _section_holdings(
 
     total_mkt = 0.0
     total_unreal = 0.0
+    priced_cost = 0.0
     n_priced = 0
     stale_notes: list[str] = []
     for tk in sorted(held):
@@ -366,6 +372,7 @@ def _section_holdings(
             unreal = mkt - p.cost_basis
             total_mkt += mkt
             total_unreal += unreal
+            priced_cost += p.cost_basis
             n_priced += 1
             price_str, mkt_str, unreal_str = (
                 f"{price.close:9.2f}", f"{mkt:13.2f}", f"{unreal:+12.2f}"
@@ -392,6 +399,16 @@ def _section_holdings(
     fees = state.total_fees()
     lines.append(f"Total cost basis (held): ${cost:,.2f}")
     if prices and n_priced > 0:
+        n_unpriced = len(held) - n_priced
+        if n_unpriced:
+            # Cost basis spans EVERY holding; market value can only span the priced ones.
+            # Subtracting one from the other across different sets reads as a loss the size
+            # of the missing positions' cost — the panel's own numbers disagreeing. Show the
+            # matching subtotal so the comparison is like-for-like and say what is excluded.
+            lines.append(
+                f"  ↳ of which priced:      ${priced_cost:,.2f}  "
+                f"({n_unpriced} holding(s) unpriced and excluded from the lines below)"
+            )
         lines.append(f"Market value (priced):   ${total_mkt:,.2f}")
         lines.append(f"Unrealized P&L:          ${total_unreal:+,.2f}")
     lines.append(f"Realized P&L (sells+div): ${real:+,.2f}")
@@ -465,7 +482,7 @@ def _section_candidates(results: list[CandidateScreen]) -> Section:
         + (
             "(the role row is a held-out simulation, not a prediction)"
             if has_role
-            else "(no return prediction; add --target for the walk-forward role check)"
+            else "(no return prediction; add --target for the held-out role check)"
         )
     )
     return Section("CANDIDATES (deterministic screen)", tuple(lines))
@@ -489,10 +506,25 @@ def _section_discoveries(discovery: Discovery, results: list[CandidateScreen]) -
     by_role: dict[str, list[Candidate]] = {}
     for c in discovery.candidates:
         by_role.setdefault(c.role, []).append(c)
+    # SAY WHICH TEST RAN. The panel looks identical whether or not a target was supplied,
+    # but with one the candidates also face the held-out role check and the return-based
+    # checks are cut to the in-sample window. Previously the only trace was an absent
+    # `using ASSET_TARGET from .env` line on stderr — an ABSENCE, in startup noise, which
+    # is not something a reader can notice. State it where the results are read.
+    gated = any(any(c.name == "role" for c in r.checks) for r in results)
+    mode = (
+        "Held-out role check: ON — each candidate was replayed as a 5% sleeve and judged on "
+        "a recent window the screen did not use while deciding (those figures read "
+        "\"in-sample through …\")."
+        if gated
+        else "Held-out role check: OFF — add --target (or set ASSET_TARGET in .env) to also "
+        "test whether adding each candidate actually improved drawdown."
+    )
     lines: list[str] = [
         "A gap = no dedicated fund in this role; broad funds you hold may already include "
         "it at market weight. Where shelves are named, each shelf is a different exposure — "
         "choosing between them is yours; the funds under one shelf are the comparable options.",
+        mode,
         "",
     ]
     for role in discovery.gaps:
@@ -551,6 +583,15 @@ def _section_discoveries(discovery: Discovery, results: list[CandidateScreen]) -
     lines.append(
         'Discovery is propose-only: roles you hold little of + screened options; a PASS is '
         '"sane, cheap, liquid, genuinely different", never a prediction.'
+    )
+    # A preset target and this panel can disagree about the SAME ticker, and both be right:
+    # --allocate fills role buckets from the universe and never looks at correlation, while
+    # the screen measures correlation against what you hold. The user was left holding the
+    # contradiction (VIG written into a target, then failed here at ρ=+0.86); say which
+    # question each one answered instead of quietly changing either.
+    lines.append(
+        "Preset targets (--allocate / --onboard) fill ROLES and are not correlation-screened, "
+        "so a ticker they picked can fail here — the two answer different questions."
     )
     return Section("DISCOVERY (roles you're light in — propose-only)", tuple(lines))
 
@@ -628,7 +669,7 @@ def _section_backtest(bt: BacktestResult) -> Section:
 
 
 def _section_benchmark(bm: BenchmarkResult) -> Section:
-    """Preset vs a canonical reference, drawdown-first, with the walk-forward held-out
+    """Preset vs a canonical reference, drawdown-first, with the held-out recent-window
     verdict. 'Where the preset lands', NOT 'beats the benchmark' — usually inconclusive
     on a short history."""
     lines = _leg_table(bm.legs, bm.missing, bm.provenance)

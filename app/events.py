@@ -16,6 +16,7 @@ import io
 import json
 import logging
 import math
+import re
 from dataclasses import dataclass
 from collections.abc import Sequence
 from datetime import date, datetime, timedelta
@@ -264,6 +265,37 @@ def _rows_from_ghostfolio_json(raw: str, path: Path) -> tuple[list[dict[str, str
     return out, warnings
 
 
+# The one ticker-shape rule, shared by every ingest point. `mcp_server` had this regex
+# (its free-text `screen_candidate` arg needed an anti-traversal guard); the CSV/JSON loader
+# — the path that actually reaches the filesystem, the price cache and every CSV we write —
+# only called `.upper()`. Real symbols are letters, digits, dots and hyphens: BRK.B, RDS-A,
+# VWRL.AS all pass. Anything else is a malformed export or an injection attempt, and it is
+# cheaper to refuse it at the door than to sanitize it at each of the places it flows to.
+TICKER_RE = re.compile(r"[A-Z0-9.\-]{1,15}")
+
+
+# Excel/Sheets execute a cell that opens with any of these. Any value we WRITE to a CSV a
+# human will open must be neutralized; an apostrophe forces text and survives the round-trip.
+_FORMULA_LEAD = ("=", "+", "-", "@", "\t", "\r")
+
+
+def csv_safe(value: str) -> str:
+    """Neutralize a spreadsheet formula lead-in without altering the value's meaning."""
+    return "'" + value if value.startswith(_FORMULA_LEAD) else value
+
+
+def validate_ticker(code: str, *, rownum: int | None = None) -> str:
+    """Uppercase `code` and refuse anything that isn't a plain ticker."""
+    tk = code.strip().upper()
+    if not TICKER_RE.fullmatch(tk):
+        where = f" (row {rownum})" if rownum is not None else ""
+        raise ValueError(
+            f"{code!r} is not a valid ticker{where} — expected 1-15 characters of "
+            "A-Z, 0-9, '.' or '-'"
+        )
+    return tk
+
+
 def load_events(path: Path) -> list[Event]:
     """Parse a transaction file into an ordered event list.
 
@@ -331,7 +363,7 @@ def _rows_to_events(rows: list[dict[str, Any]]) -> list[Event]:
     for i, row in enumerate(rows, start=1):
         action = _parse_action(_require(row, "Action", rownum=i))
         date_str = _require(row, "Date", rownum=i)
-        code = _require(row, "Code", rownum=i).upper()
+        code = validate_ticker(_require(row, "Code", rownum=i), rownum=i)
         if action in ("buy", "sell"):
             price = _require_positive(row, "Price", rownum=i, ctx=f"{action} {code}")
             quantity = _require_positive(row, "Quantity", rownum=i, ctx=f"{action} {code}")
@@ -387,6 +419,12 @@ def _rows_to_events(rows: list[dict[str, Any]]) -> list[Event]:
     return events
 
 
+# How close a raw weight sum must be to 1.0 (fractions) or 100 (percent) to look intended.
+# Outside both bands the user probably meant something the normalization will not do.
+_SUM_NEAR_FRACTION = (0.98, 1.02)
+_SUM_NEAR_PERCENT = (98.0, 102.0)
+
+
 def load_target(path: Path) -> dict[str, float]:
     """Load a target-allocation CSV (columns: Ticker, Weight) → normalized weights.
 
@@ -394,8 +432,12 @@ def load_target(path: Path) -> dict[str, float]:
     and means "close this position" — a deliberate, explicit sell-to-$0. It is kept
     in the returned dict so the caller can tell an intentional 0 apart from a ticker
     that was simply omitted (omission is the ambiguous case the CLI warns about).
-    Rejects an empty file, a target that sums to zero, a negative weight, or a
-    non-numeric weight (a clear error beats a silently skewed target).
+    Rejects an empty file, a target that sums to zero, a negative weight, a
+    non-numeric weight, a ticker that isn't a plain symbol (`validate_ticker` — these
+    names become cache filenames), or `CASH_TICKER` (a target describes the INVESTED
+    split; cash is expressed by investing less). A clear error beats a silently skewed
+    target. WARNS, without rejecting, when the raw weights sum far from 1.0 or 100 —
+    normalizing is the contract, doing it silently is what misled.
 
     Lives here (the CSV input boundary, beside `load_events`) so `strategy.py` stays
     pure — it consumes the returned dict and never touches the filesystem.
@@ -408,9 +450,15 @@ def load_target(path: Path) -> dict[str, float]:
             msg = f"{path}: target CSV needs columns Ticker, Weight (found {sorted(fields)})"
             raise ValueError(msg)
         for row in reader:
-            ticker = (row.get("Ticker") or "").strip().upper()
-            if not ticker:
+            raw_ticker = (row.get("Ticker") or "").strip()
+            if not raw_ticker:
                 continue
+            # Same rule as the book loader. A target ticker reaches `fetch_series` /
+            # `fetch_latest`, which build cache filenames as `cache_dir / f"{ticker}…"` —
+            # so `../../..` here writes parquet OUTSIDE the cache dir. Validating only
+            # `load_events` left the second file-fed path open, and `mcp_server` enforces
+            # this invariant on its own free-text arg for exactly this reason.
+            ticker = validate_ticker(raw_ticker)
             raw_w = (row.get("Weight") or "0").strip() or "0"
             try:
                 weight = float(raw_w)
@@ -423,9 +471,34 @@ def load_target(path: Path) -> dict[str, float]:
                     f"(use 0 to close the position; got {weight})"
                 )
                 raise ValueError(msg)
+            if ticker == CASH_TICKER:
+                # CASH is the ledger's pseudo-ticker for external flows, not a security.
+                # Accepted here it flowed on as a normal leg and the rebalance panel
+                # ordered "BUY 53.078 shares" of it at a derived price. A target describes
+                # the INVESTED portfolio; deliberate cash is expressed by holding back the
+                # money, not by naming a holding the tool would try to buy.
+                msg = (
+                    f"{path}: {CASH_TICKER} cannot be a target weight — a target describes "
+                    "how the invested portfolio is split. To keep cash aside, invest less "
+                    "(e.g. --rebalance fixed_dca --new-cash N) rather than targeting it."
+                )
+                raise ValueError(msg)
             raw[ticker] = raw.get(ticker, 0.0) + weight
     total = sum(raw.values())
     if not raw or total <= 0:
         msg = f"{path}: target allocation is empty or sums to zero"
         raise ValueError(msg)
+    # Weights are RELATIVE and always normalized, so 50/20 and 71.4/28.6 mean the same mix.
+    # That is deliberate (it makes both percent and fraction work), but it silently turns
+    # "VTI 50, BND 20" — plausibly someone reserving 30% cash — into a fully-invested plan,
+    # and on a complete-spec target that plan includes forced exits for everything omitted.
+    # Normalizing quietly is the design; not saying so is the defect.
+    if not (_SUM_NEAR_FRACTION[0] <= total <= _SUM_NEAR_FRACTION[1]
+            or _SUM_NEAR_PERCENT[0] <= total <= _SUM_NEAR_PERCENT[1]):
+        log.warning(
+            "%s: weights sum to %g, not ~1.0 or ~100 — normalizing to 100%% of the "
+            "invested portfolio (weights are relative). %s",
+            path, total,
+            "If you meant to hold the remainder as cash, that is not what this does.",
+        )
     return {tk: w / total for tk, w in raw.items()}
