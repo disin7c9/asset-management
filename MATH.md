@@ -374,6 +374,23 @@ Zero-variance series ($\sigma=0$) → the check is **n/a**, never a fabricated c
 Decision: fail if $\rho>0.85$, warn if $\rho>0.60$; escalate a pass→warn if
 $\rho_{\text{down}}-\rho>0.15$ (diversification that vanishes in stress).
 
+**$\rho$ is a point estimate over one window, and carries no confidence interval —
+deliberately.** Every metric in §5 is bootstrapped; this one is not, and the reason is that a
+band here would answer the wrong question. A CI measures how precisely *this window's*
+correlation was estimated. But correlation is not a fixed quantity measured imprecisely — it
+moves. Measured on a real 2.15-year book, splitting the window in half: SCHD $+0.514
+\rightarrow +0.236$, VIG $+0.757 \rightarrow +0.614$, VXF $+0.794 \rightarrow +0.698$. Those
+shifts are a third to a full multiple of the corresponding bootstrap widths (0.22–0.47 over
+538 days). A tight interval would invite *more* trust in a number whose dominant uncertainty
+is that it does not stay put. So the figure is reported bare, the thresholds are applied to
+it as a gate (never as a ranking), and the reader is told what it is: how this fund moved
+against this book over this window — not a forecast, and not a stable property of the pair.
+
+The bar for revisiting this is a **ranker**. Gating on a threshold tolerates an imprecise
+estimate; ordering candidates by $\rho$ would treat $0.71$ vs $0.74$ as a real difference,
+which at these interval widths it is not. If the screen ever sorts rather than filters, the
+uncertainty has to become explicit — or the ranking has to be refused.
+
 ### 11.2 Holdings overlap (near-equivalent collapse) — `holdings_overlap`
 Top-10 **overlap coefficient** (sum of shared minimums); None if either fund has no look-through:
 $$
