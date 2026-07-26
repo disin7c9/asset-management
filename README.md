@@ -546,9 +546,13 @@ uv run python scripts/build_universe.py --auto --out app/data/universe.csv
 
 It pulls the largest US ETFs per asset-class category from a screener (by fund *size*, not past returns — chasing performance is exactly the trap this avoids), drops leveraged/inverse, and keeps a small curated set for the few categories a screener can't isolate. Point `--discover` at your own list with `ASSET_UNIVERSE=path/to/universe.csv` in `.env`.
 
+With a `--target` (or `ASSET_TARGET` in `.env`) each discovered candidate also faces the **held-out role check** — replayed as a 5% sleeve and judged on a recent window the screen did not use while deciding. The panel states which mode it ran in, because the two look identical otherwise. It costs roughly a second per four candidates.
+
 ### 🔍 Screen a candidate
 
 `--screen TICKER` judges a *new* ticker against your book — cost, liquidity, age, concentration, overlap with what you hold, whether it diversified your past drawdowns, and its **own** worst drawdown — each with a reason. Propose-only; a PASS is "sane, cheap, liquid, genuinely different", never a prediction.
+
+The own-drawdown row compares against the **deepest-falling fund you already hold**, not against your portfolio's worst fall. A blend drops less than its parts by construction, so "deeper than your book" is a bar almost any single equity fund clears — on the bundled example it would flag three of the four funds that book holds. Clearing the peer bar says "no worse than what you already live with"; there is also a fixed equity-scale bar (worse than −30%) that warns regardless.
 
 Add `--target` and it also runs the **held-out role check**: give the candidate a 5% sleeve, replay it, and judge only on a recent window the check didn't look at while deciding. Two things to know about that verdict. **It measures drawdown pain, not return** — an uncorrelated fund makes the ride smoother even when it earns nothing, so the line prints the return cost beside the drawdown gain and you weigh both. And when a role check follows, the screen's return-based checks (correlation, drawdown-window return, own drawdown) are computed on the **in-sample window only** and labelled `[in-sample through …]`, so the candidate isn't chosen using the window the check then holds out; the structural checks (cost, liquidity, age, overlap) carry no return information and keep reading full history. Details: [MATH.md §12.3](MATH.md).
 

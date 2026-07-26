@@ -458,8 +458,26 @@ is cut.
 
 The cut has a price, and it is paid in the honest direction: with ~30% less history the candidate
 has less room to fall, so a fund near the two-year `own-drawdown` floor now returns **n/a** where it
-previously gave a verdict. Refusing to judge is the correct answer when the only way to judge would
-be to look at the held-out window.
+previously gave a verdict. On a book with under ~3 years of history that silences the check for every
+candidate — measured on a 2.15y book, 5 of 5 candidates returned n/a where a 3.55y book judged 4 of 5.
+Refusing to judge is the correct answer when the only way to judge would be to look at the held-out
+window, but the cost is concentrated on exactly the young books that can least afford it.
+
+Two figures the cut does NOT move, worth knowing before reading a diff of it: the drawdown-window
+return is unchanged whenever the book's worst drawdown falls inside the in-sample side (the common
+case — a recent worst drawdown is the exception), and the structural checks are untouched by
+construction. On one real 2.15y book the cut shifted $\rho$ by 0.02–0.06 and flipped **no** verdicts.
+
+### 12.4 The own-drawdown peer bar
+
+A candidate's own worst fall is compared against the **deepest-falling fund currently held**, not
+against the portfolio's own worst fall. The portfolio is a blend and a blend's drawdown is shallower
+than its components' by construction, so "deeper than your book" is nearly tautological for a single
+equity fund: on the bundled example (book worst $-9.8\%$) it flags VOO ($-19.0\%$), IAU ($-26.4\%$)
+and VEA ($-14.4\%$) — three of the four funds that book holds. The peer bar asks the answerable
+question instead: does this fall harder than anything already in the book? A fixed equity-scale bar
+($\le -30\%$) warns independently of any peer, and the blended figure is still reported as context
+when no peer is available.
 
 This still is not **walk-forward**, and the output still says *held-out recent-window*. Walk-forward
 means repeated re-fitting across rolling origins; this is one split, judged once. What changed is

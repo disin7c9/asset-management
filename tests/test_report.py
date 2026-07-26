@@ -447,6 +447,37 @@ def test_totals_stay_comparable_when_a_holding_is_unpriced(returns) -> None:
     assert "of which priced" not in render_text(build_report_data(s2, priced, returns, None))
 
 
+def test_discovery_panel_shows_a_concluded_role_verdict_in_both_directions() -> None:
+    # The panel shows problems and summarizes the rest, which is right for scanning 20+
+    # candidates — but it meant the ONLY role verdict a browser could ever see was
+    # "worsened" (fail). "improved" mapped to pass and was hidden, so the strongest evidence
+    # the tool can produce was withheld while the bad news was surfaced. Show CONCLUSIONS in
+    # both directions; keep non-conclusions (n/a) hidden, because they are not findings.
+    from app.discover import Discovery
+    from app.report import _section_discoveries
+    from app.screen import CandidateScreen, CheckResult
+    from app.universe import Candidate
+
+    cand = Candidate(ticker="VNQ", name="Vanguard Real Estate", role="reit",
+                     summary="", core=True, flavor="us")
+    disc = Discovery(gaps=("reit",), exposure={"reit": 0.0}, candidates=(cand,))
+
+    def panel(role: CheckResult) -> str:
+        cost = CheckResult("cost", "pass", "0.12% — cheap")
+        return "\n".join(_section_discoveries(disc, [CandidateScreen("VNQ", (cost, role))]).lines)
+
+    improved = panel(CheckResult("role", "pass", "OOS …: Ulcer 1.20% vs 1.80% without"))
+    assert "role: OOS" in improved, "a concluded improvement is still hidden while browsing"
+
+    worsened = panel(CheckResult("role", "fail", "OOS …: Ulcer 2.40% vs 1.80% without"))
+    assert "role: OOS" in worsened
+
+    # No conclusion → no line. And an ordinary passing check stays summarized in the counts.
+    for status in ("n/a",):
+        assert "role: OOS" not in panel(CheckResult("role", status, "OOS …: inconclusive"))
+    assert "cost: 0.12%" not in improved
+
+
 def test_discovery_panel_states_whether_the_role_check_ran(state, prices) -> None:
     # The panel looks identical with and without a target, but with one the candidates also
     # face the held-out role check and the return-based checks are cut to the in-sample

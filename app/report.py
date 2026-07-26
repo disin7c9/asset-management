@@ -569,7 +569,17 @@ def _section_discoveries(discovery: Discovery, results: list[CandidateScreen]) -
                     lines.append(f"         {c.summary}")
                 if r is not None:
                     for chk in r.checks:
-                        if chk.status in ("warn", "fail"):
+                        # Browsing 20+ candidates, so the default is "show problems, summarize
+                        # the rest in the counts". The ROLE row is the exception: a `pass` there
+                        # means the held-out test actually CONCLUDED the candidate reduced
+                        # drawdown — the strongest evidence this tool can produce, and rare
+                        # enough to be worth a line. Showing only its `fail` side surfaced bad
+                        # news and silently withheld good news. `inconclusive`/`insufficient`
+                        # stay hidden (they are n/a): a non-conclusion is not a finding.
+                        concluded = chk.status in ("warn", "fail") or (
+                            chk.name == "role" and chk.status == "pass"
+                        )
+                        if concluded:
                             lines.append(f"         [{chk.status}] {chk.name}: {chk.reason}")
         if len(cands) < 3:
             lines.append(f"  (thin shelf — only {len(cands)} fund(s) in the universe here)")
