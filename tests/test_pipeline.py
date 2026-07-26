@@ -407,3 +407,41 @@ def test_a_close_with_no_provenance_is_left_unpriced_not_stamped(
 
     assert prices == {}, "a price with no provenance was published anyway"
     assert "no provenance" in caplog.text
+
+
+def _falling(depth: float, n: int = 400) -> "pd.Series[float]":
+    """A series that rises then falls to `depth` (a negative fraction)."""
+    idx = pd.bdate_range("2024-01-01", periods=n)
+    peak = [100.0] * (n // 2)
+    fall = [100.0 * (1.0 + depth)] * (n - n // 2)
+    return pd.Series(peak + fall, index=idx, dtype=float)
+
+
+def test_deepest_held_picks_the_worst_faller_and_ignores_everything_else() -> None:
+    # The peer bar for the own-drawdown screen. It had NO behavioural test: gutting the body
+    # to `return None` silently reverted every own-drawdown check to the old blended-book bar
+    # and 225 tests still passed, because the only test was a source-text grep.
+    from app.pipeline import deepest_held
+
+    rows = {
+        "AAA": _falling(-0.10),
+        "BBB": _falling(-0.32),   # the deepest of the HELD set
+        "CCC": _falling(-0.55),   # deeper still, but NOT held → must be ignored
+    }
+    res = SeriesResult(rows=rows, missing=[])
+
+    got = deepest_held(res, {"AAA", "BBB"})
+    assert got is not None
+    assert got[0] == "BBB" and abs(got[1] - (-0.32)) < 0.01
+
+    # A held ticker with no series is skipped, not crashed on.
+    assert deepest_held(res, {"AAA", "BBB", "NOSERIES"})[0] == "BBB"
+
+    # Nothing held, or nothing that ever fell → no peer, and the caller falls back to the
+    # blended-book wording rather than inventing a bar.
+    assert deepest_held(res, set()) is None
+    flat = SeriesResult(rows={"FLAT": pd.Series([100.0] * 300,
+                                                index=pd.bdate_range("2024-01-01", periods=300),
+                                                dtype=float)}, missing=[])
+    assert deepest_held(flat, {"FLAT"}) is None
+    assert deepest_held(None, {"AAA"}) is None

@@ -1080,6 +1080,13 @@ def screen_candidate(ticker: str) -> CandidateVerdict:
         # that never discloses demo data.
         return CandidateVerdict(ticker=tk, verdict="N/A", checks=[], note=f"{note} {_note()}")
     held = set(b.state.held())
+    peers = held - {tk}
+    peer_series = (
+        fetch_series(sorted(peers), start, today, cache_dir=cache, online=False,
+                     basis="total_return")
+        if peers
+        else SeriesResult()
+    )
     # Held facts stay cache-only (already warmed); only the candidate may need the network, so an
     # on-demand fetch doesn't fan out across every holding (the held/candidate online split).
     cand_meta, held_facts, _ = candidate_and_held_facts(
@@ -1091,7 +1098,12 @@ def screen_candidate(ticker: str) -> CandidateVerdict:
         # single fund against the BLENDED book — a bar a diversified book almost always
         # clears, and the sixth hand-maintained CLI/MCP divergence in a codebase that
         # already lists five as a known weakness.
-        held_worst=deepest_held(b.series, held),
+        # Same peer bar the CLI uses, on the SAME basis as the candidate and excluding the
+        # candidate itself. `b.series` is the RAW portfolio path; the candidate above is
+        # total-return, and mixing the two flatters the candidate (its coupons cushion its
+        # drawdown while the peer's do not) — enough to flip a real verdict. Cache-only, so
+        # this adds no network: the held set is already warmed by the time we get here.
+        held_worst=deepest_held(peer_series, peers),
     )
     r = results[0]
     checks = [
@@ -1162,7 +1174,7 @@ def _benchmark_verdict(
         oos_ulcer_gain_low=lo, oos_ulcer_gain_high=hi,
         inconclusive_cause=result.cause or None,
     )
-    return verdict, f"Walk-forward held-out drawdown comparison vs {benchmark}."
+    return verdict, f"Held-out recent-window drawdown comparison vs {benchmark}."
 
 
 @mcp.tool(
@@ -1170,7 +1182,7 @@ def _benchmark_verdict(
     description="Propose a strategic target allocation for a risk posture (conservative / "
     "moderate / aggressive) over the user's book + the curated universe, and validate it "
     "against a canonical reference (60-40 / all-weather / permanent) with a held-out "
-    "held-out drawdown verdict. Use to answer 'what should a moderate portfolio look like for "
+    "recent-window drawdown verdict. Use to answer 'what should a moderate portfolio look like for "
     "me, and is it sound'. Propose-only: never trades, never a recommendation or return "
     "forecast — every weight comes from the deterministic core. The weights are always "
     "returned; the verdict needs the reference tickers cached, else it's null with a warm note. "

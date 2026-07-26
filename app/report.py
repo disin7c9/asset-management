@@ -684,7 +684,7 @@ def _section_benchmark(bm: BenchmarkResult) -> Section:
     on a short history."""
     lines = _leg_table(bm.legs, bm.missing, bm.provenance)
     lines.append("")
-    lines.append(f"Walk-forward (held-out): {bm.reason}")
+    lines.append(f"Held-out recent-window: {bm.reason}")
     lines.append(
         "Where your posture lands vs a known reference — never 'beats it'. The verdict "
         "rides on the Ulcer index (whole-window drawdown pain), with CDaR as the "

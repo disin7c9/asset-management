@@ -493,7 +493,7 @@ def role_check(
     bootstrap_n: int = 1000,
     seed: int = 42,
 ) -> RoleCheck:
-    """Walk-forward role check for one candidate. Never raises; an unusable
+    """Held-out recent-window role check for one candidate. Never raises; an unusable
     setup returns verdict='insufficient' with the reason."""
     def insufficient(reason: str) -> RoleCheck:
         return RoleCheck(candidate, sleeve, schedule, (), "insufficient", reason)
@@ -728,7 +728,7 @@ def benchmark_compare(
     if preset_leg is None or ref_leg is None:
         return None
 
-    # Walk-forward: split the common calendar 70/30; judge the held-out window only.
+    # Held-out split: 70/30 of the common calendar; judge the tail window only.
     idx = pd.DatetimeIndex([])
     for tk in all_priced:
         idx = idx.union(series[tk].index)

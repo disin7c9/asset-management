@@ -837,10 +837,14 @@ def test_screen_candidate_fetches_on_demand_when_not_locked(
     from app.metadata import MetadataResult
 
     monkeypatch.setenv("ASSET_MCP_OFFLINE", "")  # default: fetch a missing candidate online
+    # Record per TICKER SET, not last-call-wins: this tool now makes two fetches — the
+    # candidate (may go online) and the held peer bar for own-drawdown (cache-only on
+    # purpose, so one new ticker can't fan a network call across every holding).
     seen: dict[str, bool] = {}
 
     def fake_series(tickers: object, start: object, end: object, **k: object) -> object:
-        seen["online"] = bool(k.get("online"))
+        for tk in tickers:  # type: ignore[union-attr]
+            seen[str(tk)] = bool(k.get("online"))
         return prices_mod.SeriesResult(rows={t: _synthetic_series() for t in tickers})  # type: ignore[union-attr]
 
     monkeypatch.setattr("app.mcp_server.fetch_series", fake_series)
@@ -849,7 +853,10 @@ def test_screen_candidate_fetches_on_demand_when_not_locked(
     monkeypatch.setattr("app.pipeline.fetch_metadata", lambda tickers, **k: MetadataResult())
     res = _call("screen_candidate", {"ticker": "CCC"})  # CCC not in the warm cache
     assert not res.isError, _error_text(res)
-    assert seen["online"] is True  # fetched on demand rather than punting to the user
+    assert seen["CCC"] is True   # the CANDIDATE was fetched on demand, not punted to the user
+    assert all(v is False for tk, v in seen.items() if tk != "CCC"), (
+        "the held peer set was fetched online — one new ticker must not fan out across holdings"
+    )
     assert res.structuredContent is not None
     assert res.structuredContent["verdict"] in {"PASS", "WARN", "FAIL"}  # actually screened
 

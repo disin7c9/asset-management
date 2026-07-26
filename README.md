@@ -224,7 +224,7 @@ Expose your portfolio to an AI assistant (Claude Desktop, Claude Code, …) as *
     "asset-management": {
       "command": "uvx",
       "args": ["--from",
-               "https://github.com/disin7c9/asset-management/releases/download/v2.12.0/asset_management-2.12.0-py3-none-any.whl",
+               "https://github.com/disin7c9/asset-management/releases/download/v2.12.1/asset_management-2.12.1-py3-none-any.whl",
                "asset-management-mcp"],
       "env": {
         "ASSET_BOOK": "C:\\path\\to\\your\\transactions.csv",

@@ -678,12 +678,31 @@ def main(argv: list[str] | None = None) -> int:
     # stays 0 (that is what "partial" is for); nothing priced at all does not.
     blind = prices_required and not prices
     if blind:
+        # Say WHICH failure this was. `prices` can empty out two very different ways, and the
+        # remedies do not overlap: the fetch failed (network / no provider), or the fetch
+        # SUCCEEDED and every row was then dropped by the staleness floor or the missing-
+        # provenance guard. Blaming the connection in the second case sends the user to
+        # re-run --warm, which cannot un-stale a delisted holding.
+        fetched = run["n_series_fetched"] or run["n_prices_fetched"]
+        cause, fix = (
+            (
+                "every price fetched was rejected as unusable (stale beyond the freshness "
+                "floor, or carrying no source/timestamp we could verify)",
+                "Fix: check whether these holdings still trade — a delisted or halted ticker "
+                "has no current price, and re-fetching cannot produce one.",
+            )
+            if fetched
+            else (
+                "the price provider was unreachable",
+                "Fix: check your connection, warm the offline cache with --warm, or set "
+                "TIINGO_API_KEY for a second source.",
+            )
+        )
         sys.stdout.write(
-            "\n⚠ could not price a single holding — the price provider was unreachable.\n"
+            f"\n⚠ could not price a single holding — {cause}.\n"
             "  Returns, drawdown and risk are unavailable this run (the holdings and "
             "realized figures above come from your ledger and are unaffected).\n"
-            "  Fix: check your connection, warm the offline cache with --warm, or set "
-            "TIINGO_API_KEY for a second source.\n"
+            f"  {fix}\n"
         )
         run["status"] = "error"
     _log_run_summary(run)
@@ -1372,7 +1391,13 @@ def _screen_tickers(
         try:
             target = load_target(args.target)
         except (ValueError, OSError) as exc:
+            # The panel would otherwise report "role check: OFF — add --target", telling the
+            # user to do the thing they just did, with the real reason only in stderr.
             log.error("--%s role check: %s", status_key, exc)
+            sys.stdout.write(
+                f"\n⚠ --target was supplied but could not be read, so the held-out role "
+                f"check did not run: {exc}\n"
+            )
         else:
             tgt_series = fetch_series(
                 sorted(set(target) - set(cand_series.rows)), start, today,
@@ -1382,9 +1407,22 @@ def _screen_tickers(
             sim_series = {**tgt_series.rows, **cand_series.rows}
             role = {tk: role_check(sim_series, target, tk) for tk in tickers}
 
+    # The peer bar must be measured on the SAME basis as the candidate, and must exclude the
+    # candidate itself. The run's `series` is RAW (the portfolio path, whose dividends come from
+    # the log); the candidate is TOTAL-RETURN. Comparing the two flatters the candidate — its
+    # coupons cushion its drawdown while the peer's do not — and it flipped a real verdict:
+    # VNQ vs held SCHH read "shallower, pass" on mixed bases and "deeper, warn" on matched ones.
+    # Screening a ticker you already hold would also have compared it against ITSELF, printing
+    # two different depths for one fund.
+    peers = sorted(held - set(tickers))
+    peer_series = fetch_series(
+        peers, start, today, cache_dir=args.cache_dir, online=online, basis="total_return"
+    ) if peers else SeriesResult()
+    record_series_fetch(run, peer_series)
+
     results = screen_candidates(
         tickers, cand_series.rows, daily, cand_meta, held_facts, held, asof=today, role=role,
-        held_worst=deepest_held(series, held),
+        held_worst=deepest_held(peer_series, set(peers)),
     )
     run[status_key] = " ".join(f"{r.ticker}:{r.verdict}" for r in results)
     return results
@@ -1646,7 +1684,7 @@ def _compute_benchmark_narration(
         build_claims=lambda: build_benchmark_claims(result),
         build_prompt_fn=lambda cs, tier: build_benchmark_prompt(cs, result, tier=tier),
         title="BENCHMARK — how your posture compares",
-        provenance_tail="the drawdown verdict is the tool's walk-forward test, not the "
+        provenance_tail="the drawdown verdict is the tool's held-out test, not the "
         "model. Propose-only; not financial advice.",
     )
 

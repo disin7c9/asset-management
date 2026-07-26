@@ -2104,7 +2104,8 @@ def test_backtest_benchmark_compares_target_vs_reference(
     out = capsys.readouterr().out
     assert rc == 0
     assert "BENCHMARK (preset vs 60-40" in out      # the comparison panel, not BACKTEST
-    assert "Walk-forward (held-out):" in out         # the held-out verdict row
+    assert "Held-out recent-window:" in out          # the held-out verdict row
+    assert "Walk-forward" not in out                 # one split is not walk-forward
     assert "vs 60-40:" in _run_summary(caplog)["backtest"]
 
 
@@ -2397,3 +2398,125 @@ def test_asset_target_reaches_discover_like_every_other_action(
         main(["--csv", str(SAMPLE), "--discover", "reit", "--target", str(other),
               "--cache-dir", str(tmp_path)])
     assert "using ASSET_TARGET from .env" not in caplog.text
+
+
+def test_the_peer_bar_is_measured_on_the_candidates_price_basis(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A raw close books every dividend as a permanent loss, so the SAME fund shows a DEEPER
+    # drawdown on raw than on total-return. The candidate is fetched total-return; building
+    # the peer from the run's RAW series flatters the candidate and flipped a real verdict
+    # (VNQ vs held SCHH: "shallower, pass" mixed, "deeper, warn" matched). Assert on the
+    # NUMBER that reaches the check — a source grep passed here even when the basis was gone,
+    # because the candidate's own basis= appears earlier in the same function.
+    import pandas as pd
+
+    idx = pd.bdate_range("2024-01-01", pd.Timestamp.today().normalize())
+    n = len(idx)
+
+    def curve(depth: float) -> "pd.Series[float]":
+        return pd.Series([100.0] * (n // 2) + [100.0 * (1 + depth)] * (n - n // 2),
+                         index=idx, dtype=float)
+
+    def spy(tickers, start, end, **k):  # type: ignore[no-untyped-def]
+        # Held funds fall 40% on raw but only 5% on total-return; the candidate falls 20%.
+        tr = k.get("basis") == "total_return"
+        rows = {tk: curve(-0.20 if tk == "QQQM" else (-0.05 if tr else -0.40))
+                for tk in tickers}
+        prov = {tk: ("cache", datetime.now(timezone.utc)) for tk in rows}
+        return SeriesResult(rows=rows, missing=[], provenance=prov)
+
+    monkeypatch.setattr("app.cli.fetch_series", spy)
+    monkeypatch.setattr("app.pipeline.price_basis_mismatches", lambda *a, **k: [])
+    main(["--csv", str(SAMPLE), "--screen", "QQQM", "--cache-dir", str(tmp_path)])
+    out = capsys.readouterr().out
+
+    # On the candidate's basis the peers fell 5%, so a 20% candidate is DEEPER → warn.
+    # Built from the raw series the peers would read 40% and the candidate would pass.
+    assert "-5.0%" in out, f"peer bar not measured on total-return basis:\n{out}"
+    assert "deeper than anything you hold" in out
+    assert "-40.0%" not in out
+
+
+def test_a_held_candidate_is_never_its_own_peer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Screening a ticker already in the book compared it against ITSELF, printing two depths
+    # for one fund ("VOO ... shallower than VOO, which you already hold").
+    import pandas as pd
+
+    idx = pd.bdate_range("2024-01-01", pd.Timestamp.today().normalize())
+    n = len(idx)
+
+    def falling(tickers, start, end, **k):  # type: ignore[no-untyped-def]
+        # Everything actually falls, so a peer IS found — with flat data `deepest_held`
+        # returns None and the assertion below would pass for the wrong reason.
+        # VOO falls HARDEST, so if the candidate is left in its own peer set it becomes its
+        # own peer. Equal depths would tie-break to another ticker and prove nothing.
+        rows = {tk: pd.Series([100.0] * (n // 2)
+                              + [50.0 if tk == "VOO" else 80.0] * (n - n // 2),
+                              index=idx, dtype=float) for tk in tickers}
+        prov = {tk: ("cache", datetime.now(timezone.utc)) for tk in rows}
+        return SeriesResult(rows=rows, missing=[], provenance=prov)
+
+    monkeypatch.setattr("app.cli.fetch_series", falling)
+    monkeypatch.setattr("app.pipeline.price_basis_mismatches", lambda *a, **k: [])
+    main(["--csv", str(SAMPLE), "--screen", "VOO", "--cache-dir", str(tmp_path)])
+    out = capsys.readouterr().out
+    assert "own-drawdown" in out, "the check did not run — the assertion below proves nothing"
+    assert "than VOO, which you already hold" not in out
+
+
+def test_a_blind_run_names_which_failure_it_was(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # `prices` empties two ways with non-overlapping remedies: the fetch failed, or the fetch
+    # SUCCEEDED and every row was dropped as unusable (stale, or missing provenance). Blaming
+    # the connection in the second case sends the user to re-run --warm, which cannot un-stale
+    # a delisted holding.
+    import pandas as pd
+
+    monkeypatch.setattr("app.cli.fetch_latest",
+                        lambda tickers, *a, **k: PricesResult(missing=list(tickers)))
+
+    # (a) nothing fetched at all → provider unreachable
+    monkeypatch.setattr("app.cli.fetch_series",
+                        lambda tickers, *a, **k: SeriesResult(missing=list(tickers)))
+    assert main(["--csv", str(SAMPLE), "--no-risk"]) == 1
+    assert "the price provider was unreachable" in capsys.readouterr().out
+
+    # (b) fetched fine, every row rejected downstream → a different cause, different fix
+    old = pd.bdate_range("2019-01-01", periods=300)
+
+    def stale(tickers, *a, **k):  # type: ignore[no-untyped-def]
+        rows = {tk: pd.Series([100.0] * 300, index=old, dtype=float) for tk in tickers}
+        prov = {tk: ("cache", datetime.now(timezone.utc)) for tk in rows}
+        return SeriesResult(rows=rows, missing=[], provenance=prov)
+
+    # NOT --no-risk: that skips the series path entirely, so nothing would be fetched and
+    # the branch under test would never run.
+    monkeypatch.setattr("app.cli.fetch_series", stale)
+    monkeypatch.setattr("app.pipeline.price_basis_mismatches", lambda *a, **k: [])
+    assert main(["--csv", str(SAMPLE)]) == 1
+    out = capsys.readouterr().out
+    assert "rejected as unusable" in out
+    assert "the price provider was unreachable" not in out
+    assert "still trade" in out          # the remedy that actually applies
+
+
+def test_an_unreadable_target_says_so_instead_of_reporting_the_check_off(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The DISCOVERY panel reports "role check: OFF — add --target" when no candidate carries a
+    # role row. A target that was supplied but failed to parse produced exactly that state,
+    # telling the user to do the thing they had just done, with the reason only in stderr.
+    bad = tmp_path / "bad.csv"
+    bad.write_text("Ticker,Bogus\nVOO,60\n", encoding="utf-8")
+    monkeypatch.setattr("app.cli.fetch_series", _flat_series)
+    monkeypatch.setattr("app.pipeline.price_basis_mismatches", lambda *a, **k: [])
+
+    main(["--csv", str(SAMPLE), "--discover", "reit", "--target", str(bad),
+          "--cache-dir", str(tmp_path)])
+    out = capsys.readouterr().out
+    assert "--target was supplied but could not be read" in out
+    assert "needs columns Ticker, Weight" in out   # the actual parse error, not just a hint
