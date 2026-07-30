@@ -107,6 +107,47 @@ def test_pcn_rejects_a_bare_numeral(
     assert render_narration("Drawdown {{max_drawdown}}, plus about 12% more.", c) is None
 
 
+@pytest.mark.parametrize(
+    "numeral",
+    ["½", "⑧", "¹⁰", "Ⅹ", "十", "万", "４２", "٣"],
+    ids=[
+        # These six are the regression cases — each one RENDERED before v2.12.2.
+        "vulgar-fraction", "circled", "superscript", "roman",   # category No / Nl
+        "cjk-ten", "cjk-myriad",                                # category Lo, numeric value
+        # These two already failed closed (`\d` matches Unicode Nd, not just ASCII).
+        # Kept so the widened check cannot regress on them.
+        "fullwidth", "arabic-indic",
+    ],
+)
+def test_pcn_rejects_every_numeral_form(
+    core: tuple[DerivedState, dict[str, PriceRow], ReturnsSummary, RiskSummary],
+    numeral: str,
+) -> None:
+    # Two blind spots, both found by hostile review. `re`'s \d matches Unicode category Nd
+    # ONLY, so `½` `⑧` `¹⁰` (No) and `Ⅹ` (Nl) rendered beside a validated figure. And a
+    # category-only fix still missed the CJK numeral ideographs: `十` and `万` are category
+    # **Lo** — letters — yet carry numeric values of 10 and 10000. Hence the two-test
+    # `_is_numeral`: category OR `unicodedata.numeric`.
+    state, prices, returns, risk = core
+    c = build_claim_set(state, prices, returns, risk)
+    assert render_narration(f"You lost about {numeral} of the fund.", c) is None
+    assert render_narration(f"Drawdown {{{{max_drawdown}}}}, roughly {numeral}.", c) is None
+
+
+def test_pcn_does_not_over_reject_ordinary_prose(
+    core: tuple[DerivedState, dict[str, PriceRow], ReturnsSummary, RiskSummary],
+) -> None:
+    # A GUARD, not a regression test — it passes against the old `\d` check too, because
+    # the risk it covers runs the other way: `_is_numeral` now consults
+    # `unicodedata.numeric`, which is broad enough to over-reject if it were applied
+    # carelessly. Words, non-Latin script, accents, emoji and the symbols a brief actually
+    # prints must all survive. Kept deliberately, labelled so nobody mistakes it for one.
+    state, prices, returns, risk = core
+    c = build_claim_set(state, prices, returns, risk)
+    txt = "About one half — 투자 stayed calm 🚀; naïve façade, no percent or plus (% + $ €)."
+    assert render_narration(txt, c) == txt
+
+
 def test_rejects_unknown_token(
     core: tuple[DerivedState, dict[str, PriceRow], ReturnsSummary, RiskSummary],
 ) -> None:

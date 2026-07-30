@@ -11,19 +11,29 @@ Two guarantees, both checked here:
   with the *validated* rendered value from the claim set — the model never types a
   figure, it references one by name (arXiv 2311.09188).
 - **PCN** (proof-carrying numbers): the model's raw prose must contain **no bare
-  digit** — every numeral must arrive via a `{{token}}`. If a literal digit appears
-  outside a token, the model wrote a number itself, so the narration is **rejected**
-  wholesale (fail-closed) and the caller prints the plain brief (arXiv 2509.06902).
+  numeral** — every figure must arrive via a `{{token}}`. A character counts as a numeral
+  if its Unicode category is numeric **or** it carries a `unicodedata.numeric` value (see
+  `_is_numeral`; neither test alone suffices). One such character outside a token means the
+  model wrote a number itself, so the narration is **rejected** wholesale (fail-closed) and
+  the caller prints the plain brief (arXiv 2509.06902).
 
-Because the only path for a digit into the final text is substitution from
+Because the only path for a figure into the final text is substitution from
 `build_claim_set` (which reads the same validated core the brief does), a fabricated
-or mis-scaled number cannot survive. The residual risk is purely interpretive prose.
+or mis-scaled number cannot survive.
+
+**What this does NOT enforce** — stated here so the guarantee is never read wider than it
+is. The fence constrains numerals, not meaning. It does not check that a token lands in a
+sentence that means it (`your portfolio GAINED {{max_drawdown}}` validates and renders);
+it does not constrain verbal magnitudes ("nearly halved"); and it does not stop advice or
+forecast wording. Those are prose-level failures this architecture cannot see, which is
+why a caller must present the narration as commentary rather than as a claim.
 """
 
 from __future__ import annotations
 
 import math
 import re
+import unicodedata
 from dataclasses import dataclass
 from datetime import date
 
@@ -147,7 +157,7 @@ def _add_claim(
 ) -> None:
     """Insert ONE claim, skipping a non-finite float figure — the single fail-closed gate
     EVERY claim-builder routes through (brief / discovery / benchmark), so a nan/inf can
-    never reach the fence as "nan%"/"$inf" (which PCN's ``\\d`` would not catch). The
+    never reach the fence as "nan%"/"$inf" (which the numeral check would not catch). The
     FREE-tier band derives once here from (token, value), so a new claim can't silently
     lose its privacy band."""
     if isinstance(value, float) and not math.isfinite(value):
@@ -252,11 +262,32 @@ def build_claim_set(
 _TOKEN_RE = re.compile(r"\{\{\s*([A-Za-z][A-Za-z0-9_]*)\s*\}\}")
 
 
+# Every Unicode numeric category, not only decimal digits. `re`'s `\d` matches Nd
+# alone, so `½` and `⑧` (No) and `Ⅹ` (Nl) are numerals that passed the fence and
+# rendered beside a validated figure — found by hostile review, v2.12.2.
+_NUMERIC_CATEGORIES = frozenset({"Nd", "Nl", "No"})
+
+
+def _is_numeral(ch: str) -> bool:
+    """True if `ch` is a numeral by EITHER test, because neither alone is enough.
+
+    Category catches the numeric categories (Nd/Nl/No). It misses the CJK numeral
+    ideographs — `十` `万` `億` are category **Lo** (a letter) yet carry real numeric
+    values, so a category-only check let "fell about 十 percent" through. Conversely
+    ``unicodedata.numeric`` has no value for some characters a reader still parses as a
+    figure, so both tests run and either one is disqualifying.
+    """
+    return (
+        unicodedata.category(ch) in _NUMERIC_CATEGORIES
+        or unicodedata.numeric(ch, None) is not None
+    )
+
+
 def _has_bare_numeral(prose: str) -> bool:
-    """PCN: True if any digit appears OUTSIDE a `{{token}}` — i.e. the model typed a
+    """PCN: True if any numeral appears OUTSIDE a `{{token}}` — i.e. the model typed a
     number itself. Token references (incl. ones whose name contains a digit) are
     removed first, so only a model-authored numeral trips this."""
-    return bool(re.search(r"\d", _TOKEN_RE.sub("", prose)))
+    return any(_is_numeral(ch) for ch in _TOKEN_RE.sub("", prose))
 
 
 def render_narration(prose: str, claim_set: dict[str, Claim]) -> str | None:
