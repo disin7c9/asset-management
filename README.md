@@ -4,11 +4,11 @@
 
 **TL;DR:** `uvx --from git+https://github.com/disin7c9/asset-management asset-management --demo` — a drawdown-first portfolio brief on a bundled example book, one command, no setup. USD-only, long-only stock/ETF; you keep your own transaction log.
 
-**Track a personal stock/ETF portfolio and get suggestions you can audit. Python computes every number; the optional AI narrates — and is structurally unable to write a figure of its own.**
+**Track a personal stock/ETF portfolio and get suggestions you can audit. Python computes every number; the optional AI narrates — it never receives the figures, and every value it quotes is substituted from the computed result.**
 
 ## 🔢 The number fence
 
-Many AI finance tools let the model produce the numbers. Here the model may only place `{{token}}` placeholders: a deterministic renderer substitutes figures from the validated core and **refuses the entire narration if the model typed any decimal digit itself**:
+Many AI finance tools let the model produce the numbers. Here the model may only place `{{token}}` placeholders: a deterministic renderer substitutes figures from the validated core and **refuses the entire narration if the model typed any numeral itself** — in any Unicode numeric category, so `½` fails closed alongside `3.2`:
 
 ```text
  the model wrote                             │  the reader gets
@@ -20,7 +20,7 @@ Many AI finance tools let the model produce the numbers. Here the model may only
                                              │    validated core
 ─────────────────────────────────────────────┼─────────────────────────────────────────────
  "Your portfolio fell 12% but recovered      │  (no summary at all)
-  nicely — don't worry."                     │  ✘ REFUSED — one model-typed digit voids
+  nicely — don't worry."                     │  ✘ REFUSED — one model-typed numeral voids
                                              │    the entire note; the brief prints
                                              │    without it
 ```
@@ -41,7 +41,7 @@ Holdings are *derived* from an append-only transaction log (date, ticker, action
   - [⚡ Try it in 60 seconds (bundled fake portfolio, no setup)](#-try-it-in-60-seconds-bundled-fake-portfolio-no-setup)
   - [💵 Use it with your own money — four steps](#-use-it-with-your-own-money--four-steps)
 - [🔍 Why you can trust the numbers](#-why-you-can-trust-the-numbers)
-  - [🚫 Not financial advice — structurally, not as fine print](#-not-financial-advice--structurally-not-as-fine-print)
+  - [🚫 Not financial advice — by the shape of the output, not as fine print](#-not-financial-advice--by-the-shape-of-the-output-not-as-fine-print)
   - [✅ Correctness is a claim you can check](#-correctness-is-a-claim-you-can-check)
   - [🔬 Validation — reconciled against two independent tools](#-validation--reconciled-against-two-independent-tools)
 - [💬 Chat with your portfolio — the Claude Desktop addon (read-only MCP)](#-chat-with-your-portfolio--the-claude-desktop-addon-read-only-mcp)
@@ -168,7 +168,7 @@ Register-ScheduledTask -TaskName "asset-brief" `
 
 ## 🔍 Why you can trust the numbers
 
-### 🚫 Not financial advice — structurally, not as fine print
+### 🚫 Not financial advice — by the shape of the output, not as fine print
 
 The *shape* of the output is what makes this a description rather than advice:
 
@@ -178,16 +178,18 @@ The *shape* of the output is what makes this a description rather than advice:
 - anything claiming an *edge* must pass an **out-of-sample gate** before it may surface a suggestion — in-sample-only numbers are refused by design;
 - the tool is **read-only**: it never trades, and the AI can never write to your ledger.
 
+That shapes the **brief**. The optional AI narration is prose: the fence guarantees its *figures* come from the core, but it does not constrain wording — advice-shaped or forecast-shaped sentences are not blocked. `app/narrate.py`'s module docstring lists exactly what is and is not enforced.
+
 ### ✅ Correctness is a claim you can check
 
 - the [gate](.github/workflows/ci.yml) runs the full test suite + `mypy --strict` + ruff on every push to `main` and every PR — the badge at the top is that gate, live;
-- holdings, market value, and P&L are reconciled **to the cent** against [Ghostfolio](https://ghostfol.io), and Sharpe/Sortino/drawdown **to 4 decimals** against quantstats → [reconcile/RESULTS.md](reconcile/RESULTS.md);
+- holdings, market value, and P&L were reconciled **to the cent** against [Ghostfolio](https://ghostfol.io), and Sharpe/Sortino/drawdown **to 4 decimals** against quantstats — a recorded 2026-06-02 snapshot, not a live CI gate → [reconcile/RESULTS.md](reconcile/RESULTS.md);
 - every formula is written down in [MATH.md](MATH.md);
 - the number fence is a script you can poke yourself: [`scripts/demo_fence.py`](scripts/demo_fence.py).
 
 ### 🔬 Validation — reconciled against two independent tools
 
-The numbers are cross-checked against two independent tools on the bundled example data (harness in [`reconcile/`](reconcile/)):
+The numbers were cross-checked against two independent tools (harness in [`reconcile/`](reconcile/)). The recorded run is a **2026-06-02 snapshot** over an 11-event book — the bundled example as it stood before cash tracking added its CASH rows — so read it as a point-in-time check, not a gate CI re-runs:
 
 - **ghostfolio** reconstructs holdings, market value, and P&L from the same transaction log and matches **to the cent**.
 - **quantstats** independently computes Sharpe, Sortino, and max drawdown from the return series, matching **to 4 decimals**.
@@ -205,7 +207,7 @@ uv run --with quantstats python reconcile/reconcile_quantstats.py   # metric cro
 
 [![asset-management MCP server](https://glama.ai/mcp/servers/disin7c9/asset-management/badges/card.svg)](https://glama.ai/mcp/servers/disin7c9/asset-management)
 
-Expose your portfolio to an AI assistant (Claude Desktop, Claude Code, …) as **read-only tools** it can call — so you can "chat with your portfolio" while every number still comes from the validated core, not the model. The server is **read-only** — no write tools, bound to your `ASSET_BOOK` book (no file-path args) — and offline **except two bounded, opt-out fetches**: a cold cache **auto-warms the core set once** (your tickers + benchmark refs, ~30–60s), and screening/proposing a ticker that isn't cached fetches it on demand. Set `ASSET_MCP_OFFLINE=1` to disable both (for an *already-warmed* cache; pointed at a cold one it just degrades to honest `n/a`). Eight tools:
+Expose your portfolio to an AI assistant (Claude Desktop, Claude Code, …) as **read-only tools** it can call — so you can "chat with your portfolio" with every figure in a **tool result** computed by the same deterministic core the CLI uses. Be precise about the boundary: the assistant's own prose is *not* fenced. Nothing here can stop a model typing a number of its own into the chat, so treat any figure not visibly traceable to a tool result as unverified — the server says exactly this in its `portfolio://guarantees` resource. (The CLI's `--narrate` path is different: it substitutes figures mechanically and refuses a narration containing a model-typed numeral.) The server is **read-only** — no write tools, bound to your `ASSET_BOOK` book (no file-path args) — and offline **except two bounded, opt-out fetches**: a cold cache **auto-warms the core set once** (your tickers + benchmark refs, ~30–60s), and screening/proposing a ticker that isn't cached fetches it on demand. Set `ASSET_MCP_OFFLINE=1` to disable both (for an *already-warmed* cache; pointed at a cold one it just degrades to honest `n/a`). Eight tools:
 
 - **`portfolio_summary`** — holdings, P&L, and annualized returns.
 - **`risk_report`** — drawdown-first risk: max drawdown (depth/dates/recovery), Ulcer, CDaR, Sharpe/Sortino/Calmar, all with bootstrap confidence intervals.
@@ -216,7 +218,7 @@ Expose your portfolio to an AI assistant (Claude Desktop, Claude Code, …) as *
 - **`propose_allocation`** — a strategic target for a posture (`conservative`/`moderate`/`aggressive`) over your book + the universe, validated against a reference with the same held-out recent-window, Ulcer-first verdict — propose-only, numbers from the core, never a recommendation.
 - **`starter_allocation`** — new to this? answer three plain risk questions → a starting posture and its validated proposal (the onboarding path into `propose_allocation`).
 
-**Install (Claude Desktop):** Settings → Developer → **Edit Config**, and add:
+**Install (Claude Desktop):** Settings → Developer → **Edit Config**, and add (or just replace, if you have never touched claude_desktop_config.json):
 
 ```json
 {
@@ -224,7 +226,7 @@ Expose your portfolio to an AI assistant (Claude Desktop, Claude Code, …) as *
     "asset-management": {
       "command": "uvx",
       "args": ["--from",
-               "https://github.com/disin7c9/asset-management/releases/download/v2.12.1/asset_management-2.12.1-py3-none-any.whl",
+               "https://github.com/disin7c9/asset-management/releases/download/v2.12.2/asset_management-2.12.2-py3-none-any.whl",
                "asset-management-mcp"],
       "env": {
         "ASSET_BOOK": "C:\\path\\to\\your\\transactions.csv",
@@ -368,44 +370,46 @@ A `target.csv` is one you create with `--dump-target` / `--allocate-out` (or use
 <summary>Sample output — the full <code>--demo</code> brief (drawdown, ratios, returns, holdings)</summary>
 
 ```text
+$ uv run python -m app --demo
+
 === DRAWDOWN (investment, time-weighted) ===
-Max drawdown:      -9.84%  (95% CI -17.49% .. -6.86%)
+Max drawdown:      -9.84%  (95% CI -17.16% .. -6.44%)
   peak 2025-02-19 → trough 2025-04-08 → 2025-06-10  (111 days)
-Ulcer index:       2.39%  (95% CI 1.62% .. 6.17%)
-CDaR (worst 5%):   6.67%  (95% CI 4.56% .. 14.04%)
+Ulcer index:       2.40%  (95% CI 1.60% .. 6.32%)
+CDaR (worst 5%):   6.67%  (95% CI 4.51% .. 14.09%)
 You've spent 81% of this period below a previous high.
 Gains given back: -$1,240  — peak profit $3,336 (2025-02-19) → $2,096 (2025-04-08) → 2025-06-10
   (dollars of profit given back from a peak; flow-neutral — funding & transfers don't distort it)
 
 === RISK-ADJUSTED (annualized, 252-day basis, risk-free 0%, ± bootstrap CI) ===
-Sharpe:   +1.57  (95% CI +0.59 .. +2.49)
-Sortino:  +2.35  (95% CI +0.85 .. +3.97)
-Calmar:   +1.75  (95% CI +0.39 .. +4.07)
+Sharpe:   +1.55  (95% CI +0.52 .. +2.49)
+Sortino:  +2.33  (95% CI +0.73 .. +3.85)
+Calmar:   +1.73  (95% CI +0.49 .. +3.56)
 
 === RETURNS (annualized, 252-day basis) ===
-Period: 2023-01-05 → 2026-07-24 (1296 days, ~3.55y)
-Time-weighted (true TWR):                +17.26%
-Money-weighted (IRR):                    +16.15%
-Modified Dietz (approx TWR):             +15.87%
+Period: 2023-01-05 → 2026-07-30 (1302 days, ~3.56y)
+Time-weighted (true TWR):                +17.04%
+Money-weighted (IRR):                    +15.92%
+Modified Dietz (approx TWR):             +15.65%
   (point figures: accounting identities over your cash flows, not sampled statistics → no band; see RISK-ADJUSTED for bootstrapped CIs)
 
 === HOLDINGS ===
 ticker     shares  avg cost    price    mkt value      unreal    realized
 -------------------------------------------------------------------------
-BND        50.000     72.26    72.25      3612.50       -0.50      +45.10
-IAU        25.000     37.23    76.15      1903.75     +973.13     +220.62
-VEA        15.000     40.27    69.78      1046.70     +442.70       +0.00
-VOO        12.000    375.13   678.61      8143.32    +3641.72     +295.80
+BND        50.000     72.26    72.50      3624.75      +11.75      +45.10
+IAU        25.000     37.23    75.34      1883.50     +952.88     +220.62
+VEA        15.000     40.27    69.01      1035.22     +431.22       +0.00
+VOO        12.000    375.13   675.28      8103.36    +3601.76     +295.80
 -------------------------------------------------------------------------
 Total cost basis (held): $9,649.23
-Market value (priced):   $14,706.27
-Unrealized P&L:          $+5,057.04
+Market value (priced):   $14,646.84
+Unrealized P&L:          $+4,997.61
 Realized P&L (sells+div): $+549.37
 Fees paid (informational): $33.00
-Net P&L (unrealized + realized): $+5,606.42
+Net P&L (unrealized + realized): $+5,546.99
 
-Prices: 4 cache  (age: 5.9h .. 5.9h old as of 2026-07-24 13:51 UTC)
-Generated by asset-management. Figures are deterministic and reconciled against ghostfolio + quantstats; this is not financial advice.
+Prices: 4 cache  (age: 6m .. 6m old as of 2026-07-29 15:20 UTC)
+Generated by asset-management. Figures are computed by a deterministic core; this is not financial advice.
 ```
 
 </details>
@@ -422,32 +426,38 @@ A **target is a complete spec** (`--target path`, columns `Ticker,Weight`; weigh
 - `bands` — `to_total`, but gated on a drift **trigger**: if no ticker is outside its band nothing trades, and if any ticker is, every leg goes back to target (including `--new-cash`). Trading only the breached leg would sell with nothing to buy, since the offsetting drift sits in the legs still inside their bands. The band is the **smaller** of an absolute `--band` (default 5pp) or `--band-rel` × the ticker's target weight (the **"5/25 rule"**, default 25%) — so a small sleeve isn't handed a band many times its own size; a 0% target → 0 band → always exits
 
 <details>
-<summary>Sample output — rebalance suggestions (demo book, target VOO 40 / BND 30 / IAU 15 / VEA 15)</summary>
+<summary>Sample output — rebalance suggestions (demo book, bundled target VOO 45 / VEA 20 / BND 25 / IAU 10)</summary>
+
+Both blocks are verbatim output of the commands shown, against `data/sample_data/target.csv`. Prices move, so the figures are a snapshot; the shape is not.
 
 **`to_total`** — sell + buy to hit the target exactly:
 
 ```text
+$ uv run python -m app --demo --rebalance to_total --target data/sample_data/target.csv
+
 === SUGGESTED ACTIONS (rebalance to target) ===
 ticker    cur%   tgt% action            $      shares   why
 ------------------------------------------------------------------------------
-VOO       55.4   40.0   SELL     -2260.81      -3.332   55.4% vs 40.0% target
-VEA        7.1   15.0    BUY     +1159.24     +16.613   7.1% vs 15.0% target
-BND       24.6   30.0    BUY      +799.38     +11.064   24.6% vs 30.0% target
-IAU       12.9   15.0    BUY      +302.19      +3.968   12.9% vs 15.0% target
-Buy $2,260.81 · Sell $2,260.81 · net +$0.00 (cash-neutral)
+VEA        7.1   20.0    BUY     +1894.14     +27.445   7.1% vs 20.0% target
+VOO       55.3   45.0   SELL     -1512.28      -2.239   55.3% vs 45.0% target
+IAU       12.9   10.0   SELL      -418.82      -5.559   12.9% vs 10.0% target
+BND       24.7   25.0    BUY       +36.96      +0.510   24.7% vs 25.0% target
+Buy $1,931.10 · Sell $1,931.10 · net +$0.00 (cash-neutral)
 ```
 
-**`bands`** (the 5/25 rule) — same target. The band is a **trigger**: VOO sits 15.4pp outside its band, so the whole book goes back to target. IAU is inside its own band and still trades, because that's where the offsetting drift lives — its row says so:
+**`bands`** (the 5/25 rule) — same target. The band is a **trigger**: VEA sits 12.9pp outside its band, so the whole book goes back to target. BND is inside its own band and still trades, because that's where the offsetting drift lives — its row says so:
 
 ```text
+$ uv run python -m app --demo --rebalance bands --target data/sample_data/target.csv
+
 === SUGGESTED ACTIONS (threshold-band rebalance) ===
 ticker    cur%   tgt% action            $      shares   why
 ------------------------------------------------------------------------------
-VOO       55.4   40.0   SELL     -2260.81      -3.332   drift +15.4pp exceeds 5.00pp band
-VEA        7.1   15.0    BUY     +1159.24     +16.613   drift -7.9pp exceeds 3.75pp band
-BND       24.6   30.0    BUY      +799.38     +11.064   drift -5.4pp exceeds 5.00pp band
-IAU       12.9   15.0    BUY      +302.19      +3.968   12.9% vs 15.0% target (rebalance triggered)
-Buy $2,260.81 · Sell $2,260.81 · net +$0.00 (cash-neutral)
+VEA        7.1   20.0    BUY     +1894.14     +27.445   drift -12.9pp exceeds 5.00pp band
+VOO       55.3   45.0   SELL     -1512.28      -2.239   drift +10.3pp exceeds 5.00pp band
+IAU       12.9   10.0   SELL      -418.82      -5.559   drift +2.9pp exceeds 2.50pp band
+BND       24.7   25.0    BUY       +36.96      +0.510   24.7% vs 25.0% target (rebalance triggered)
+Buy $1,931.10 · Sell $1,931.10 · net +$0.00 (cash-neutral)
 ```
 
 If nothing is outside its band, nothing trades at all. Propose-only — no trade is executed; every row cites the rule that fired.
@@ -465,28 +475,29 @@ With `--benchmark`, the held-out verdict resolves through three named gates: the
 <summary>Sample output — held-out verdict vs 60-40</summary>
 
 ```text
-=== BENCHMARK (preset vs 60-40 · 2016-07-25 → 2026-07-23 — propose-only) ===
+$ uv run python -m app --backtest --target data/sample_data/target.csv --benchmark 60-40
+
+=== BENCHMARK (preset vs 60-40 · 2023-01-06 → 2026-07-29 — propose-only) ===
                                             preset                   60-40
 --------------------------------------------------------------------------
-Max drawdown                               -22.01%                 -21.14%
-  95% CI                          -35.2% .. -10.3%        -34.5% .. -10.9%
-Ulcer index                                  5.57%                   5.74%
-  95% CI                             2.6% .. 13.8%           2.6% .. 13.7%
-CDaR (worst 5%)                             16.25%                  16.59%
-  95% CI                             7.1% .. 30.5%           7.3% .. 29.8%
-Sharpe (252-basis)                           +0.88                   +0.89
-  95% CI                            +0.25 .. +1.63          +0.28 .. +1.67
-Sortino                                      +1.23                   +1.26
-  95% CI                            +0.33 .. +2.46          +0.38 .. +2.49
-Annualized return                           +9.42%                  +9.81%
-Final value                                $24,543                 $25,428
-  prices: cache · oldest fetch 2026-07-24
+Max drawdown                               -10.40%                 -11.22%
+  95% CI                           -16.5% .. -5.7%         -17.5% .. -5.6%
+Ulcer index                                  2.20%                   2.24%
+  95% CI                              1.5% .. 5.5%            1.4% .. 6.9%
+CDaR (worst 5%)                              6.43%                   6.59%
+  95% CI                             4.1% .. 13.0%           4.1% .. 14.7%
+Sharpe (252-basis)                           +1.54                   +1.45
+  95% CI                            +0.57 .. +2.51          +0.46 .. +2.45
+Sortino                                      +2.30                   +2.16
+  95% CI                            +0.81 .. +4.04          +0.65 .. +3.82
+Annualized return                          +16.47%                 +14.06%
+Final value                                $17,144                 $15,924
+  prices: cache · oldest fetch 2026-07-29
 
-Walk-forward (held-out): OOS (2023-07-24→2026-07-23, 752d): Ulcer 2.17% vs 2.29%
-60-40; CDaR 6.64% vs 6.86%; max DD -9.4% vs -11.2% (context); return +14.1% vs
-+13.0%/yr (+1.1pp, context) — no clear drawdown difference from 60-40 (the Ulcer gap
-is within the noise margin)
+Held-out recent-window: OOS (2025-07-08→2026-07-29, 266d): Ulcer 1.90% vs 1.33% 60-40; CDaR 6.06% vs 4.08%; max DD -8.0% vs -5.8% (context); return +16.3% vs +12.6%/yr (+3.7pp, context) — no clear drawdown difference from 60-40; 95% CI of the Ulcer gain [-2.36pp, +0.27pp] (the paired bootstrap does not confirm the gap)
 ```
+
+Here the Ulcer gap clears the noise margin, so the verdict runs all the way to the bootstrap — and the interval straddles zero, so it stays `inconclusive` and says which gate stopped it. A **candidate** screened at a 5% sleeve is the opposite case: the effect is far smaller and gate 1 usually settles it on its own ([MATH.md §12.7](MATH.md)).
 
 Read what it doesn't say. The preset carries slightly *less* drawdown pain than 60-40
 (Ulcer 5.57% vs 5.74%) and slightly *less* return (+9.42% vs +9.81%/yr) — a trade, not a
@@ -505,35 +516,49 @@ Four honesty rules keep the panel from overreaching. A **gap means no dedicated 
 <details>
 <summary>Sample output — a lead shelf, the satellite index, a drill</summary>
 
-**Default** — the lead shelf's comparable funds, with the role's other shelves *named* (not ranked):
+Verbatim output, one role each from the panel the command prints (the full panel covers every gap).
+
+**Default (`--demo --discover`)** — the lead shelf's comparable funds, with the role's other shelves *named*, not ranked:
 
 ```text
 corporate-bond  — you currently hold 0%
   · investment-grade — the standard sleeve
-  VCIT  PASS  Vanguard Intermediate-Term Corp    (0 fail / 0 warn / 4 pass / 4 n-a)
-  LQD   PASS  iShares iBoxx $ Investment Grad     (0 fail / 0 warn / 5 pass / 3 n-a)
-  IGIB  PASS  iShares 5-10 Year Investment Gr     (0 fail / 0 warn / 4 pass / 4 n-a)
+  VCIT  PASS  Vanguard Intermediate-Term Corp  (0 fail / 0 warn / 6 pass / 2 n-a)
+         Corporate Bond ETF.
+  LQD   PASS  iShares iBoxx $ Investment Grad  (0 fail / 0 warn / 8 pass / 0 n-a)
+         Corporate Bond ETF.
+  IGIB  PASS  iShares 5-10 Year Investment Gr  (0 fail / 0 warn / 6 pass / 2 n-a)
+         Corporate Bond ETF.
   also here: high-yield — junk — equity-like drawdowns (19) — drill with --discover corporate-bond:<shelf>
 ```
 
-**Satellite (`--discover sector-equity`)** — the tool maps the shelves and refuses to pick one:
+**Satellite (`--demo --discover sector-equity`)** — the tool maps the shelves and refuses to pick one:
 
 ```text
 sector-equity  — you currently hold 0%
-  a tactical bet, not a hole — picking the sector/theme is the decision here, and it is yours.
-    tech (6) · semis (3) · ai (2) · innovation (3) · health (5) · biotech (4) · financial (6) ·
-    banks (3) · utilities (5) · energy (6) · miners (4) · uranium (3) · water (2) · clean-energy (2) · …
+  a tactical bet, not a hole — picking the sector/theme is the decision here, and it is yours. This maps the shelves; it won't rank them.
+    tech (6) · semis (3) · software (1) · ai (2) · cyber (1) · innovation (3) · quantum (1) · health (5) · biotech (4) · devices (1) · financial (6) · banks (3) · bdc (1) · brokers (1) · utilities (5) · energy (6) · explorers (1) · oil-services (1) · miners (4) · nat-resources (2) · materials (3) · uranium (3) · battery-metals (1) · water (2) · infrastructure (5) · grid (1) · clean-energy (2)
   name one to see its screened funds, e.g. --discover sector-equity:tech
 ```
 
-**Drill one shelf (`--discover treasury:long`)** — the shelf label discloses the risk up front:
+**Drill one shelf (`--demo --discover treasury:long`)** — the shelf label discloses the risk up front:
 
 ```text
 treasury  — you currently hold 0%
   · long — 20y+ — rate-sensitive, equity-scale drawdowns
-  TLT   PASS  iShares 20+ Year Treasury Bond      (0 fail / 0 warn / 4 pass / 4 n-a)
-  VGLT  PASS  Vanguard Long-Term Treasury ETF     (0 fail / 0 warn / 4 pass / 4 n-a)
-  also here: intermediate — the standard sleeve (~3-10y) (6) · short — 1-3y — cash-like (4)
+  TLT   PASS  iShares 20+ Year Treasury Bond  (0 fail / 0 warn / 6 pass / 2 n-a)
+         Long Government ETF.
+  VGLT  PASS  Vanguard Long-Term Treasury ETF  (0 fail / 0 warn / 6 pass / 2 n-a)
+         Long Government ETF.
+  TLH   PASS  iShares 10-20 Year Treasury Bon  (0 fail / 0 warn / 6 pass / 2 n-a)
+         Long Government ETF.
+  SPTL  PASS  State Street SPDR Portfolio Lon  (0 fail / 0 warn / 6 pass / 2 n-a)
+         Long Government ETF.
+  GOVI  PASS  Invesco Equal Weight 0-30 Year  (0 fail / 0 warn / 6 pass / 2 n-a)
+         Long Government ETF.
+  XTEN  PASS  BondBloxx Bloomberg Ten Year Ta  (0 fail / 0 warn / 6 pass / 2 n-a)
+         Long Government ETF.
+  also here: intermediate — the standard sleeve (~3-10y) (6) · short — 1-3y — cash-like (4) — drill with --discover treasury:<shelf>
 ```
 
 </details>
@@ -559,19 +584,20 @@ Add `--target` and it also runs the **held-out role check**: give the candidate 
 <details>
 <summary>Sample output — same role, different risk (IEF vs TLT)</summary>
 
-Both fill the treasury role and both pass on correlation — but `own-drawdown` tells the rest of the story:
+Both fill the treasury role and both pass on correlation — but `own-drawdown` shows they are not the same risk:
 
 ```text
-IEF — WARN  (0 fail / 2 warn / 5 pass / 2 n-a)
-  [pass] diversifier: ρ=+0.22 vs your book; during your worst drawdown (2025-02-19→2025-04-08, -9.8%) it returned +2.3%
-  [warn] own-drawdown: worst fall -11.5% (2023-04-06→2023-10-19) in 3.5y — deeper than your book's worst (-9.8%)
+$ uv run python -m app --demo --screen IEF,TLT
 
-TLT — WARN  (0 fail / 2 warn / 5 pass / 2 n-a)
-  [pass] diversifier: ρ=+0.26 vs your book; during your worst drawdown (2025-02-19→2025-04-08, -9.8%) it returned +0.3%
-  [warn] own-drawdown: worst fall -23.8% (2023-01-18→2023-10-19) in 3.5y — deeper than your book's worst (-9.8%)
+IEF — PASS  (0 fail / 0 warn / 6 pass / 2 n-a)
+  [pass] diversifier: ρ=+0.22 vs your book; red-day ρ=+0.06; during your worst drawdown (2025-02-19→2025-04-08, -9.8%) it returned +2.9%
+  [pass] own-drawdown: worst fall -10.2% (2023-05-03→2023-10-19) in 3.6y; shallower than IAU, which you already hold (-26.4%)
+TLT — PASS  (0 fail / 0 warn / 6 pass / 2 n-a)
+  [pass] diversifier: ρ=+0.25 vs your book; red-day ρ=+0.09; during your worst drawdown (2025-02-19→2025-04-08, -9.8%) it returned +1.0%
+  [pass] own-drawdown: worst fall -22.4% (2023-04-06→2023-10-19) in 3.6y; shallower than IAU, which you already hold (-26.4%)
 ```
 
-Correlation alone would wave both through as clean diversifiers; own-drawdown flags that each carries a fall deeper than your whole book — TLT far more so.
+Both clear the peer bar here — this book already holds IAU, which fell **-26.4%**, so the bar is set by what you already live with rather than by an abstract threshold. The contrast is still the point: TLT's worst fall is more than twice IEF's, and against a book whose deepest holding fell less than 22% that same TLT row would warn while IEF's would not. Correlation alone would wave both through identically.
 </details>
 
 ### 📝 Narration (optional plain-language summary)
