@@ -25,6 +25,7 @@ from app.risk import (
     cdar,
     dollar_drawdown,
     max_drawdown,
+    path_block,
     sharpe,
     sortino,
     summarize_risk,
@@ -181,6 +182,30 @@ def test_summarize_risk_full_panel() -> None:
     assert summary.is_noisy is False  # 600 > 504
     assert summary.drawdown.depth <= 0
     assert summary.sharpe.low <= summary.sharpe.point <= summary.sharpe.high
+
+
+def test_calmar_ci_uses_the_path_block_like_its_drawdown_denominator() -> None:
+    # Calmar is annualized return ÷ max drawdown, so its sampling behaviour inherits the
+    # denominator's path dependence — it is not a mean-type ratio. With an ~n**(1/3) block
+    # the resample cannot reassemble a multi-month decline, so the interval differs. The
+    # decline below is what makes the two blocks disagree; without it the test is vacuous.
+    rng = np.random.default_rng(11)
+    daily = rng.normal(0.0006, 0.010, 600)
+    daily[200:320] -= 0.0035  # a sustained ~4-month slide the block has to span
+    returns = pd.Series(daily, index=pd.date_range("2022-01-01", periods=600, freq="D"))
+    index = (1.0 + returns).cumprod()
+
+    summary = summarize_risk(returns, index, bootstrap_n=300, seed=7)
+    assert summary is not None
+
+    pathwise = bootstrap_ci(calmar, returns, n=300, seed=7, block=path_block(len(returns)))
+    default_block = bootstrap_ci(calmar, returns, n=300, seed=7)
+
+    assert (summary.calmar.low, summary.calmar.high) == (pathwise.low, pathwise.high)
+    assert (summary.calmar.low, summary.calmar.high) != (
+        default_block.low,
+        default_block.high,
+    )
 
 
 def test_summarize_risk_flags_noisy_short_history() -> None:

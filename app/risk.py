@@ -231,8 +231,9 @@ def cdar_from_returns(returns: "pd.Series[float]") -> float:
 
 def path_block(n: int) -> int:
     """Moving-block size for path-dependent statistics (~√n, at least 2). Shared by
-    ``summarize_risk``'s max-DD/Ulcer/CDaR CIs and ``backtest``'s paired Ulcer-gain CI,
-    so the block rule can't drift between the point panel and the held-out verdict."""
+    ``summarize_risk``'s max-DD/Ulcer/CDaR/Calmar CIs and ``backtest``'s paired Ulcer-gain
+    CI, so the block rule can't drift between the point panel and the held-out verdict.
+    Calmar qualifies through its max-drawdown denominator, not by being an extremum."""
     return max(2, int(round(n**0.5)))
 
 
@@ -307,6 +308,11 @@ def summarize_risk(
     # Path-dependent extrema (max-DD, Ulcer, CDaR) need a LARGER bootstrap block
     # than mean-type ratios: an ~n**(1/3) block can't reassemble a multi-month
     # decline, biasing those bands shallow. Use ~√n for them; ratios keep the default.
+    # CALMAR joins them (v2.12.2): it is annualized return ÷ max drawdown, so it is not a
+    # mean-type ratio — it INHERITS the denominator's path dependence, and was reading the
+    # default block only because it sits among the ratios. Measured on cached series the
+    # block choice moved its CI width by -19%..+9% and shifted one interval from
+    # straddling zero to excluding it, so this is not cosmetic.
     pblock = path_block(len(daily_returns))
     return RiskSummary(
         n_days=len(daily_returns),
@@ -322,5 +328,5 @@ def summarize_risk(
         ),
         sharpe=bootstrap_ci(sharpe, daily_returns, n=bootstrap_n, seed=seed),
         sortino=bootstrap_ci(sortino, daily_returns, n=bootstrap_n, seed=seed),
-        calmar=bootstrap_ci(calmar, daily_returns, n=bootstrap_n, seed=seed),
+        calmar=bootstrap_ci(calmar, daily_returns, n=bootstrap_n, seed=seed, block=pblock),
     )
