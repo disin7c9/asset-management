@@ -6,12 +6,12 @@
     "url": "https://github.com/disin7c9/asset-management",
     "source": "github"
   },
-  "version": "2.12.1",
+  "version": "2.12.2",
   "packages": [
     {
       "registryType": "mcpb",
-      "identifier": "https://github.com/disin7c9/asset-management/releases/download/v2.12.1/asset-management-2.12.1.mcpb",
-      "fileSha256": "c0202115d065fef2e6d2690fc4e1a1a72cb044e2614c9f9866cc6bc2658c6251",
+      "identifier": "https://github.com/disin7c9/asset-management/releases/download/v2.12.2/asset-management-2.12.2.mcpb",
+      "fileSha256": "0db9b0d0d22f4e349447b2dec6f8d6eeea4da1196e5aa1fb09ca301353a6c4ac",
       "transport": {
         "type": "stdio"
       }
