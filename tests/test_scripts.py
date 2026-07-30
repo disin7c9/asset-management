@@ -124,14 +124,41 @@ def test_bundle_pyproject_is_dev_free() -> None:
     assert parsed["build-system"]["build-backend"]  # build metadata intact
 
 
+def test_mcp_dependency_is_capped_below_the_fastmcp_removal() -> None:
+    # mcp 2.0.0 (2026-07-28) removed `mcp.server.fastmcp`, the import app/mcp_server.py
+    # depends on. With an open-ended floor, `uvx --from git+…` resolved 2.0.0 and every
+    # fresh install died at import — while CI stayed green against the locked 1.27.2, so
+    # nothing here caught it. The cap is what closes that gap; this test is why it stays.
+    # Raise it only together with the port to the 2.x `MCPServer` API.
+    import tomllib
+
+    with (ROOT / "pyproject.toml").open("rb") as fh:
+        deps = tomllib.load(fh)["project"]["dependencies"]
+    mcp_spec = next((d for d in deps if d.replace(" ", "").startswith("mcp")), None)
+    assert mcp_spec is not None, "the mcp runtime dependency vanished from pyproject"
+    assert "<2" in mcp_spec.replace(" ", ""), (
+        f"mcp is declared as {mcp_spec!r} with no upper bound below 2.0 — a fresh "
+        "resolve will pick mcp>=2, which has no `mcp.server.fastmcp`, and the server "
+        "will fail at import for anyone installing via uvx/pip rather than the lock"
+    )
+
+
 def test_demo_fence_runs_keyless_and_fails_closed() -> None:
-    # The README's first "run it yourself" command: offline, no API key, and both
-    # refusal paths visible. Redirected output must be plain (no ANSI escapes).
+    # The README's first "run it yourself" command: offline, no API key, and every
+    # refusal path visible. Assert the REASONS rather than a count, so adding a case
+    # doesn't silently pass while a case that stopped refusing goes unnoticed.
     out = subprocess.run(
         [sys.executable, str(ROOT / "scripts" / "demo_fence.py"), "--fast"],
         capture_output=True, text=True, timeout=120, check=True,
     ).stdout
-    assert out.count("REFUSED") == 2
+    assert "REFUSED (a bare digit outside any token)" in out
+    assert "REFUSED (any Unicode numeral, not just 0-9)" in out  # v2.12.2: ½ / ⑧ / ¹⁰ / Ⅹ
+    assert "REFUSED (a CJK numeral ideograph" in out              # v2.12.2: 十 / 万 (category Lo)
+    assert "REFUSED (unknown claim)" in out
+    # The label is derived from what render_narration actually returned, so a fence that
+    # started leaking prints LEAKED instead. Asserting its absence is what makes the three
+    # lines above real coverage rather than a check on unconditional literal text.
+    assert "LEAKED" not in out
     assert "-9.84%" in out  # the obedient act rendered the substituted figure
     assert "\033[" not in out  # piped run → color gated off
 

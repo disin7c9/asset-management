@@ -1,6 +1,6 @@
 [project]
 name = "asset-management"
-version = "2.12.1"
+version = "2.12.2"
 description = "Personal asset-management tool: transaction-log holdings, drawdown-first reporting with confidence bands, multi-source price provenance."
 license = "AGPL-3.0-or-later"
 requires-python = ">=3.12,<3.13"
@@ -12,7 +12,12 @@ dependencies = [
     "yfinance>=0.2.40",
     "resend>=2.0",
     "python-dotenv>=1.0",
-    "mcp>=1.27.2",
+    # Upper bound is load-bearing, not caution. mcp 2.0.0 (2026-07-28) REMOVED
+    # `mcp.server.fastmcp` — the import at app/mcp_server.py:50 — replacing FastMCP with
+    # `MCPServer`. An open-ended floor meant `uvx --from git+…` resolved 2.0.0 and every
+    # fresh install died at import with ModuleNotFoundError, while CI stayed green against
+    # the locked 1.27.2. Raise this only together with the port to the 2.x API.
+    "mcp>=1.27.2,<2",
 ]
 
 [project.scripts]
