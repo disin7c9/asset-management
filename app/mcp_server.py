@@ -157,8 +157,7 @@ mcp: FastMCP = FastMCP(
     "asset-management",
     instructions=(
         "Read-only, offline view of the user's own stock/ETF portfolio. Every number "
-        "is computed by a validated deterministic core (reconciled to the cent vs "
-        "ghostfolio, 4 decimals vs quantstats) — do not compute or estimate figures "
+        "is computed by a deterministic core — do not compute or estimate figures "
         "yourself; call a tool. If a tool returns an error or a null/absent figure, tell "
         "the user it's unavailable and how to get it (e.g. warm the cache) — never "
         "substitute your own estimate, reconstruction, or factor-model guess. Lead with "
@@ -1411,9 +1410,10 @@ does write its own price cache under `ASSET_CACHE_DIR` — that is the only thin
 and only you write to it.
 
 **2. Every number this server reports is computed, never generated.** Figures come from
-a deterministic Python core — reconciled to the cent against a real brokerage export, and
-to 4 decimal places against quantstats. When a value is unavailable the tools say so, and
-how to fix it, rather than guessing.
+a deterministic Python core. That core was cross-checked against ghostfolio and quantstats
+in a recorded 2026-06-02 snapshot — a point-in-time check, not something re-run on every
+build, so weigh it as evidence rather than as a live guarantee. When a value is
+unavailable the tools say so, and how to fix it, rather than guessing.
 
 Be precise about the boundary: that guarantee covers the *tool output*. Nothing here can
 stop an assistant from typing a number of its own into the chat — that is instruction, not

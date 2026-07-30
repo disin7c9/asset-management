@@ -278,12 +278,16 @@ Non-finite resamples are skipped; a non-finite point estimate yields a degenerat
 ### 8.3 Block-length heuristics
 $$
 b_{\text{ratios}}=\max\!\bigl(2,\ \operatorname{round}(n^{1/3})\bigr)
-\qquad\text{(Sharpe/Sortino/Calmar)},
+\qquad\text{(Sharpe/Sortino)},
 $$
 $$
 b_{\text{path}}=\max\!\bigl(2,\ \operatorname{round}(\sqrt n)\bigr)
-\qquad\text{(MDD / Ulcer / CDaR — a longer block can reassemble a multi-month decline)} .
+\qquad\text{(MDD / Ulcer / CDaR / Calmar — a longer block can reassemble a multi-month decline)} .
 $$
+**Calmar sits with the path statistics** (v2.12.2), though it is a ratio: it is annualized
+return $\div$ max drawdown, so its denominator *is* a path-dependent extremum and its sampling
+behaviour inherits that. Sortino stays on $b_{\text{ratios}}$ because its denominator
+(downside deviation) is an unordered average, not a running extremum.
 **Noisy flag:** $n<504$ ($\approx$ 2 trading years) → every ratio is treated as statistically thin.
 
 ---
@@ -530,7 +534,10 @@ $$
 $$
 $\mathrm{CI}$ is the paired-bootstrap 95% interval of the Ulcer gain (§12.6). Gate 2 lets CDaR **tie**
 but not **contradict** the Ulcer direction — it catches an Ulcer win bought with a deeper worst tail.
-The blocking gate is returned as a structured `cause` for consumers to branch on.
+The blocking gate is returned as a structured `cause` for consumers to branch on. How far the chain
+runs depends on the effect size the caller feeds it: `benchmark_compare` (a whole preset vs a
+reference) routinely clears gate 1 and resolves on the bootstrap, whereas `role_check` at the
+shipped 5% candidate sleeve was blocked at gate 1 for every candidate measured — §12.7.
 
 ### 12.6 Paired moving-block bootstrap of the Ulcer gain — `_paired_ulcer_gain_ci`
 The honesty gate. Both legs ride the same market, so resample them with the **same** block indices —
@@ -549,8 +556,47 @@ $$
 Non-finite resamples are dropped (as in the risk-panel bootstrap). An improved/worsened verdict
 stands only if the CI **confirms the direction** ($\mathrm{CI}_{\text{low}}>0$ for improved,
 $\mathrm{CI}_{\text{high}}<0$ for worsened); otherwise inconclusive. Needs $n\ge 10$ aligned days
-(else no interval → `window_too_short`). Decisive on a real effect, honestly inconclusive inside the
-noise band — the property that keeps the gate from passing overfit noise.
+(else no interval → `window_too_short`). This bootstrap runs only once gate 1 has passed — routine on
+a whole-preset benchmark comparison, but not on a 5% candidate sleeve (§12.7).
+
+### 12.7 What $\varepsilon_U$ actually gates — measured (v2.12.2)
+$\varepsilon_U=0.0025$ was never measured; it was set by analogy. The verdict statistic changed from
+max-drawdown depth to Ulcer in v2.9.0, and the previous $0.005$ max-DD margin was **halved** on the
+argument that Ulcer runs at roughly half the scale of max-DD depth. Measured on the **bundled demo
+target** (`data/sample_data/target.csv` — VOO 45 / VEA 20 / BND 25 / IAU 10) over a ~265-day held-out
+window ending July 2026, ten candidates at the shipped $w_{\text{sleeve}}=0.05$. The exact window and
+figures move with the price cache; the conclusions below held across three runs a week apart:
+
+1. **Gate 1 decides the candidate screen** (not the benchmark comparison, where the effect is far
+   larger and the bootstrap does run). All ten returned `inconclusive` with cause `noise_margin`.
+   Measured $|\text{ulcergain}|$ ran $0.04$–$0.23$pp against the $0.25$pp margin, so gates 2 and 3
+   never executed — the largest effect the mechanism produced was still below the bar.
+2. **The scale assumption rests on a quantity that is not stable.** Across the same ten,
+   $|\text{ulcergain}|/|\text{maxDDgain}|$ came out below $1$ for every candidate, so Ulcer gaps
+   are materially smaller than max-DD gaps — but the multiplier itself will not hold still: three
+   independent runs over windows a week apart put its mean at $0.36$, $0.48$ and $0.34$, with
+   per-candidate values from $0.16$ to $1.29$. The spread is dominated by candidates whose max-DD
+   gap is near the $0.1$pp print resolution, where the ratio is mostly quantization error, and by
+   max-DD being a single-event extreme — the very noisiness §12.5 cites for demoting it from the
+   verdict. **So the defect is not that $0.5$ was the wrong multiplier; it is that no fixed
+   multiplier exists to scale one margin into the other.** Deriving $\varepsilon_U$ that way was
+   unsound in kind, and re-deriving it must come from the Ulcer gain's own null distribution.
+3. **The switch tightened the gate rather than preserving it.** DBC produced a max-DD gain of
+   ${\approx}1.4$pp, clearing the old $0.005$ bar, while its Ulcer gain of $0.23$pp fails the current
+   one: on this target the previous rule resolves 1 of 10 where the current rule resolves 0 of 10.
+
+Whether that is *wrong* is **not established**. It depends on whether gaps of this size are signal or
+noise at a 5% sleeve, which has not been measured — if such a sleeve genuinely cannot move drawdown,
+`inconclusive` is the correct answer and the gate is working. What is established is that the
+constant was never checked against the effect size it gates. Re-deriving it from a measured
+no-effect distribution is deferred; until then read $\varepsilon_U$ as a deliberately conservative
+bar, not a calibrated one. The gate is symmetric ($|\cdot|$), so it is not biased toward negative
+verdicts.
+
+Reproduce one row (fetches on a cold cache; figures move with the price cache):
+```bash
+uv run python -m app --demo --screen DBC --target data/sample_data/target.csv
+```
 
 ---
 
@@ -565,11 +611,11 @@ noise band — the property that keeps the gate from passing overfit noise.
 | noisy threshold | $504$ days | risk | flag thin samples |
 | bootstrap resamples $B$ | $1000$ | risk, backtest | CI precision |
 | CI level $c$ | $0.95$ | risk, backtest | band width |
-| block length | $n^{1/3}$ (ratios), $\sqrt n$ (path/paired) | risk, backtest | preserve autocorrelation |
+| block length | $n^{1/3}$ (Sharpe/Sortino), $\sqrt n$ (MDD/Ulcer/CDaR/Calmar, paired) | risk, backtest | preserve autocorrelation |
 | candidate sleeve $s$ | $0.05$ | backtest | role-check displacement |
 | OOS fraction | $0.30$ | backtest | held-out share |
 | min window | $60$ days each side | backtest | else "insufficient" |
-| verdict margins | $\varepsilon_U=0.0025$ (Ulcer), $\varepsilon_C=0.005$ (CDaR slack) | backtest | signal vs noise |
+| verdict margins | $\varepsilon_U=0.0025$ (Ulcer), $\varepsilon_C=0.005$ (CDaR slack) | backtest | signal vs noise — $\varepsilon_U$ set by analogy, not measured (§12.7) |
 | corr thresholds | warn $0.60$, fail $0.85$, downside escalate $+0.15$ | screen | diversifier verdict |
 | overlap thresholds | warn $0.40$, fail $0.70$ | screen | near-duplicate verdict |
 | concentration warn | $0.50$ | screen | top-10 weight |
